@@ -57,6 +57,7 @@ export interface Track {
   addedAt: number;
   lrcLyrics?: string;
   recoveredFrom?: string;
+  autoQueued?: boolean;
 }
 
 export interface Playlist {

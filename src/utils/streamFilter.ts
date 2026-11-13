@@ -1,7 +1,7 @@
-import type { StudioQueueItem } from '../types/audio';
+import type { StudioQueueItem, Track } from '../types/audio';
 
 const MIX_OR_PLAYLIST_RE =
-  /\b(full\s*album|full\s*mix|dj\s*mix|dj\s*set|megamix|nonstop|non-stop|compilation|playlist|1\s*hour|2\s*hours|continuous\s*mix|mashup\s*mix|radio\s*show|podcast|episode\s*\d+)\b/i;
+  /\b(full\s*album|full\s*mix|dj\s*mix|dj\s*set|megamix|nonstop|non-stop|compilation|playlist|1\s*hour|2\s*hours|continuous\s*mix|mashup\s*mix|radio\s*show|podcast|episode\s*\d+|tutorial|recreating|how\s+to\s+(make|produce)|reaction|track\s*breakdown)\b/i;
 
 export function isIndividualSong(
   title: string,
@@ -85,21 +85,26 @@ interface YouTubeVideoRenderer {
   title?: { runs?: YouTubeTextRun[]; simpleText?: string };
   ownerText?: { runs?: YouTubeTextRun[] };
   shortBylineText?: { runs?: YouTubeTextRun[] };
+  longBylineText?: { runs?: YouTubeTextRun[] };
   lengthText?: { simpleText?: string };
 }
 
-export function extractYouTubeSearchResults(html: string): ParsedYouTubeVideo[] {
+function extractYtInitialDataJson(html: string): Record<string, unknown> | null {
   const match =
     html.match(/var ytInitialData = (\{[\s\S]*?\});<\/script>/) ||
     html.match(/window\["ytInitialData"\]\s*=\s*(\{[\s\S]*?\});<\/script>/);
-  if (!match) return [];
+  if (!match) return null;
 
-  let data: Record<string, unknown>;
   try {
-    data = JSON.parse(match[1]) as Record<string, unknown>;
+    return JSON.parse(match[1]) as Record<string, unknown>;
   } catch {
-    return [];
+    return null;
   }
+}
+
+export function extractYouTubeSearchResults(html: string): ParsedYouTubeVideo[] {
+  const data = extractYtInitialDataJson(html);
+  if (!data) return [];
 
   const contents = (
     data as {
@@ -155,4 +160,135 @@ export function extractYouTubeSearchResults(html: string): ParsedYouTubeVideo[] 
   }
 
   return results;
+}
+
+function collectCompactRenderers(node: unknown, out: YouTubeVideoRenderer[], depth = 0): void {
+  if (!node || typeof node !== 'object' || depth > 14) return;
+  if (Array.isArray(node)) {
+    for (const item of node) collectCompactRenderers(item, out, depth + 1);
+    return;
+  }
+  const obj = node as Record<string, unknown>;
+  if (obj.compactVideoRenderer && typeof obj.compactVideoRenderer === 'object') {
+    out.push(obj.compactVideoRenderer as YouTubeVideoRenderer);
+  }
+  for (const val of Object.values(obj)) {
+    if (val && typeof val === 'object') {
+      collectCompactRenderers(val, out, depth + 1);
+    }
+  }
+}
+
+export function extractYouTubeRelatedResults(
+  html: string,
+  excludeVideoId?: string
+): ParsedYouTubeVideo[] {
+  const data = extractYtInitialDataJson(html);
+  if (!data) return [];
+
+  const secondary = (
+    data as {
+      contents?: {
+        twoColumnWatchNextResults?: {
+          secondaryResults?: unknown;
+        };
+      };
+    }
+  )?.contents?.twoColumnWatchNextResults?.secondaryResults;
+
+  if (!secondary) return [];
+
+  const renderers: YouTubeVideoRenderer[] = [];
+  collectCompactRenderers(secondary, renderers);
+
+  const seenIds = new Set<string>(excludeVideoId ? [excludeVideoId] : []);
+  const results: ParsedYouTubeVideo[] = [];
+
+  for (const v of renderers) {
+    if (!v.videoId || seenIds.has(v.videoId)) continue;
+
+    const rawTitle =
+      v.title?.simpleText || v.title?.runs?.map((r) => r.text || '').join('') || '';
+    const channelName =
+      v.shortBylineText?.runs?.[0]?.text ||
+      v.longBylineText?.runs?.[0]?.text ||
+      v.ownerText?.runs?.[0]?.text ||
+      '';
+    const durationSeconds = parseYouTubeDuration(v.lengthText?.simpleText);
+
+    if (!rawTitle || durationSeconds <= 0) continue;
+    if (!isIndividualSong(rawTitle, channelName, durationSeconds)) continue;
+
+    const { artist, title } = parseYouTubeArtistAndTitle(rawTitle, channelName);
+    if (!isIndividualSong(title, artist, durationSeconds)) continue;
+
+    seenIds.add(v.videoId);
+    results.push({
+      videoId: v.videoId,
+      title,
+      artist,
+      durationSeconds,
+      thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+    });
+  }
+
+  return results;
+}
+
+export function buildRadioSeedQuery(track: Pick<Track, 'title' | 'artist' | 'genre'>): string {
+  const cleanArtist = (track.artist || '')
+    .replace(/\b(youTube\s*audio|official|topic|vevo)\b/gi, '')
+    .trim();
+  const cleanGenre =
+    track.genre && track.genre.toLowerCase() !== 'youtube' && track.genre.toLowerCase() !== 'stream'
+      ? track.genre.trim()
+      : '';
+
+  if (cleanArtist && cleanGenre) {
+    return `${cleanArtist} ${cleanGenre} songs`;
+  }
+  if (cleanArtist) {
+    return `${cleanArtist} similar songs music`;
+  }
+  if (cleanGenre) {
+    return `${cleanGenre} popular songs`;
+  }
+  return `${track.title} similar songs`;
+}
+
+export function mergeAutoplayQueue(
+  existingQueue: Track[],
+  currentTrack: Track,
+  relatedTracks: Track[],
+  options: { replaceExistingAuto?: boolean; maxAutoTracks?: number } = {}
+): Track[] {
+  const { replaceExistingAuto = true, maxAutoTracks = 10 } = options;
+
+  const baseQueue = existingQueue.filter((item) => {
+    if (item.id === currentTrack.id) return true;
+    if (replaceExistingAuto && item.autoQueued) return false;
+    return true;
+  });
+
+  if (!baseQueue.some((item) => item.id === currentTrack.id)) {
+    baseQueue.unshift(currentTrack);
+  }
+
+  const seenIds = new Set(baseQueue.map((item) => item.id));
+  const seenYoutubeIds = new Set(
+    baseQueue.map((item) => item.youtubeId).filter((id): id is string => Boolean(id))
+  );
+
+  const additions: Track[] = [];
+  for (const candidate of relatedTracks) {
+    if (additions.length >= maxAutoTracks) break;
+    if (seenIds.has(candidate.id)) continue;
+    if (candidate.youtubeId && seenYoutubeIds.has(candidate.youtubeId)) continue;
+
+    seenIds.add(candidate.id);
+    if (candidate.youtubeId) seenYoutubeIds.add(candidate.youtubeId);
+    additions.push({ ...candidate, autoQueued: true });
+  }
+
+  return [...baseQueue, ...additions];
 }

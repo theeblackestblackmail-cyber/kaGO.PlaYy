@@ -6,6 +6,7 @@ import {
   Pause,
   Play,
   Plus,
+  Radio,
   RotateCcw,
   RotateCw,
   SkipBack,
@@ -45,6 +46,9 @@ interface FullscreenPlayerProps {
   onOpenDsp: () => void;
   onUpdateLyricsOffset: (trackId: string, offset: number) => void;
   onOpenStream: () => void;
+  autoplayRadioEnabled: boolean;
+  isFetchingRadio: boolean;
+  onToggleAutoplayRadio: () => void;
 }
 
 export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
@@ -71,6 +75,9 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   onOpenDsp,
   onUpdateLyricsOffset,
   onOpenStream,
+  autoplayRadioEnabled,
+  isFetchingRadio,
+  onToggleAutoplayRadio,
 }) => {
   const [subTab, setSubTab] = useState<FullscreenSubTab>('turntable');
   const activeLineRef = useRef<HTMLButtonElement | null>(null);
@@ -270,9 +277,33 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
 
           {subTab === 'queue' && (
             <div className="space-y-2">
-              <div className="mb-3 flex items-center justify-between text-xs text-[#8E929B]">
-                <span>Active Playback Queue</span>
-                <span className="font-mono-tabular">{queue.length} tracks</span>
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#1F2129] bg-[#0D0E12] px-3.5 py-2.5">
+                <div className="flex items-center gap-2 text-xs text-[#8E929B]">
+                  <span className="font-semibold text-[#F4F3F0]">Active Playback Queue</span>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-mono-tabular">{queue.length} tracks</span>
+                  {isFetchingRadio && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span className="font-mono-tabular text-[#FF4D6D]">Finding related songs...</span>
+                    </>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={autoplayRadioEnabled}
+                  onClick={onToggleAutoplayRadio}
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors cursor-pointer ${
+                    autoplayRadioEnabled
+                      ? 'border-[#E11D48] bg-[#E11D48]/15 text-[#FF4D6D]'
+                      : 'border-[#252834] bg-[#14161D] text-[#8E929B] hover:text-white'
+                  }`}
+                >
+                  <Radio className="h-3.5 w-3.5" />
+                  <span>Auto Radio: {autoplayRadioEnabled ? 'ON' : 'OFF'}</span>
+                </button>
               </div>
               {queue.length === 0 ? (
                 <div className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-8 text-center text-sm text-[#8E929B]">
@@ -303,13 +334,20 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                           {String(idx + 1).padStart(2, '0')}
                         </span>
                         <div className="min-w-0 flex-1">
-                          <p
-                            className={`truncate text-sm font-semibold ${
-                              active ? 'text-[#FF4D6D]' : 'text-[#F4F3F0]'
-                            }`}
-                          >
-                            {qTrack.title}
-                          </p>
+                          <div className="flex items-center gap-2">
+                            <p
+                              className={`truncate text-sm font-semibold ${
+                                active ? 'text-[#FF4D6D]' : 'text-[#F4F3F0]'
+                              }`}
+                            >
+                              {qTrack.title}
+                            </p>
+                            {qTrack.autoQueued && !active && (
+                              <span className="shrink-0 rounded border border-[#2C303E] bg-[#14161E] px-1.5 py-0.5 font-mono-tabular text-[10px] font-semibold uppercase tracking-wide text-[#9CA3AF]">
+                                Auto Radio
+                              </span>
+                            )}
+                          </div>
                           <p className="truncate text-xs text-[#8E929B]">{qTrack.artist}</p>
                         </div>
                       </button>

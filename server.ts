@@ -4,7 +4,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
-import { extractYouTubeSearchResults, isIndividualSong, sortStudioQueue } from './src/utils/streamFilter';
+import {
+  buildRadioSeedQuery,
+  extractYouTubeRelatedResults,
+  extractYouTubeSearchResults,
+  isIndividualSong,
+  sortStudioQueue,
+} from './src/utils/streamFilter';
 import type {
   StudioChatMessage,
   StudioPlaybackState,
@@ -166,6 +172,41 @@ async function searchYouTubeTracks(
   }
 }
 
+async function fetchYouTubeWatchRelated(youtubeId: string, genre?: string): Promise<Track[]> {
+  try {
+    const url = `https://www.youtube.com/watch?v=${encodeURIComponent(youtubeId)}`;
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(6500),
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Cookie: 'SOCS=CAI',
+      },
+    });
+    if (!response.ok) return [];
+    const html = await response.text();
+    const parsed = extractYouTubeRelatedResults(html, youtubeId).slice(0, 12);
+
+    return parsed.map((item) => ({
+      id: `yt-${item.videoId}`,
+      youtubeId: item.videoId,
+      streamProvider: 'youtube' as const,
+      title: item.title,
+      artist: item.artist,
+      album: 'YouTube Radio Up Next',
+      duration: item.durationSeconds,
+      source: 'stream' as const,
+      artworkUrl: item.thumbnailUrl,
+      genre: genre || 'YouTube',
+      addedAt: Date.now(),
+      autoQueued: true,
+    }));
+  } catch {
+    return [];
+  }
+}
+
 async function searchAudiusTracks(term: string, genre?: string): Promise<Track[]> {
   try {
     const url = `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(
@@ -250,6 +291,50 @@ async function startServer() {
     }
 
     return res.json({ results: [], source: 'fallback' });
+  });
+
+  app.get('/api/stream/related', async (req, res) => {
+    const youtubeId = String(req.query.youtubeId || '').trim();
+    const title = String(req.query.title || '').trim();
+    const artist = String(req.query.artist || '').trim();
+    const genre = String(req.query.genre || '').trim();
+
+    const collected: Track[] = [];
+    const seenIds = new Set<string>(youtubeId ? [`yt-${youtubeId}`] : []);
+
+    if (youtubeId) {
+      const watchNext = await fetchYouTubeWatchRelated(youtubeId, genre);
+      for (const track of watchNext) {
+        if (!seenIds.has(track.id)) {
+          seenIds.add(track.id);
+          collected.push(track);
+        }
+      }
+    }
+
+    if (collected.length < 6) {
+      const seedQuery = buildRadioSeedQuery({ title: title || 'music', artist, genre });
+      const searchRelated = await searchYouTubeTracks(seedQuery, genre, youtubeId);
+      for (const track of searchRelated) {
+        if (!seenIds.has(track.id)) {
+          seenIds.add(track.id);
+          collected.push({ ...track, autoQueued: true });
+        }
+      }
+    }
+
+    if (collected.length === 0) {
+      const audiusQuery = buildRadioSeedQuery({ title: title || 'synthwave', artist, genre });
+      const audiusRelated = await searchAudiusTracks(audiusQuery, genre);
+      for (const track of audiusRelated) {
+        if (!seenIds.has(track.id)) {
+          seenIds.add(track.id);
+          collected.push({ ...track, autoQueued: true });
+        }
+      }
+    }
+
+    return res.json({ results: collected.slice(0, 12), source: collected.length > 0 ? 'live' : 'fallback' });
   });
 
   app.get('/api/stream/recover', async (req, res) => {

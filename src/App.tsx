@@ -30,6 +30,8 @@ import {
   subscribeNativePipState,
   syncNativeNowPlaying,
 } from './utils/nativeMediaBridge';
+import { mergeAutoplayQueue } from './utils/streamFilter';
+import { fetchRelatedRadioTracks } from './utils/streamRadio';
 
 export default function App() {
   const isOnline = useOnlineStatus();
@@ -48,10 +50,21 @@ export default function App() {
   const [isLiveStudioOpen, setIsLiveStudioOpen] = useState(false);
   const [isInAppPip, setIsInAppPip] = useState(false);
   const [isNativePip, setIsNativePip] = useState(false);
+  const [autoplayRadioEnabled, setAutoplayRadioEnabled] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem('kago_autoplay_radio');
+      return stored === null ? true : stored === 'true';
+    } catch {
+      return true;
+    }
+  });
+  const [isFetchingRadio, setIsFetchingRadio] = useState(false);
 
   const songPickerRef = useRef<HTMLInputElement | null>(null);
   const nativePipStageRef = useRef<HTMLDivElement | null>(null);
   const requestedNotifPermRef = useRef(false);
+  const radioSeedEpochRef = useRef(0);
+  const playedHistoryIdsRef = useRef<Set<string>>(new Set());
 
   // Hydrate offline DB on startup
   useEffect(() => {
@@ -84,17 +97,93 @@ export default function App() {
     return [...allLibraryTracks, ...CURATED_STREAM_BANK.filter((c) => !seen.has(c.id))];
   }, [allLibraryTracks]);
 
-  const playTrack = useCallback((track: Track) => {
-    setQueue((prev) => (prev.some((t) => t.id === track.id) ? prev : [...prev, track]));
-    void audioEngine.playTrack(track);
-  }, []);
+  const populateRelatedRadio = useCallback(
+    async (seedTrack: Track, replaceExistingAuto: boolean) => {
+      if (!autoplayRadioEnabled || seedTrack.source !== 'stream') return;
+      const epoch = ++radioSeedEpochRef.current;
+      setIsFetchingRadio(true);
+      try {
+        const excludeIds = Array.from(playedHistoryIdsRef.current);
+        const related = await fetchRelatedRadioTracks(seedTrack, excludeIds);
+        if (epoch !== radioSeedEpochRef.current || related.length === 0) return;
+        setQueue((prev) =>
+          mergeAutoplayQueue(prev, seedTrack, related, {
+            replaceExistingAuto,
+            maxAutoTracks: 10,
+          })
+        );
+      } finally {
+        if (epoch === radioSeedEpochRef.current) {
+          setIsFetchingRadio(false);
+        }
+      }
+    },
+    [autoplayRadioEnabled]
+  );
+
+  const playTrack = useCallback(
+    (track: Track) => {
+      playedHistoryIdsRef.current.add(track.id);
+      if (track.source === 'stream') {
+        if (track.autoQueued) {
+          // Promoted from auto radio -> keep existing upcoming songs and top up if running low
+          setQueue((prev) => {
+            const next = prev.map((t) => (t.id === track.id ? { ...t, autoQueued: false } : t));
+            const idx = next.findIndex((t) => t.id === track.id);
+            const remaining = idx >= 0 ? next.length - 1 - idx : 0;
+            if (remaining <= 2) {
+              void populateRelatedRadio(track, false);
+            }
+            return next;
+          });
+        } else {
+          // User explicitly picked a new song to stream -> seed Spotify-style related queue
+          setQueue((prev) => {
+            const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
+            const preserved = prev.filter(
+              (t) => t.id !== track.id && !t.autoQueued && !stemIds.has(t.id)
+            );
+            return [track, ...preserved];
+          });
+          void populateRelatedRadio(track, true);
+        }
+      } else {
+        setQueue((prev) => (prev.some((t) => t.id === track.id) ? prev : [...prev, track]));
+      }
+      void audioEngine.playTrack(track);
+    },
+    [populateRelatedRadio]
+  );
+
+  const handleToggleAutoplayRadio = useCallback(() => {
+    setAutoplayRadioEnabled((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem('kago_autoplay_radio', String(next));
+      } catch {
+        // Ignore storage quota errors
+      }
+      if (next && engine.currentTrack?.source === 'stream') {
+        void populateRelatedRadio(engine.currentTrack, false);
+      }
+      return next;
+    });
+  }, [engine.currentTrack, populateRelatedRadio]);
 
   const handleNext = useCallback(() => {
     if (queue.length === 0) return;
     const currentIdx = queue.findIndex((t) => t.id === engine.currentTrack?.id);
     const nextIdx = currentIdx >= 0 ? (currentIdx + 1) % queue.length : 0;
-    void audioEngine.playTrack(queue[nextIdx]);
-  }, [queue, engine.currentTrack?.id]);
+    const nextTrack = queue[nextIdx];
+    playedHistoryIdsRef.current.add(nextTrack.id);
+
+    const remainingAfterNext = queue.length - 1 - nextIdx;
+    if (autoplayRadioEnabled && nextTrack.source === 'stream' && remainingAfterNext <= 2) {
+      void populateRelatedRadio(nextTrack, false);
+    }
+
+    void audioEngine.playTrack(nextTrack);
+  }, [queue, engine.currentTrack?.id, autoplayRadioEnabled, populateRelatedRadio]);
 
   const handlePrev = useCallback(() => {
     if (queue.length === 0) return;
@@ -512,6 +601,9 @@ export default function App() {
         onOpenDsp={() => setIsDspOpen(true)}
         onUpdateLyricsOffset={(id, offset) => void handleUpdateLyricsOffset(id, offset)}
         onOpenStream={() => setActiveTab('stream')}
+        autoplayRadioEnabled={autoplayRadioEnabled}
+        isFetchingRadio={isFetchingRadio}
+        onToggleAutoplayRadio={handleToggleAutoplayRadio}
       />
 
       <FloatingPipWindow

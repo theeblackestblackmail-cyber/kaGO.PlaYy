@@ -4,13 +4,16 @@ import { sanitizeFilename } from './filenameSanitizer';
 import { parseLrc, formatLrcTimestamp, findActiveLyricIndex, formatDuration } from './lrcParser';
 import { parseId3v2Buffer } from './audioMetadata';
 import {
+  buildRadioSeedQuery,
+  extractYouTubeRelatedResults,
   extractYouTubeSearchResults,
   isIndividualSong,
+  mergeAutoplayQueue,
   parseYouTubeArtistAndTitle,
   parseYouTubeDuration,
   sortStudioQueue,
 } from './streamFilter';
-import type { StudioQueueItem } from '../types/audio';
+import type { StudioQueueItem, Track } from '../types/audio';
 
 test('sanitizeFilename cleans noisy YouTube rip filenames and separates artist and title', () => {
   const res = sanitizeFilename('04 - Daft_Punk_-_Derezzed_(Official_Video)_[4K_HQ_320kbps].mp3');
@@ -246,4 +249,108 @@ test('setup-android-native patches AndroidManifest, Gradle, and copies Java Medi
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
+});
+
+test('extractYouTubeRelatedResults extracts Up Next individual songs and excludes mixes and seed ID', () => {
+  const sampleWatchData = {
+    contents: {
+      twoColumnWatchNextResults: {
+        secondaryResults: {
+          secondaryResults: {
+            results: [
+              {
+                compactVideoRenderer: {
+                  videoId: 'seed1234567',
+                  title: { simpleText: 'Kavinsky - Nightcall' },
+                  shortBylineText: { runs: [{ text: 'Kavinsky' }] },
+                  lengthText: { simpleText: '4:18' },
+                },
+              },
+              {
+                compactVideoRenderer: {
+                  videoId: 'rel11111111',
+                  title: { simpleText: 'M83 - Midnight City [Official Audio]' },
+                  shortBylineText: { runs: [{ text: 'M83 - Topic' }] },
+                  lengthText: { simpleText: '4:03' },
+                },
+              },
+              {
+                compactVideoRenderer: {
+                  videoId: 'relmix22222',
+                  title: { simpleText: 'Best Synthwave 1 Hour Mix' },
+                  shortBylineText: { runs: [{ text: 'DJ Mix' }] },
+                  lengthText: { simpleText: '59:12' },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+  };
+  const html = `<html><script>var ytInitialData = ${JSON.stringify(sampleWatchData)};</script></html>`;
+  const related = extractYouTubeRelatedResults(html, 'seed1234567');
+  assert.equal(related.length, 1);
+  assert.equal(related[0].videoId, 'rel11111111');
+  assert.equal(related[0].artist, 'M83');
+  assert.equal(related[0].title, 'Midnight City');
+});
+
+test('buildRadioSeedQuery and mergeAutoplayQueue preserve manual queue tracks and refresh auto radio items', () => {
+  const seed: Track = {
+    id: 'yt-seed',
+    youtubeId: 'seed123',
+    title: 'Nightcall',
+    artist: 'Kavinsky',
+    album: 'YouTube Music Stream',
+    duration: 258,
+    source: 'stream',
+    genre: 'Electronic',
+    addedAt: 1,
+  };
+  const manualTrack: Track = {
+    id: 'manual-1',
+    title: 'Manual Pick',
+    artist: 'User Artist',
+    album: 'Local',
+    duration: 200,
+    source: 'local',
+    addedAt: 2,
+  };
+  const staleAutoTrack: Track = {
+    id: 'yt-old-auto',
+    youtubeId: 'oldauto',
+    title: 'Old Auto',
+    artist: 'Old Artist',
+    album: 'Radio',
+    duration: 210,
+    source: 'stream',
+    autoQueued: true,
+    addedAt: 3,
+  };
+  const newRelated: Track[] = [
+    { ...seed }, // duplicate of seed should be skipped
+    {
+      id: 'yt-rel-1',
+      youtubeId: 'rel1',
+      title: 'Midnight City',
+      artist: 'M83',
+      album: 'YouTube Radio Up Next',
+      duration: 243,
+      source: 'stream',
+      addedAt: 4,
+    },
+  ];
+
+  assert.equal(buildRadioSeedQuery(seed), 'Kavinsky Electronic songs');
+
+  const merged = mergeAutoplayQueue([seed, manualTrack, staleAutoTrack], seed, newRelated, {
+    replaceExistingAuto: true,
+  });
+  assert.deepEqual(
+    merged.map((t) => t.id),
+    ['yt-seed', 'manual-1', 'yt-rel-1']
+  );
+  assert.equal(merged[1].autoQueued, undefined);
+  assert.equal(merged[2].autoQueued, true);
 });
