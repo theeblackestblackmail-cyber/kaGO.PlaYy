@@ -330,7 +330,16 @@ async function startServer() {
   });
 
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ server, path: '/ws/studio' });
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (req, socket, head) => {
+    const reqPath = (req.url || '').split('?')[0];
+    if (reqPath === '/ws/studio') {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
+      });
+    }
+  });
 
   wss.on('connection', (ws) => {
     const clientId = `listener-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -466,10 +475,14 @@ async function startServer() {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   } else {
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR !== 'true' ? { server } : false,
+        allowedHosts: true,
+        hmr: !disableHmr,
+        ws: { server },
+        watch: disableHmr ? null : {},
       },
       appType: 'spa',
     });
