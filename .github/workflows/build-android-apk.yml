@@ -27,23 +27,20 @@ jobs:
       - name: Set up Android SDK 34
         uses: android-actions/setup-android@v3
 
-      - name: Install dependencies and build web bundle
+      - name: Install dependencies, lint, and build web bundle
         run: |
           npm install
+          npm run lint
           npm run build
 
-      - name: Initialize Capacitor Android project (SDK 34)
+      - name: Initialize Capacitor Android project and native media layer
         run: |
           npm install --no-save @capacitor/core@^6.2.0 @capacitor/cli@^6.2.0 @capacitor/android@^6.2.0
           if [ ! -d "android" ]; then
             npx cap add android
           fi
           npx cap sync android
-
-      - name: Ensure Android SDK 34 targets
-        run: |
-          sed -i 's/compileSdkVersion = [0-9]*/compileSdkVersion = 34/' android/variables.gradle || true
-          sed -i 's/targetSdkVersion = [0-9]*/targetSdkVersion = 34/' android/variables.gradle || true
+          node scripts/setup-android-native.mjs
 
       - name: Build Debug APK
         working-directory: android

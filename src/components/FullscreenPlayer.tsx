@@ -17,8 +17,9 @@ import type { DspSettings, StoredLyrics, Track } from '../types/audio';
 import { findActiveLyricIndex, formatDuration, parseLrc } from '../utils/lrcParser';
 import { SpectrumVisualizer } from './SpectrumVisualizer';
 import { VinylTurntable } from './VinylTurntable';
+import { WatchVideoViewport } from './WatchVideoViewport';
 
-type FullscreenSubTab = 'turntable' | 'lyrics' | 'queue';
+type FullscreenSubTab = 'turntable' | 'video' | 'lyrics' | 'queue';
 
 interface FullscreenPlayerProps {
   isOpen: boolean;
@@ -31,6 +32,8 @@ interface FullscreenPlayerProps {
   dsp: DspSettings;
   isFavorite: boolean;
   storedLyrics?: StoredLyrics;
+  isInAppPip: boolean;
+  onToggleInAppPip: () => void;
   onTogglePlay: () => void;
   onSeek: (seconds: number) => void;
   onSeekBy: (seconds: number) => void;
@@ -41,6 +44,7 @@ interface FullscreenPlayerProps {
   onToggleFavorite: (trackId: string) => void;
   onOpenDsp: () => void;
   onUpdateLyricsOffset: (trackId: string, offset: number) => void;
+  onOpenStream: () => void;
 }
 
 export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
@@ -54,6 +58,8 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   dsp,
   isFavorite,
   storedLyrics,
+  isInAppPip,
+  onToggleInAppPip,
   onTogglePlay,
   onSeek,
   onSeekBy,
@@ -64,6 +70,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   onToggleFavorite,
   onOpenDsp,
   onUpdateLyricsOffset,
+  onOpenStream,
 }) => {
   const [subTab, setSubTab] = useState<FullscreenSubTab>('turntable');
   const activeLineRef = useRef<HTMLButtonElement | null>(null);
@@ -92,25 +99,26 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
       className="fixed inset-0 z-50 flex flex-col bg-black text-[#F4F3F0] animate-[fadeIn_180ms_ease-out]"
     >
       {/* Top Bar */}
-      <div className="flex items-center justify-between gap-4 border-b border-[#1A1C24] bg-[#06070A] px-4 py-3 sm:px-6">
+      <div className="flex items-center justify-between gap-2 sm:gap-4 border-b border-[#1A1C24] bg-[#06070A] px-3 py-3 sm:px-6">
         <button
           type="button"
           onClick={onClose}
           aria-label="Collapse fullscreen player"
-          className="flex h-10 w-10 items-center justify-center rounded-lg border border-[#242732] bg-[#111319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#111319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
         >
           <ChevronDown className="h-5 w-5" />
         </button>
 
-        {/* 3-Tab Switcher */}
+        {/* 4-Tab Switcher (Turntable | Watch Video | Sync Lyrics | Queue) */}
         <div
           role="tablist"
           aria-label="Fullscreen player views"
-          className="flex items-center gap-1 rounded-lg border border-[#222530] bg-[#0D0E13] p-1"
+          className="flex items-center gap-1 overflow-x-auto rounded-lg border border-[#222530] bg-[#0D0E13] p-1"
         >
           {(
             [
               { id: 'turntable', label: 'Turntable' },
+              { id: 'video', label: 'Watch Video' },
               { id: 'lyrics', label: 'Sync Lyrics' },
               { id: 'queue', label: 'Queue' },
             ] as const
@@ -123,7 +131,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                 role="tab"
                 aria-selected={active}
                 onClick={() => setSubTab(t.id)}
-                className={`rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+                className={`rounded-md px-2.5 sm:px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
                   active
                     ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
                     : 'text-[#8E929B] hover:text-white'
@@ -139,7 +147,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
           type="button"
           onClick={onOpenDsp}
           aria-label="Open Hardware DSP Studio"
-          className="flex h-10 w-10 items-center justify-center rounded-lg border border-[#242732] bg-[#111319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#111319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
         >
           <Sliders className="h-4 w-4" />
         </button>
@@ -155,6 +163,27 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                 isPlaying={isPlaying}
                 onTogglePlay={onTogglePlay}
                 size="lg"
+              />
+              <SpectrumVisualizer isPlaying={isPlaying} dsp={dsp} compact />
+            </div>
+          )}
+
+          {subTab === 'video' && (
+            <div className="space-y-5">
+              <WatchVideoViewport
+                track={track}
+                isPlaying={isPlaying}
+                currentTime={currentTime}
+                zIndex={60}
+                isInAppPip={isInAppPip}
+                onToggleInAppPip={() => {
+                  onToggleInAppPip();
+                  onClose();
+                }}
+                onOpenStream={() => {
+                  onClose();
+                  onOpenStream();
+                }}
               />
               <SpectrumVisualizer isPlaying={isPlaying} dsp={dsp} compact />
             </div>

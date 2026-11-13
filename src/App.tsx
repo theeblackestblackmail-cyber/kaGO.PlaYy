@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { audioEngine } from './audio/AudioEngine';
 import { DashboardView } from './components/DashboardView';
 import { DspStudioModal } from './components/DspStudioModal';
+import { FloatingPipWindow } from './components/FloatingPipWindow';
 import { FolderScannerView } from './components/FolderScannerView';
 import { FullscreenPlayer } from './components/FullscreenPlayer';
 import { LibraryView } from './components/LibraryView';
@@ -23,6 +24,12 @@ import type {
   Track,
 } from './types/audio';
 import { readAudioFileTags } from './utils/audioMetadata';
+import {
+  requestNativeNotificationPermission,
+  subscribeNativeMediaActions,
+  subscribeNativePipState,
+  syncNativeNowPlaying,
+} from './utils/nativeMediaBridge';
 
 export default function App() {
   const isOnline = useOnlineStatus();
@@ -39,8 +46,12 @@ export default function App() {
   const [isDspOpen, setIsDspOpen] = useState(false);
   const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
   const [isLiveStudioOpen, setIsLiveStudioOpen] = useState(false);
+  const [isInAppPip, setIsInAppPip] = useState(false);
+  const [isNativePip, setIsNativePip] = useState(false);
 
   const songPickerRef = useRef<HTMLInputElement | null>(null);
+  const nativePipStageRef = useRef<HTMLDivElement | null>(null);
+  const requestedNotifPermRef = useRef(false);
 
   // Hydrate offline DB on startup
   useEffect(() => {
@@ -119,11 +130,63 @@ export default function App() {
   handlePrevRef.current = handlePrev;
   const lastPositionSyncRef = useRef<number>(0);
 
-  // Sync device lock-screen Media Session metadata & action handlers (only on track change)
+  // Subscribe to Android native MediaSession (Samsung Now Bar / Lockscreen) & native PiP
   useEffect(() => {
-    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const unsubMedia = subscribeNativeMediaActions((detail) => {
+      if (detail.action === 'play' || detail.action === 'pause' || detail.action === 'toggle') {
+        void audioEngine.togglePlay();
+      } else if (detail.action === 'next') {
+        handleNextRef.current();
+      } else if (detail.action === 'prev') {
+        handlePrevRef.current();
+      } else if (detail.action === 'seek') {
+        audioEngine.seek(detail.positionMs / 1000);
+      }
+    });
+    const unsubPip = subscribeNativePipState((active) => {
+      setIsNativePip(active);
+    });
+    return () => {
+      unsubMedia();
+      unsubPip();
+    };
+  }, []);
+
+  // Dock YouTube iframe edge-to-edge when Android enters OS Picture-in-Picture
+  useEffect(() => {
+    if (!isNativePip || !engine.currentTrack?.youtubeId) return;
+    const el = nativePipStageRef.current;
+    if (!el) return;
+    const detach = audioEngine.attachYouTubeViewport(el, 110);
+    return () => {
+      detach();
+    };
+  }, [isNativePip, engine.currentTrack?.youtubeId]);
+
+  const lastNativeSyncRef = useRef<number>(0);
+
+  // Sync device lock-screen Media Session + Android KaGoMediaService (Samsung Now Bar)
+  useEffect(() => {
     const track = engine.currentTrack;
     if (!track) return;
+
+    if (engine.isPlaying && !requestedNotifPermRef.current) {
+      requestedNotifPermRef.current = true;
+      requestNativeNotificationPermission();
+    }
+
+    syncNativeNowPlaying({
+      title: track.title,
+      artist: track.artist,
+      album: track.album,
+      durationSeconds: engine.duration || track.duration,
+      currentTimeSeconds: engine.currentTime,
+      isPlaying: engine.isPlaying,
+      artworkUrl: track.artworkUrl,
+    });
+    lastNativeSyncRef.current = Date.now();
+
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
 
     try {
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -148,16 +211,30 @@ export default function App() {
     } catch {
       // Ignore MediaSession errors on unsupported environments
     }
-  }, [engine.currentTrack?.id]);
+  }, [engine.currentTrack?.id, engine.isPlaying]);
 
-  // Sync Media Session playbackState & throttled positionState
+  // Sync Media Session & Native Samsung Now Bar playback position throttled every 1.5s
   useEffect(() => {
-    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
-    if (!engine.currentTrack) return;
+    const track = engine.currentTrack;
+    if (!track) return;
+    const now = Date.now();
 
+    if (now - lastNativeSyncRef.current >= 1500) {
+      lastNativeSyncRef.current = now;
+      syncNativeNowPlaying({
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        durationSeconds: engine.duration || track.duration,
+        currentTimeSeconds: engine.currentTime,
+        isPlaying: engine.isPlaying,
+        artworkUrl: track.artworkUrl,
+      });
+    }
+
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
     try {
       navigator.mediaSession.playbackState = engine.isPlaying ? 'playing' : 'paused';
-      const now = Date.now();
       if (
         engine.duration > 0 &&
         typeof navigator.mediaSession.setPositionState === 'function' &&
@@ -327,6 +404,8 @@ export default function App() {
             engine={engine}
             dsp={dsp}
             storedTrackCount={allLibraryTracks.length}
+            isInAppPip={isInAppPip}
+            onToggleInAppPip={() => setIsInAppPip((prev) => !prev)}
             onQuickPlay={handleQuickPlay}
             onTogglePlay={() => void audioEngine.togglePlay()}
             onPlayTrack={playTrack}
@@ -420,6 +499,8 @@ export default function App() {
         dsp={dsp}
         isFavorite={engine.currentTrack ? favoriteIds.includes(engine.currentTrack.id) : false}
         storedLyrics={engine.currentTrack ? lyricsMap[engine.currentTrack.id] : undefined}
+        isInAppPip={isInAppPip}
+        onToggleInAppPip={() => setIsInAppPip((prev) => !prev)}
         onTogglePlay={() => void audioEngine.togglePlay()}
         onSeek={(sec) => audioEngine.seek(sec)}
         onSeekBy={(sec) => audioEngine.seekBy(sec)}
@@ -430,7 +511,28 @@ export default function App() {
         onToggleFavorite={handleToggleFavorite}
         onOpenDsp={() => setIsDspOpen(true)}
         onUpdateLyricsOffset={(id, offset) => void handleUpdateLyricsOffset(id, offset)}
+        onOpenStream={() => setActiveTab('stream')}
       />
+
+      <FloatingPipWindow
+        isOpen={isInAppPip && !isNativePip}
+        track={engine.currentTrack}
+        isPlaying={engine.isPlaying}
+        onTogglePlay={() => void audioEngine.togglePlay()}
+        onExpand={() => {
+          setIsInAppPip(false);
+          setIsFullscreenOpen(true);
+        }}
+        onClose={() => setIsInAppPip(false)}
+      />
+
+      {isNativePip && (
+        <div
+          ref={nativePipStageRef}
+          aria-label="Android Picture-in-Picture Player"
+          className="fixed inset-0 z-[100] bg-black flex items-center justify-center"
+        />
+      )}
 
       <SharedLiveStudioModal
         isOpen={isLiveStudioOpen}

@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
-import { isIndividualSong, sortStudioQueue } from './src/utils/streamFilter';
+import { extractYouTubeSearchResults, isIndividualSong, sortStudioQueue } from './src/utils/streamFilter';
 import type {
   StudioChatMessage,
   StudioPlaybackState,
@@ -111,39 +111,119 @@ function appendSystemMessage(text: string) {
   broadcast({ type: 'studio:chat_message', message: msg });
 }
 
-interface ItunesSong {
-  trackId?: number;
-  trackName?: string;
-  artistName?: string;
-  collectionName?: string;
-  previewUrl?: string;
-  artworkUrl100?: string;
-  trackTimeMillis?: number;
-  primaryGenreName?: string;
+interface AudiusTrack {
+  id?: string;
+  title?: string;
+  duration?: number;
+  genre?: string;
+  user?: { name?: string };
+  artwork?: { '480x480'?: string; '150x150'?: string };
 }
 
-function mapItunesSongToTrack(item: ItunesSong): Track | null {
-  if (!item.trackName || !item.artistName || !item.previewUrl || !item.trackId) return null;
-  const durationSec = item.trackTimeMillis ? Math.round(item.trackTimeMillis / 1000) : 30;
-  if (!isIndividualSong(item.trackName, item.collectionName, durationSec)) {
-    return null;
-  }
-  const artwork = item.artworkUrl100
-    ? item.artworkUrl100.replace('100x100bb', '600x600bb')
-    : undefined;
+async function searchYouTubeTracks(
+  term: string,
+  genre?: string,
+  excludeYoutubeId?: string
+): Promise<Track[]> {
+  try {
+    const queryWithIntent = /\b(audio|lyrics|song|official)\b/i.test(term)
+      ? term
+      : `${term} audio`;
+    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(
+      queryWithIntent
+    )}&sp=EgIQAQ%3D%3D`;
 
-  return {
-    id: `stream-${item.trackId}`,
-    title: item.trackName,
-    artist: item.artistName,
-    album: item.collectionName || 'Single',
-    duration: durationSec,
-    source: 'stream',
-    artworkUrl: artwork,
-    streamUrl: item.previewUrl,
-    genre: item.primaryGenreName || 'Stream',
-    addedAt: Date.now(),
-  };
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(6500),
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Cookie: 'SOCS=CAI',
+      },
+    });
+    if (!response.ok) return [];
+    const html = await response.text();
+    const parsed = extractYouTubeSearchResults(html)
+      .filter((item) => !excludeYoutubeId || item.videoId !== excludeYoutubeId)
+      .slice(0, 12);
+
+    return parsed.map((item) => ({
+      id: `yt-${item.videoId}`,
+      youtubeId: item.videoId,
+      streamProvider: 'youtube' as const,
+      title: item.title,
+      artist: item.artist,
+      album: 'YouTube Music Stream',
+      duration: item.durationSeconds,
+      source: 'stream' as const,
+      artworkUrl: item.thumbnailUrl,
+      genre: genre || 'YouTube',
+      addedAt: Date.now(),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function searchAudiusTracks(term: string, genre?: string): Promise<Track[]> {
+  try {
+    const url = `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(
+      term
+    )}&limit=12`;
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(4500),
+      headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) return [];
+    const data = (await response.json()) as { data?: AudiusTrack[] };
+    const results: Track[] = [];
+
+    for (const item of data.data || []) {
+      if (!item.id || !item.title || !item.duration) continue;
+      if (!isIndividualSong(item.title, item.genre, item.duration)) continue;
+      results.push({
+        id: `audius-${item.id}`,
+        streamProvider: 'audius',
+        title: item.title,
+        artist: item.user?.name || 'Audius Artist',
+        album: 'Audius Full Stream',
+        duration: Math.round(item.duration),
+        source: 'stream',
+        artworkUrl: item.artwork?.['480x480'] || item.artwork?.['150x150'],
+        streamUrl: `https://api.audius.co/v1/tracks/${encodeURIComponent(item.id)}/stream`,
+        genre: item.genre || genre || 'Stream',
+        addedAt: Date.now(),
+      });
+    }
+    return results.slice(0, 12);
+  } catch {
+    return [];
+  }
+}
+
+function isAllowedProxyHost(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  if (
+    lower === 'localhost' ||
+    lower === '127.0.0.1' ||
+    lower === '0.0.0.0' ||
+    lower.startsWith('10.') ||
+    lower.startsWith('192.168.') ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(lower)
+  ) {
+    return false;
+  }
+  const allowedSuffixes = [
+    'audius.co',
+    'audius.org',
+    'audiusrules.com',
+    'mzstatic.com',
+    'apple.com',
+  ];
+  return allowedSuffixes.some(
+    (host) => lower === host || lower.endsWith(`.${host}`)
+  );
 }
 
 async function startServer() {
@@ -157,57 +237,59 @@ async function startServer() {
   app.get('/api/stream/search', async (req, res) => {
     const query = String(req.query.q || '').trim();
     const genre = String(req.query.genre || '').trim();
-    const term = [query, genre].filter(Boolean).join(' ') || 'electronic synthwave';
+    const baseTerm = [query, genre ? `${genre} music` : ''].filter(Boolean).join(' ') || 'synthwave electronic music';
 
-    try {
-      const url = `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&entity=song&limit=24`;
-      const response = await fetch(url, {
-        signal: AbortSignal.timeout(4500),
-        headers: { Accept: 'application/json' },
-      });
-      if (!response.ok) {
-        return res.json({ results: [], source: 'fallback' });
-      }
-      const data = (await response.json()) as { results?: ItunesSong[] };
-      const mapped = (data.results || [])
-        .map(mapItunesSongToTrack)
-        .filter((t): t is Track => t !== null)
-        .slice(0, 12);
-
-      return res.json({ results: mapped, source: 'live' });
-    } catch {
-      return res.json({ results: [], source: 'fallback' });
+    const ytResults = await searchYouTubeTracks(baseTerm, genre);
+    if (ytResults.length > 0) {
+      return res.json({ results: ytResults, source: 'live', provider: 'youtube' });
     }
+
+    const audiusResults = await searchAudiusTracks([query, genre].filter(Boolean).join(' ') || 'synthwave', genre);
+    if (audiusResults.length > 0) {
+      return res.json({ results: audiusResults, source: 'live', provider: 'audius' });
+    }
+
+    return res.json({ results: [], source: 'fallback' });
   });
 
   app.get('/api/stream/recover', async (req, res) => {
     const title = String(req.query.title || '').trim();
     const artist = String(req.query.artist || '').trim();
     const genre = String(req.query.genre || '').trim();
-    const searchTerm = [title, artist].filter(Boolean).join(' ') || genre || 'synthwave';
+    const excludeId = String(req.query.excludeId || '').trim();
 
-    try {
-      const url = `https://itunes.apple.com/search?term=${encodeURIComponent(searchTerm)}&media=music&entity=song&limit=8`;
-      const response = await fetch(url, {
-        signal: AbortSignal.timeout(4000),
-        headers: { Accept: 'application/json' },
-      });
-      if (response.ok) {
-        const data = (await response.json()) as { results?: ItunesSong[] };
-        const candidate = (data.results || [])
-          .map(mapItunesSongToTrack)
-          .find((t): t is Track => t !== null && Boolean(t.streamUrl));
-        if (candidate?.streamUrl) {
-          return res.json({
-            recovered: true,
-            mode: 'alternate-stream',
-            streamUrl: candidate.streamUrl,
-            recoveredFrom: `Alternate Stream #${candidate.id.replace('stream-', '')}`,
-          });
-        }
+    const recoveryQueries = [
+      [title, artist, 'lyrics audio'].filter(Boolean).join(' '),
+      [title, 'official audio'].filter(Boolean).join(' '),
+    ].filter(Boolean);
+
+    for (const q of recoveryQueries) {
+      const ytCandidates = await searchYouTubeTracks(q, genre, excludeId);
+      if (ytCandidates[0]?.youtubeId) {
+        const alt = ytCandidates[0];
+        return res.json({
+          recovered: true,
+          mode: 'alternate-youtube',
+          youtubeId: alt.youtubeId,
+          id: alt.id,
+          duration: alt.duration,
+          artworkUrl: alt.artworkUrl,
+          recoveredFrom: `Alternate YouTube (${alt.youtubeId})`,
+        });
       }
-    } catch {
-      // Fall through to local synth recovery
+    }
+
+    const audiusCandidates = await searchAudiusTracks([title, artist].filter(Boolean).join(' ') || genre || 'synthwave', genre);
+    if (audiusCandidates[0]?.streamUrl) {
+      const alt = audiusCandidates[0];
+      return res.json({
+        recovered: true,
+        mode: 'alternate-stream',
+        streamUrl: alt.streamUrl,
+        duration: alt.duration,
+        artworkUrl: alt.artworkUrl,
+        recoveredFrom: 'Audius Full-Length Mirror',
+      });
     }
 
     return res.json({
@@ -224,21 +306,18 @@ async function startServer() {
     }
     try {
       const parsed = new URL(rawUrl);
-      const allowedHosts = ['mzstatic.com', 'apple.com'];
-      const isAllowed = allowedHosts.some(
-        (host) => parsed.hostname === host || parsed.hostname.endsWith(`.${host}`)
-      );
-      if (!isAllowed || parsed.protocol !== 'https:') {
+      if (parsed.protocol !== 'https:' || !isAllowedProxyHost(parsed.hostname)) {
         return res.status(403).send('Host not permitted');
       }
 
       const upstream = await fetch(parsed.toString(), {
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(10000),
+        redirect: 'follow',
       });
       if (!upstream.ok || !upstream.body) {
         return res.status(502).send('Upstream error');
       }
-      const contentType = upstream.headers.get('content-type') || 'audio/mp4';
+      const contentType = upstream.headers.get('content-type') || 'audio/mpeg';
       res.setHeader('Content-Type', contentType);
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Cache-Control', 'public, max-age=3600');

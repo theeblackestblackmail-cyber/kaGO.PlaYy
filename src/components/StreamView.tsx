@@ -60,10 +60,49 @@ export const StreamView: React.FC<StreamViewProps> = ({
       if (genreFilter) params.set('genre', genreFilter);
 
       const res = await fetch(`/api/stream/search?${params.toString()}`);
-      const data = (await res.json()) as { results?: Track[]; source?: string };
-      const liveSongs = (data.results || []).filter((t) =>
-        isIndividualSong(t.title, t.album, t.duration)
-      );
+      let liveSongs: Track[] = [];
+      let sourceFlag = 'live';
+
+      if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
+        const data = (await res.json()) as { results?: Track[]; source?: string };
+        liveSongs = (data.results || []).filter((t) =>
+          isIndividualSong(t.title, t.album, t.duration)
+        );
+        sourceFlag = data.source || 'live';
+      } else {
+        // Standalone APK / static fallback via CORS-enabled Audius full-length API
+        const audiusQ = [cleanQ, genreFilter].filter(Boolean).join(' ') || 'synthwave';
+        const aRes = await fetch(
+          `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(audiusQ)}&limit=12`
+        );
+        if (aRes.ok) {
+          const aJson = (await aRes.json()) as {
+            data?: Array<{
+              id?: string;
+              title?: string;
+              duration?: number;
+              genre?: string;
+              user?: { name?: string };
+              artwork?: { '480x480'?: string; '150x150'?: string };
+            }>;
+          };
+          liveSongs = (aJson.data || [])
+            .filter((item) => item.id && item.title && item.duration && isIndividualSong(item.title, item.genre, item.duration))
+            .map((item) => ({
+              id: `audius-${item.id}`,
+              streamProvider: 'audius' as const,
+              title: item.title!,
+              artist: item.user?.name || 'Audius Artist',
+              album: 'Audius Full Stream',
+              duration: Math.round(item.duration!),
+              source: 'stream' as const,
+              artworkUrl: item.artwork?.['480x480'] || item.artwork?.['150x150'],
+              streamUrl: `https://api.audius.co/v1/tracks/${encodeURIComponent(item.id!)}/stream`,
+              genre: item.genre || genreFilter || 'Stream',
+              addedAt: Date.now(),
+            }));
+        }
+      }
 
       // Filter local curated sound bank as complementary offline-ready results
       const localMatches = CURATED_STREAM_BANK.filter((item) => {
@@ -76,9 +115,9 @@ export const StreamView: React.FC<StreamViewProps> = ({
         return matchesGenre && matchesQuery;
       });
 
-      const merged = liveSongs.length > 0 ? [...liveSongs, ...localMatches] : localMatches;
+      const merged = liveSongs.length > 0 ? liveSongs : localMatches;
       setResults(merged.length > 0 ? merged : CURATED_STREAM_BANK);
-      if (data.source === 'fallback' && liveSongs.length === 0) {
+      if (sourceFlag === 'fallback' && liveSongs.length === 0) {
         setStatusNote('Showing curated offline sound bank tracks (individual songs only).');
       }
     } catch {
@@ -109,25 +148,46 @@ export const StreamView: React.FC<StreamViewProps> = ({
       const res = await fetch(
         `/api/stream/recover?title=${encodeURIComponent(track.title)}&artist=${encodeURIComponent(
           track.artist
-        )}&genre=${encodeURIComponent(track.genre || '')}`
+        )}&genre=${encodeURIComponent(track.genre || '')}&excludeId=${encodeURIComponent(
+          track.youtubeId || ''
+        )}`
       );
       const data = (await res.json()) as {
         recovered?: boolean;
         mode?: string;
+        youtubeId?: string;
         streamUrl?: string;
+        duration?: number;
+        artworkUrl?: string;
         recoveredFrom?: string;
       };
 
       const recoveredTrack: Track =
-        data.mode === 'alternate-stream' && data.streamUrl
+        data.mode === 'alternate-youtube' && data.youtubeId
           ? {
               ...track,
+              youtubeId: data.youtubeId,
+              streamUrl: undefined,
+              streamProvider: 'youtube',
+              duration: data.duration || track.duration,
+              artworkUrl: data.artworkUrl || track.artworkUrl,
+              recoveredFrom: data.recoveredFrom || 'Alternate YouTube Audio',
+            }
+          : data.mode === 'alternate-stream' && data.streamUrl
+          ? {
+              ...track,
+              youtubeId: undefined,
               streamUrl: data.streamUrl,
-              recoveredFrom: data.recoveredFrom || 'Alternate Mirror',
+              streamProvider: 'audius',
+              duration: data.duration || track.duration,
+              artworkUrl: data.artworkUrl || track.artworkUrl,
+              recoveredFrom: data.recoveredFrom || 'Audius Full-Length Mirror',
             }
           : {
               ...track,
+              youtubeId: undefined,
               streamUrl: undefined,
+              streamProvider: 'synth',
               recoveredFrom: 'Local Synth Engine Stem',
               synthProfile: track.synthProfile || {
                 bpm: 118,
@@ -144,7 +204,9 @@ export const StreamView: React.FC<StreamViewProps> = ({
     } catch {
       const fallbackTrack: Track = {
         ...track,
+        youtubeId: undefined,
         streamUrl: undefined,
+        streamProvider: 'synth',
         recoveredFrom: 'Local Synth Stem Fallback',
         synthProfile: track.synthProfile || {
           bpm: 114,
@@ -169,7 +231,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
           <div>
             <h1 className="font-display text-2xl font-bold text-[#F4F3F0]">Free Music Streamer</h1>
             <p className="text-xs text-[#8E929B]">
-              Zero-signup stream search strictly filtered for individual songs (no playlists or mixes)
+              Zero-signup full-length YouTube & free music search strictly filtered for individual songs
             </p>
           </div>
           {statusNote && (

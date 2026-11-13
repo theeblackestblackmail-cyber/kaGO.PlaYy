@@ -45,6 +45,8 @@ export interface Track {
   source: TrackSource;
   artworkUrl?: string;
   streamUrl?: string;
+  youtubeId?: string;
+  streamProvider?: 'youtube' | 'audius' | 'synth';
   folderPath?: string;
   trackNumber?: number;
   genre?: string;

@@ -55,16 +55,36 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
       }
 
       const hasAnalyser = audioEngine.getFrequencyData(freqBuffer);
+      const hasLiveSignal = hasAnalyser && freqBuffer.some((v) => v > 4);
+      const nowSec = performance.now() / 1000;
       const gap = 3;
       const barW = Math.max(2, (width - gap * (barCount - 1)) / barCount);
 
       for (let i = 0; i < barCount; i++) {
         let targetNorm = 0;
-        if (isPlaying && hasAnalyser) {
+        if (isPlaying && hasLiveSignal) {
           const binIdx = Math.min(freqBuffer.length - 1, Math.floor((i / barCount) * 48));
           const rawVal = freqBuffer[binIdx] / 255;
           // Shape subtle floor + responsive peaks
           targetNorm = Math.min(1, rawVal * 1.08);
+        } else if (isPlaying) {
+          // Cross-origin iframe streams (YouTube) cannot expose raw PCM to AnalyserNode:
+          // drive smooth multi-harmonic bars shaped by the active 5-band EQ & 80 Hz Bass Boost
+          const bandFloat = (i / (barCount - 1)) * 4;
+          const b0 = Math.floor(bandFloat);
+          const b1 = Math.min(4, b0 + 1);
+          const frac = bandFloat - b0;
+          const eqDb =
+            (dsp.bands[b0] ?? 0) * (1 - frac) + (dsp.bands[b1] ?? 0) * frac;
+          const boostDb = i < 9 && dsp.bassBoostEnabled ? dsp.bassBoostDb * 0.45 : 0;
+          const eqScale = Math.max(0.45, Math.min(1.45, 1 + (eqDb + boostDb) / 24));
+          const bassRollOff = 0.88 - (i / barCount) * 0.36;
+          const beatPulse =
+            0.34 +
+            0.26 * Math.sin(nowSec * 6.4 - i * 0.28) +
+            0.16 * Math.cos(nowSec * 11.2 + i * 0.71) +
+            0.12 * Math.sin(nowSec * 3.1 + i * 0.15);
+          targetNorm = Math.max(0.08, Math.min(0.96, beatPulse * bassRollOff * eqScale));
         } else {
           targetNorm = 0.03;
         }
@@ -113,7 +133,7 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
     };
-  }, [isPlaying, height]);
+  }, [isPlaying, height, dsp]);
 
   return (
     <div className="rounded-lg border border-[#1B1D26] bg-[#050508] p-3.5">

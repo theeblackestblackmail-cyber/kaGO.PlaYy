@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Disc,
+  Disc3,
   FolderOpen,
   Mic2,
   Music,
@@ -8,16 +9,20 @@ import {
   Play,
   Radio,
   Sliders,
+  Video,
 } from 'lucide-react';
 import { PROCEDURAL_STEMS } from '../data/presetsAndStems';
 import type { ActiveTab, AudioEngineSnapshot, DspSettings, Track } from '../types/audio';
 import { SpectrumVisualizer } from './SpectrumVisualizer';
 import { VinylTurntable } from './VinylTurntable';
+import { WatchVideoViewport } from './WatchVideoViewport';
 
 interface DashboardViewProps {
   engine: AudioEngineSnapshot;
   dsp: DspSettings;
   storedTrackCount: number;
+  isInAppPip: boolean;
+  onToggleInAppPip: () => void;
   onQuickPlay: () => void;
   onTogglePlay: () => void;
   onPlayTrack: (track: Track) => void;
@@ -30,6 +35,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   engine,
   dsp,
   storedTrackCount,
+  isInAppPip,
+  onToggleInAppPip,
   onQuickPlay,
   onTogglePlay,
   onPlayTrack,
@@ -38,6 +45,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onNavigate,
 }) => {
   const activeIsRunning = engine.isPlaying;
+  const [deckMode, setDeckMode] = useState<'turntable' | 'video'>('turntable');
 
   return (
     <div className="space-y-6">
@@ -151,15 +159,76 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </section>
 
-      {/* Turntable and Telemetry Split */}
+      {/* Turntable / Watch Video and Telemetry Split */}
       <section className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
-        {/* Left (wider): Turntable */}
-        <div className="lg:col-span-7 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-5 flex flex-col justify-center">
-          <VinylTurntable
-            track={engine.currentTrack}
-            isPlaying={activeIsRunning}
-            onTogglePlay={engine.currentTrack ? onTogglePlay : onQuickPlay}
-          />
+        {/* Left (wider): Turntable + Watch Video Tab */}
+        <div className="lg:col-span-7 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-5 flex flex-col justify-between gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#1E2028] pb-3">
+            <div
+              role="tablist"
+              aria-label="Deck display mode"
+              className="inline-flex items-center gap-1 rounded-lg border border-[#222530] bg-[#090A0E] p-1"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={deckMode === 'turntable'}
+                onClick={() => setDeckMode('turntable')}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+                  deckMode === 'turntable'
+                    ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
+                    : 'text-[#8E929B] hover:text-white'
+                }`}
+              >
+                <Disc3 className="h-3.5 w-3.5" />
+                <span>Turntable</span>
+              </button>
+
+              <button
+                type="button"
+                role="tab"
+                aria-selected={deckMode === 'video'}
+                onClick={() => setDeckMode('video')}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+                  deckMode === 'video'
+                    ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
+                    : 'text-[#8E929B] hover:text-white'
+                }`}
+              >
+                <Video className="h-3.5 w-3.5" />
+                <span>Watch Video</span>
+                {engine.currentTrack?.youtubeId && (
+                  <span className="h-1.5 w-1.5 rounded-full bg-[#FDA4AF]" />
+                )}
+              </button>
+            </div>
+
+            {engine.currentTrack?.youtubeId && deckMode === 'turntable' && (
+              <span className="font-mono-tabular text-[11px] text-[#8E929B]">
+                Background audio active
+              </span>
+            )}
+          </div>
+
+          <div className="flex-1 flex flex-col justify-center">
+            {deckMode === 'turntable' ? (
+              <VinylTurntable
+                track={engine.currentTrack}
+                isPlaying={activeIsRunning}
+                onTogglePlay={engine.currentTrack ? onTogglePlay : onQuickPlay}
+              />
+            ) : (
+              <WatchVideoViewport
+                track={engine.currentTrack}
+                isPlaying={activeIsRunning}
+                currentTime={engine.currentTime}
+                zIndex={30}
+                isInAppPip={isInAppPip}
+                onToggleInAppPip={onToggleInAppPip}
+                onOpenStream={() => onNavigate('stream')}
+              />
+            )}
+          </div>
         </div>
 
         {/* Right: Audio Engine Status */}
