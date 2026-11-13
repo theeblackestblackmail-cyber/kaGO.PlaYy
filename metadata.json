@@ -2,5 +2,7 @@
   "name": "kaGO.PIaY",
   "description": "Offline Audio Engine and Free Music Streamer — dual-channel pro-audio hardware workstation, direct-drive turntable, DSP rack, folder scanner, and synced lyrics.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
