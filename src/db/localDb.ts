@@ -12,9 +12,13 @@ const STORES = {
   META: 'meta',
 } as const;
 
+let cachedDbPromise: Promise<IDBDatabase> | null = null;
+
 function openDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (cachedDbPromise) return cachedDbPromise;
+  cachedDbPromise = new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
+      cachedDbPromise = null;
       reject(new Error('IndexedDB unavailable'));
       return;
     }
@@ -37,9 +41,19 @@ function openDb(): Promise<IDBDatabase> {
         db.createObjectStore(STORES.META);
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onclose = () => {
+        cachedDbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => {
+      cachedDbPromise = null;
+      reject(req.error);
+    };
   });
+  return cachedDbPromise;
 }
 
 async function getAllFromStore<T>(storeName: string): Promise<T[]> {
