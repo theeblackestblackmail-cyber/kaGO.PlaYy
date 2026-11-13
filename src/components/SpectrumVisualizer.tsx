@@ -1,0 +1,138 @@
+import React, { useEffect, useRef } from 'react';
+import { audioEngine } from '../audio/AudioEngine';
+import type { DspSettings } from '../types/audio';
+
+interface SpectrumVisualizerProps {
+  isPlaying: boolean;
+  dsp: DspSettings;
+  height?: number;
+  compact?: boolean;
+}
+
+export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
+  isPlaying,
+  dsp,
+  height = 148,
+  compact = false,
+}) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const peaksRef = useRef<number[]>(new Array(44).fill(0));
+  const barsRef = useRef<number[]>(new Array(44).fill(0));
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let rafId = 0;
+    const freqBuffer = new Uint8Array(64);
+    const barCount = 44;
+
+    const renderFrame = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const rect = canvas.getBoundingClientRect();
+      const width = Math.max(240, Math.floor(rect.width));
+      const h = height;
+
+      if (canvas.width !== width * dpr || canvas.height !== h * dpr) {
+        canvas.width = width * dpr;
+        canvas.height = h * dpr;
+      }
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, h);
+
+      // Subtle reference grid lines
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+      ctx.lineWidth = 1;
+      for (let g = 1; g <= 3; g++) {
+        const gy = Math.round((h / 4) * g) + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(0, gy);
+        ctx.lineTo(width, gy);
+        ctx.stroke();
+      }
+
+      const hasAnalyser = audioEngine.getFrequencyData(freqBuffer);
+      const gap = 3;
+      const barW = Math.max(2, (width - gap * (barCount - 1)) / barCount);
+
+      for (let i = 0; i < barCount; i++) {
+        let targetNorm = 0;
+        if (isPlaying && hasAnalyser) {
+          const binIdx = Math.min(freqBuffer.length - 1, Math.floor((i / barCount) * 48));
+          const rawVal = freqBuffer[binIdx] / 255;
+          // Shape subtle floor + responsive peaks
+          targetNorm = Math.min(1, rawVal * 1.08);
+        } else {
+          targetNorm = 0.03;
+        }
+
+        // Smooth interpolation
+        const prev = barsRef.current[i] || 0;
+        const nextVal = targetNorm > prev ? prev + (targetNorm - prev) * 0.45 : prev * 0.86;
+        barsRef.current[i] = Math.max(0.025, nextVal);
+
+        // Falling peak cap physics
+        if (barsRef.current[i] >= peaksRef.current[i]) {
+          peaksRef.current[i] = barsRef.current[i];
+        } else {
+          peaksRef.current[i] = Math.max(0.035, peaksRef.current[i] - 0.0085);
+        }
+
+        const barH = Math.max(3, barsRef.current[i] * (h - 14));
+        const x = i * (barW + gap);
+        const y = h - barH;
+
+        const grad = ctx.createLinearGradient(x, h, x, y);
+        grad.addColorStop(0, '#9F1239');
+        grad.addColorStop(0.55, '#E11D48');
+        grad.addColorStop(1, '#FF5A5F');
+
+        ctx.fillStyle = grad;
+        ctx.fillRect(x, y, barW, barH);
+
+        // Falling peak cap
+        const peakY = Math.max(2, h - peaksRef.current[i] * (h - 14) - 3);
+        ctx.fillStyle = isPlaying ? '#FDA4AF' : '#3E4251';
+        ctx.fillRect(x, peakY, barW, 2);
+      }
+
+      const stillSettling =
+        isPlaying ||
+        barsRef.current.some((v) => v > 0.03) ||
+        peaksRef.current.some((p) => p > 0.04);
+
+      if (stillSettling) {
+        rafId = requestAnimationFrame(renderFrame);
+      }
+    };
+
+    rafId = requestAnimationFrame(renderFrame);
+    return () => {
+      if (rafId) cancelAnimationFrame(rafId);
+    };
+  }, [isPlaying, height]);
+
+  return (
+    <div className="rounded-lg border border-[#1B1D26] bg-[#050508] p-3.5">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-[#8E929B]">
+        <span className="font-mono-tabular">20 Hz – 20 kHz Spectrum</span>
+        <div className="flex items-center gap-3 font-mono-tabular">
+          <span>EQ: {dsp.preset}</span>
+          <span aria-hidden="true">·</span>
+          <span className={dsp.bassBoostEnabled ? 'text-[#FF4D6D]' : ''}>
+            80 Hz Boost: {dsp.bassBoostEnabled ? `+${dsp.bassBoostDb} dB` : 'Bypass'}
+          </span>
+        </div>
+      </div>
+      <canvas
+        ref={canvasRef}
+        data-testid="spectrum-canvas"
+        className="w-full block"
+        style={{ height: `${compact ? 104 : height}px` }}
+      />
+    </div>
+  );
+};

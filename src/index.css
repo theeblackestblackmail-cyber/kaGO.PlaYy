@@ -1,0 +1,136 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Syne', sans-serif;
+    --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  }
+
+  html,
+  body {
+    background-color: #000000;
+    color: #f4f3f0;
+    font-family: var(--font-sans);
+    overflow-x: hidden;
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
+
+.font-mono-tabular {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes vinyl-spin-33 {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes vinyl-spin-45 {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.vinyl-spinning-33 {
+  animation: vinyl-spin-33 1.818s linear infinite;
+}
+
+.vinyl-spinning-45 {
+  animation: vinyl-spin-45 1.333s linear infinite;
+}
+
+.vinyl-paused {
+  animation-play-state: paused;
+}
+
+/* Custom Range Inputs for Hardware DSP Studio */
+input[type='range'].hardware-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type='range'].hardware-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: #232631;
+}
+
+input[type='range'].hardware-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #e11d48;
+  border: 2px solid #f4f3f0;
+  margin-top: -5px;
+  box-shadow: 0 0 10px rgba(225, 29, 72, 0.55);
+}
+
+input[type='range'].hardware-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: #232631;
+}
+
+input[type='range'].hardware-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: #e11d48;
+  border: 2px solid #f4f3f0;
+  box-shadow: 0 0 10px rgba(225, 29, 72, 0.55);
+}
+
+/* Vertical EQ Faders */
+input[type='range'].eq-vertical-fader {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  -webkit-appearance: none;
+  appearance: none;
+  width: 32px;
+  height: 144px;
+  background: transparent;
+  cursor: ns-resize;
+}
+
+input[type='range'].eq-vertical-fader::-webkit-slider-runnable-track {
+  width: 6px;
+  border-radius: 9999px;
+  background: #1b1d25;
+  border: 1px solid #2b2e3a;
+}
+
+input[type='range'].eq-vertical-fader::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 24px;
+  height: 12px;
+  border-radius: 3px;
+  background: #e11d48;
+  border: 1px solid #f4f3f0;
+  margin-left: -10px;
+  box-shadow: 0 0 8px rgba(225, 29, 72, 0.5);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vinyl-spinning-33,
+  .vinyl-spinning-45 {
+    animation: none !important;
+  }
+}
