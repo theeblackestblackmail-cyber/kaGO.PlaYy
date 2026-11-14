@@ -321,3 +321,16 @@ export function subscribeNativePipState(
   window.addEventListener('kago-native-pip', listener);
   return () => window.removeEventListener('kago-native-pip', listener);
 }
+
+export function subscribeNativeKeepalive(
+  handler: (phase: string) => void
+): () => void {
+  if (typeof window === 'undefined') return () => {};
+  const listener = (ev: Event) => {
+    const custom = ev as CustomEvent<{ phase?: string }>;
+    handler(custom?.detail?.phase || 'native');
+  };
+  window.addEventListener('kago-native-keepalive', listener);
+  return () => window.removeEventListener('kago-native-keepalive', listener);
+}
+

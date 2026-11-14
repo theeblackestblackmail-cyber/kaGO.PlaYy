@@ -457,3 +457,21 @@ export function mergeAutoplayQueue(
 
   return [...baseQueue, ...additions];
 }
+
+export function shouldAutoResumeBackgroundPause(params: {
+  isPlaying: boolean;
+  visibilityState: string;
+  now: number;
+  backgroundTransitionUntil: number;
+  userPausedAt: number;
+}): boolean {
+  if (!params.isPlaying) return false;
+  if (params.userPausedAt > 0 && params.now - params.userPausedAt < 2000) {
+    return false;
+  }
+  return (
+    params.visibilityState !== 'visible' ||
+    params.now < params.backgroundTransitionUntil
+  );
+}
+

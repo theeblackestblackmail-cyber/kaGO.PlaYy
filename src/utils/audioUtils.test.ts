@@ -18,6 +18,7 @@ import {
   parseYouTubeSuggestResponse,
   parseYouTubeViewCount,
   rankYouTubeSearchResults,
+  shouldAutoResumeBackgroundPause,
   sortStudioQueue,
 } from './streamFilter';
 import type { StudioQueueItem, Track } from '../types/audio';
@@ -314,6 +315,8 @@ test('setup-android-native patches AndroidManifest, Gradle, and copies Java Medi
 
     const manifest = fs.readFileSync(path.join(androidMain, 'AndroidManifest.xml'), 'utf8');
     assert.ok(manifest.includes('android:hardwareAccelerated="true"'));
+    assert.ok(manifest.includes('ACCESS_WIFI_STATE'));
+    assert.ok(manifest.includes('ACCESS_NETWORK_STATE'));
     assert.ok(manifest.includes('FOREGROUND_SERVICE_MEDIA_PLAYBACK'));
     assert.ok(manifest.includes('POST_NOTIFICATIONS'));
     assert.ok(manifest.includes('android:supportsPictureInPicture="true"'));
@@ -461,3 +464,87 @@ test('folderImporter filters supported audio files and builds local tracks clean
   assert.equal(built[0].track.artist, 'Kavinsky');
   assert.equal(built[0].track.title, 'Nightcall');
 });
+
+test('themeManager converts HSV/Hex accurately and derives accessible accent palettes', async () => {
+  const {
+    deriveAccentPalette,
+    getContrastTextColor,
+    hexToHsv,
+    hsvToHex,
+    normalizeHex,
+  } = await import('./themeManager');
+
+  assert.equal(normalizeHex('3b82f6'), '#3B82F6');
+  assert.equal(normalizeHex('#abc'), '#AABBCC');
+  assert.equal(normalizeHex('invalid'), null);
+
+  // Pure primary round-trips
+  assert.equal(hsvToHex(0, 100, 100), '#FF0000');
+  assert.equal(hsvToHex(240, 100, 100), '#0000FF');
+  const redHsv = hexToHsv('#E11D48');
+  const roundTrip = hsvToHex(redHsv.h, redHsv.s, redHsv.v);
+  assert.ok(roundTrip.startsWith('#') && roundTrip.length === 7);
+
+  // Contrast safety for light vs dark accent choices
+  assert.equal(getContrastTextColor('#FACC15'), '#0A0B0F');
+  assert.equal(getContrastTextColor('#E11D48'), '#FFFFFF');
+
+  const blueDark = deriveAccentPalette('#2563EB', 'dark', 100);
+  assert.equal(blueDark.base, '#2563EB');
+  assert.equal(blueDark.rgb, '37, 99, 235');
+  assert.equal(blueDark.onAccent, '#FFFFFF');
+});
+
+test('shouldAutoResumeBackgroundPause keeps backgrounded playback alive while respecting explicit pauses', () => {
+  const now = 100_000;
+
+  // Switching to Recents / another app triggers visibility=hidden: auto-resume!
+  assert.equal(
+    shouldAutoResumeBackgroundPause({
+      isPlaying: true,
+      visibilityState: 'hidden',
+      now,
+      backgroundTransitionUntil: 0,
+      userPausedAt: 0,
+    }),
+    true
+  );
+
+  // Within native minimize grace window even if visibility momentarily flickers: auto-resume!
+  assert.equal(
+    shouldAutoResumeBackgroundPause({
+      isPlaying: true,
+      visibilityState: 'visible',
+      now,
+      backgroundTransitionUntil: now + 3000,
+      userPausedAt: 0,
+    }),
+    true
+  );
+
+  // Explicit user pause within last 2s must NOT auto-resume
+  assert.equal(
+    shouldAutoResumeBackgroundPause({
+      isPlaying: true,
+      visibilityState: 'hidden',
+      now,
+      backgroundTransitionUntil: now + 3000,
+      userPausedAt: now - 500,
+    }),
+    false
+  );
+
+  // Already paused state stays paused
+  assert.equal(
+    shouldAutoResumeBackgroundPause({
+      isPlaying: false,
+      visibilityState: 'hidden',
+      now,
+      backgroundTransitionUntil: now + 3000,
+      userPausedAt: 0,
+    }),
+    false
+  );
+});
+
+

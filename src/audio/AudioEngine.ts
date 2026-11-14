@@ -1,8 +1,17 @@
 import { DEFAULT_DSP_SETTINGS, EQ_FREQUENCIES } from '../data/presetsAndStems';
 import { localDb } from '../db/localDb';
 import type { AudioEngineSnapshot, DspSettings, SynthProfile, Track } from '../types/audio';
-import { hasNativeHttpBridge, nativeFetchText } from '../utils/nativeMediaBridge';
-import { extractYouTubeSearchResults, rankYouTubeSearchResults } from '../utils/streamFilter';
+import {
+  hasNativeHttpBridge,
+  isNativeAndroidApp,
+  nativeFetchText,
+  subscribeNativeKeepalive,
+} from '../utils/nativeMediaBridge';
+import {
+  extractYouTubeSearchResults,
+  rankYouTubeSearchResults,
+  shouldAutoResumeBackgroundPause,
+} from '../utils/streamFilter';
 
 type Listener = (snapshot: AudioEngineSnapshot) => void;
 type TrackEndListener = () => void;
@@ -356,9 +365,101 @@ class DualChannelAudioEngine {
   private ytViewportZIndex = 30;
   private ytResizeObserver: ResizeObserver | null = null;
   private ytSyncListenerBound = false;
+  private backgroundTransitionUntil = 0;
+  private userPausedAt = 0;
+  private bgKeepaliveTimer: number | null = null;
+  private bgListenersBound = false;
 
   private listeners = new Set<Listener>();
   private endListeners = new Set<TrackEndListener>();
+
+  constructor() {
+    this.bindBackgroundListeners();
+  }
+
+  private bindBackgroundListeners() {
+    if (this.bgListenersBound || typeof document === 'undefined' || typeof window === 'undefined') {
+      return;
+    }
+    this.bgListenersBound = true;
+
+    const triggerKeepalive = () => {
+      if (!this.isPlaying) return;
+      this.handleBackgroundTransition();
+    };
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible' && this.isPlaying) {
+        this.handleBackgroundTransition();
+      }
+    });
+    window.addEventListener('pagehide', triggerKeepalive);
+    window.addEventListener('blur', triggerKeepalive);
+    subscribeNativeKeepalive(() => triggerKeepalive());
+  }
+
+  private handleBackgroundTransition() {
+    if (!this.isPlaying) return;
+    if (this.userPausedAt > 0 && Date.now() - this.userPausedAt < 2000) return;
+
+    this.backgroundTransitionUntil = Date.now() + 6500;
+    this.ensurePlaybackAliveNow();
+    window.setTimeout(() => this.ensurePlaybackAliveNow(), 160);
+    window.setTimeout(() => this.ensurePlaybackAliveNow(), 550);
+    this.startBgKeepalive();
+  }
+
+  private ensurePlaybackAliveNow() {
+    if (!this.isPlaying || !this.currentTrack) return;
+    if (this.userPausedAt > 0 && Date.now() - this.userPausedAt < 2000) return;
+
+    if (this.ctx && this.ctx.state === 'suspended') {
+      void this.ctx.resume().catch(() => {});
+    }
+
+    if (this.ytActive && this.ytPlayer && this.ytReady) {
+      try {
+        const state = this.ytPlayer.getPlayerState();
+        const statePlaying = window.YT?.PlayerState?.PLAYING ?? 1;
+        const stateBuffering = window.YT?.PlayerState?.BUFFERING ?? 3;
+        if (state !== statePlaying && state !== stateBuffering) {
+          this.ytPlayer.playVideo();
+        }
+      } catch {
+        // Ignore transient YouTube API errors
+      }
+      this.startYtTicker();
+      return;
+    }
+
+    const active = this.activeChannel === 'A' ? this.channelA : this.channelB;
+    if (active && active.audioEl.src && !active.synthDriver && active.audioEl.paused && !active.audioEl.ended) {
+      void active.audioEl.play().catch(() => {});
+    }
+  }
+
+  private startBgKeepalive() {
+    if (this.bgKeepaliveTimer !== null || typeof window === 'undefined') return;
+    this.bgKeepaliveTimer = window.setInterval(() => {
+      if (!this.isPlaying) {
+        this.stopBgKeepalive();
+        return;
+      }
+      const inBackground =
+        (typeof document !== 'undefined' && document.visibilityState !== 'visible') ||
+        isNativeAndroidApp();
+      if (inBackground) {
+        this.ensurePlaybackAliveNow();
+      }
+    }, 1200);
+  }
+
+  private stopBgKeepalive() {
+    if (this.bgKeepaliveTimer !== null) {
+      clearInterval(this.bgKeepaliveTimer);
+      this.bgKeepaliveTimer = null;
+    }
+  }
 
   subscribe(fn: Listener): () => void {
     this.listeners.add(fn);
@@ -873,15 +974,39 @@ class DualChannelAudioEngine {
                     this.duration = dur;
                   }
                   this.startYtTicker();
+                  this.startBgKeepalive();
                   this.syncYouTubeHostGeometry();
                   this.emit();
-                } else if (ev.data === statePaused && document.visibilityState === 'visible') {
-                  this.isPlaying = false;
-                  this.stopYtTicker();
-                  this.emit();
+                } else if (ev.data === statePaused) {
+                  const vis = typeof document !== 'undefined' ? document.visibilityState : 'visible';
+                  if (
+                    shouldAutoResumeBackgroundPause({
+                      isPlaying: this.isPlaying,
+                      visibilityState: vis,
+                      now: Date.now(),
+                      backgroundTransitionUntil: this.backgroundTransitionUntil,
+                      userPausedAt: this.userPausedAt,
+                    })
+                  ) {
+                    try {
+                      ev.target.playVideo();
+                    } catch {
+                      // Ignore
+                    }
+                    window.setTimeout(() => this.ensurePlaybackAliveNow(), 180);
+                    window.setTimeout(() => this.ensurePlaybackAliveNow(), 600);
+                    return;
+                  }
+                  if (vis === 'visible' || (this.userPausedAt > 0 && Date.now() - this.userPausedAt < 2000)) {
+                    this.isPlaying = false;
+                    this.stopYtTicker();
+                    this.stopBgKeepalive();
+                    this.emit();
+                  }
                 } else if (ev.data === stateEnded) {
                   this.isPlaying = false;
                   this.stopYtTicker();
+                  this.stopBgKeepalive();
                   this.emit();
                   for (const fn of this.endListeners) fn();
                 }
@@ -1078,6 +1203,7 @@ class DualChannelAudioEngine {
       this.stopSynthTicker();
     }
 
+    this.userPausedAt = 0;
     this.activeChannel = incomingChannelId;
     this.currentTrack = track;
     this.currentTime = 0;
@@ -1123,6 +1249,7 @@ class DualChannelAudioEngine {
         if (alreadyMounted) {
           try {
             player.loadVideoById(track.youtubeId, 0);
+            player.playVideo();
           } catch {
             void this.recoverActiveYouTubeTrack(track, seq);
             return;
@@ -1139,6 +1266,7 @@ class DualChannelAudioEngine {
           }
         }
         this.startYtTicker();
+        this.startBgKeepalive();
         this.armYtStartupWatchdog(track, seq);
         this.emit();
         return;
@@ -1199,6 +1327,7 @@ class DualChannelAudioEngine {
       await this.startSynthOnStrip(incomingStrip, track);
     }
 
+    this.startBgKeepalive();
     this.emit();
   }
 
@@ -1217,31 +1346,52 @@ class DualChannelAudioEngine {
     this.startSynthTicker();
   }
 
-  async togglePlay(): Promise<void> {
+  pause(): void {
+    if (!this.currentTrack) return;
+    this.userPausedAt = Date.now();
+    this.isPlaying = false;
+    this.stopBgKeepalive();
+
+    if (this.ytActive && this.ytPlayer && this.ytReady) {
+      this.stopYtTicker();
+      try {
+        this.ytPlayer.pauseVideo();
+      } catch {
+        // Ignore
+      }
+      this.emit();
+      return;
+    }
+
+    const active = this.activeChannel === 'A' ? this.channelA : this.channelB;
+    if (active) {
+      if (active.synthDriver) {
+        active.synthDriver.stop();
+        this.stopSynthTicker();
+      } else {
+        active.audioEl.pause();
+      }
+    }
+    this.emit();
+  }
+
+  async play(): Promise<void> {
     const ctx = this.ensureContext();
     if (ctx.state === 'suspended') {
       await ctx.resume();
     }
     if (!this.currentTrack) return;
+    this.userPausedAt = 0;
 
     if (this.ytActive && this.ytPlayer && this.ytReady) {
-      if (this.isPlaying) {
-        this.isPlaying = false;
-        this.stopYtTicker();
-        try {
-          this.ytPlayer.pauseVideo();
-        } catch {
-          // Ignore
-        }
-      } else {
-        this.isPlaying = true;
-        try {
-          this.ytPlayer.playVideo();
-        } catch {
-          // Ignore
-        }
-        this.startYtTicker();
+      this.isPlaying = true;
+      try {
+        this.ytPlayer.playVideo();
+      } catch {
+        // Ignore
       }
+      this.startYtTicker();
+      this.startBgKeepalive();
       this.emit();
       return;
     }
@@ -1249,30 +1399,30 @@ class DualChannelAudioEngine {
     const active = this.activeChannel === 'A' ? this.channelA : this.channelB;
     if (!active) return;
 
-    if (this.isPlaying) {
-      this.isPlaying = false;
-      if (active.synthDriver) {
-        active.synthDriver.stop();
-        this.stopSynthTicker();
+    this.isPlaying = true;
+    if (active.synthDriver || this.currentTrack.source === 'synth' || !active.audioEl.src) {
+      if (!active.synthDriver) {
+        await this.startSynthOnStrip(active, this.currentTrack);
       } else {
-        active.audioEl.pause();
+        const bpm = this.currentTrack.synthProfile?.bpm || this.currentTrack.bpm || 110;
+        const stepIdx = Math.floor((this.currentTime * bpm) / 15) % 32;
+        active.synthDriver.start(stepIdx);
+        this.startSynthTicker();
       }
     } else {
-      this.isPlaying = true;
-      if (active.synthDriver || this.currentTrack.source === 'synth' || !active.audioEl.src) {
-        if (!active.synthDriver) {
-          await this.startSynthOnStrip(active, this.currentTrack);
-        } else {
-          const bpm = this.currentTrack.synthProfile?.bpm || this.currentTrack.bpm || 110;
-          const stepIdx = Math.floor((this.currentTime * bpm) / 15) % 32;
-          active.synthDriver.start(stepIdx);
-          this.startSynthTicker();
-        }
-      } else {
-        await active.audioEl.play().catch(() => {});
-      }
+      await active.audioEl.play().catch(() => {});
     }
+    this.startBgKeepalive();
     this.emit();
+  }
+
+  async togglePlay(): Promise<void> {
+    if (!this.currentTrack) return;
+    if (this.isPlaying) {
+      this.pause();
+    } else {
+      await this.play();
+    }
   }
 
   seek(targetSeconds: number): void {

@@ -5,15 +5,20 @@ import {
   FolderSearch,
   HardDrive,
   Mic2,
+  Moon,
   Music,
+  Palette,
   Radio,
   Sliders,
+  Sun,
   Volume2,
   Wifi,
   WifiOff,
 } from 'lucide-react';
 import { EQ_PRESETS, EQ_PRESET_ORDER } from '../data/presetsAndStems';
 import type { ActiveTab, DspSettings, EqBands, EqPresetName } from '../types/audio';
+import type { ThemeMode, ThemePreferences } from '../utils/themeManager';
+import { AccentColorPicker } from './AccentColorPicker';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface SettingsViewProps {
@@ -21,6 +26,10 @@ interface SettingsViewProps {
   storedTrackCount: number;
   isOnline: boolean;
   autoplayRadioEnabled: boolean;
+  themePrefs: ThemePreferences;
+  onChangeThemeMode: (mode: ThemeMode) => void;
+  onChangeAccentColor: (accentHex: string, accentAlpha: number) => void;
+  onResetAccentColor: () => void;
   onToggleAutoplayRadio: () => void;
   onOpenDsp: () => void;
   onUpdateDsp: (next: DspSettings) => void;
@@ -34,6 +43,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   storedTrackCount,
   isOnline,
   autoplayRadioEnabled,
+  themePrefs,
+  onChangeThemeMode,
+  onChangeAccentColor,
+  onResetAccentColor,
   onToggleAutoplayRadio,
   onOpenDsp,
   onUpdateDsp,
@@ -57,13 +70,73 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <div>
             <h1 className="font-display text-2xl font-bold text-[#F4F3F0]">Settings</h1>
             <p className="mt-1 text-xs text-[#8E929B]">
-              Equalizer DSP rack, Spotify-style Auto Radio, local folder tools, and synced lyrics
+              Accent color wheel, Dark &amp; Light mode, Equalizer DSP rack, and library tools
             </p>
           </div>
           <div className="flex items-center gap-2">
             <PWAInstallButton />
           </div>
         </div>
+      </section>
+
+      {/* Appearance & Theme: Dark/Light Mode + Accent Color Wheel */}
+      <section className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-4 sm:p-6 space-y-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#2A2D39] bg-[#15171F] text-[#E11D48]">
+              <Palette className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="font-display text-base sm:text-lg font-bold text-[#F4F3F0]">
+                Appearance &amp; Accent Color
+              </h2>
+              <p className="text-xs text-[#8E929B]">
+                Switch between Dark / Light mode or customize your accent color with the wheel
+              </p>
+            </div>
+          </div>
+
+          {/* Dark / Light Mode Segmented Toggle */}
+          <div
+            role="group"
+            aria-label="Theme mode"
+            className="inline-flex items-center gap-1 self-start sm:self-auto rounded-lg border border-[#222530] bg-[#090A0E] p-1"
+          >
+            <button
+              type="button"
+              aria-pressed={themePrefs.mode === 'dark'}
+              onClick={() => onChangeThemeMode('dark')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors cursor-pointer ${
+                themePrefs.mode === 'dark'
+                  ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
+                  : 'text-[#8E929B] hover:text-[#F4F3F0]'
+              }`}
+            >
+              <Moon className="h-3.5 w-3.5" />
+              <span>Dark</span>
+            </button>
+            <button
+              type="button"
+              aria-pressed={themePrefs.mode === 'light'}
+              onClick={() => onChangeThemeMode('light')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors cursor-pointer ${
+                themePrefs.mode === 'light'
+                  ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
+                  : 'text-[#8E929B] hover:text-[#F4F3F0]'
+              }`}
+            >
+              <Sun className="h-3.5 w-3.5" />
+              <span>Light</span>
+            </button>
+          </div>
+        </div>
+
+        <AccentColorPicker
+          accentHex={themePrefs.accentHex}
+          accentAlpha={themePrefs.accentAlpha}
+          onChange={onChangeAccentColor}
+          onReset={onResetAccentColor}
+        />
       </section>
 
       {/* Equalizer & Audio DSP Card */}

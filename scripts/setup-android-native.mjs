@@ -23,6 +23,8 @@ export function applyAndroidNativeOverrides(rootDir = process.cwd()) {
 
   const permissions = [
     '<uses-permission android:name="android.permission.INTERNET" />',
+    '<uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />',
+    '<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />',
     '<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
     '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />',
     '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',

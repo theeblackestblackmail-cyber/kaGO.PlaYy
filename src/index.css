@@ -6,6 +6,14 @@
     --font-display: 'Syne', sans-serif;
     --font-sans: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
     --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+    --kago-accent: #e11d48;
+    --kago-accent-hover: #be123c;
+    --kago-accent-light: #ff4d6d;
+    --kago-accent-soft: #fda4af;
+    --kago-accent-dark: #9f1239;
+    --kago-accent-rgb: 225, 29, 72;
+    --kago-accent-on-accent: #ffffff;
   }
 
   html,
@@ -15,6 +23,12 @@
     font-family: var(--font-sans);
     min-height: 100dvh;
     overflow-x: clip;
+  }
+
+  html.light,
+  html.light body {
+    background-color: #f3f4f8;
+    color: #0f172a;
   }
 }
 
@@ -80,16 +94,20 @@ input[type='range'].hardware-slider::-webkit-slider-runnable-track {
   background: #232631;
 }
 
+html.light input[type='range'].hardware-slider::-webkit-slider-runnable-track {
+  background: #cbd5e1;
+}
+
 input[type='range'].hardware-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
   width: 16px;
   height: 16px;
   border-radius: 9999px;
-  background: #e11d48;
+  background: var(--kago-accent);
   border: 2px solid #f4f3f0;
   margin-top: -6px;
-  box-shadow: 0 0 10px rgba(225, 29, 72, 0.55);
+  box-shadow: 0 0 10px rgba(var(--kago-accent-rgb), 0.55);
 }
 
 input[type='range'].hardware-slider::-moz-range-track {
@@ -98,25 +116,39 @@ input[type='range'].hardware-slider::-moz-range-track {
   background: #232631;
 }
 
+html.light input[type='range'].hardware-slider::-moz-range-track {
+  background: #cbd5e1;
+}
+
 input[type='range'].hardware-slider::-moz-range-thumb {
   width: 16px;
   height: 16px;
   border-radius: 9999px;
-  background: #e11d48;
+  background: var(--kago-accent);
   border: 2px solid #f4f3f0;
-  box-shadow: 0 0 10px rgba(225, 29, 72, 0.55);
+  box-shadow: 0 0 10px rgba(var(--kago-accent-rgb), 0.55);
 }
 
-/* Playback Seek Progress Bar: Red (already played) -> White (unplayed) */
+/* Playback Seek Progress Bar: Accent Color (already played) -> White / Light Slate (unplayed) */
 input[type='range'].seek-progress-slider::-webkit-slider-runnable-track {
   height: 4px;
   border-radius: 9999px;
   background: linear-gradient(
     to right,
-    #e11d48 0%,
-    #e11d48 var(--slider-progress, 0%),
+    var(--kago-accent) 0%,
+    var(--kago-accent) var(--slider-progress, 0%),
     rgba(255, 255, 255, 0.9) var(--slider-progress, 0%),
     rgba(255, 255, 255, 0.9) 100%
+  );
+}
+
+html.light input[type='range'].seek-progress-slider::-webkit-slider-runnable-track {
+  background: linear-gradient(
+    to right,
+    var(--kago-accent) 0%,
+    var(--kago-accent) var(--slider-progress, 0%),
+    #cbd5e1 var(--slider-progress, 0%),
+    #cbd5e1 100%
   );
 }
 
@@ -125,10 +157,20 @@ input[type='range'].seek-progress-slider::-moz-range-track {
   border-radius: 9999px;
   background: linear-gradient(
     to right,
-    #e11d48 0%,
-    #e11d48 var(--slider-progress, 0%),
+    var(--kago-accent) 0%,
+    var(--kago-accent) var(--slider-progress, 0%),
     rgba(255, 255, 255, 0.9) var(--slider-progress, 0%),
     rgba(255, 255, 255, 0.9) 100%
+  );
+}
+
+html.light input[type='range'].seek-progress-slider::-moz-range-track {
+  background: linear-gradient(
+    to right,
+    var(--kago-accent) 0%,
+    var(--kago-accent) var(--slider-progress, 0%),
+    #cbd5e1 var(--slider-progress, 0%),
+    #cbd5e1 100%
   );
 }
 
@@ -152,16 +194,206 @@ input[type='range'].eq-vertical-fader::-webkit-slider-runnable-track {
   border: 1px solid #2b2e3a;
 }
 
+html.light input[type='range'].eq-vertical-fader::-webkit-slider-runnable-track {
+  background: #e2e8f0;
+  border-color: #cbd5e1;
+}
+
 input[type='range'].eq-vertical-fader::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
   width: 26px;
   height: 14px;
   border-radius: 4px;
-  background: #e11d48;
+  background: var(--kago-accent);
   border: 1px solid #f4f3f0;
   margin-left: -11px;
-  box-shadow: 0 0 8px rgba(225, 29, 72, 0.5);
+  box-shadow: 0 0 8px rgba(var(--kago-accent-rgb), 0.5);
+}
+
+/* ============================================================================
+   Dynamic Accent Color Mapping (drives all accent buttons, icons, tabs, glows)
+   ============================================================================ */
+.bg-\[\#E11D48\],
+.bg-\[\#FF2E54\] {
+  background-color: var(--kago-accent) !important;
+}
+.bg-\[\#E11D48\].text-white {
+  color: var(--kago-accent-on-accent) !important;
+}
+.hover\:bg-\[\#BE123C\]:hover {
+  background-color: var(--kago-accent-hover) !important;
+}
+.bg-\[\#E11D48\]\/10 {
+  background-color: rgba(var(--kago-accent-rgb), 0.1) !important;
+}
+.bg-\[\#E11D48\]\/15 {
+  background-color: rgba(var(--kago-accent-rgb), 0.15) !important;
+}
+.bg-\[\#E11D48\]\/20 {
+  background-color: rgba(var(--kago-accent-rgb), 0.2) !important;
+}
+.bg-\[\#FDA4AF\] {
+  background-color: var(--kago-accent-soft) !important;
+}
+.bg-\[\#13090E\],
+.bg-\[\#15090E\],
+.bg-\[\#17090E\],
+.bg-\[\#180A0F\],
+.bg-\[\#19090E\],
+.bg-\[\#1A080D\] {
+  background-color: rgba(var(--kago-accent-rgb), 0.12) !important;
+}
+
+.text-\[\#E11D48\] {
+  color: var(--kago-accent) !important;
+}
+.text-\[\#FF4D6D\],
+.text-\[\#FF3B5C\] {
+  color: var(--kago-accent-light) !important;
+}
+.text-\[\#FDA4AF\] {
+  color: var(--kago-accent-soft) !important;
+}
+.hover\:text-\[\#FF4D6D\]:hover {
+  color: var(--kago-accent-light) !important;
+}
+
+.border-\[\#E11D48\] {
+  border-color: var(--kago-accent) !important;
+}
+.border-\[\#E11D48\]\/30 {
+  border-color: rgba(var(--kago-accent-rgb), 0.3) !important;
+}
+.border-\[\#E11D48\]\/40 {
+  border-color: rgba(var(--kago-accent-rgb), 0.4) !important;
+}
+.border-\[\#E11D48\]\/50 {
+  border-color: rgba(var(--kago-accent-rgb), 0.5) !important;
+}
+.border-\[\#E11D48\]\/80 {
+  border-color: rgba(var(--kago-accent-rgb), 0.8) !important;
+}
+.hover\:border-\[\#E11D48\]:hover {
+  border-color: var(--kago-accent) !important;
+}
+.hover\:border-\[\#E11D48\]\/60:hover {
+  border-color: rgba(var(--kago-accent-rgb), 0.6) !important;
+}
+.focus\:border-\[\#E11D48\]:focus {
+  border-color: var(--kago-accent) !important;
+}
+.focus-visible\:ring-\[\#E11D48\]:focus-visible {
+  --tw-ring-color: var(--kago-accent) !important;
+}
+
+[class*='rgba(225,29,72'],
+[class*='shadow-[0_0_8px_#E11D48'],
+[class*='shadow-[0_0_10px_#FF2E54'],
+[class*='shadow-[0_0_12px_#E11D48'] {
+  box-shadow: 0 0 16px rgba(var(--kago-accent-rgb), 0.45) !important;
+}
+
+/* ============================================================================
+   Light Mode Surface & Typography Overrides (when html.light is active)
+   ============================================================================ */
+html.light .bg-black {
+  background-color: #f3f4f8 !important;
+}
+html.light .bg-black\/85 {
+  background-color: rgba(248, 250, 252, 0.9) !important;
+}
+html.light .bg-black\/80,
+html.light .bg-black\/90 {
+  background-color: rgba(15, 23, 42, 0.45) !important;
+}
+html.light .bg-\[\#0D0E12\] {
+  background-color: #ffffff !important;
+}
+html.light .bg-\[\#0C0D12\]\/95 {
+  background-color: rgba(255, 255, 255, 0.96) !important;
+}
+html.light .bg-\[\#08090C\]\/95 {
+  background-color: rgba(255, 255, 255, 0.96) !important;
+}
+html.light .bg-\[\#050508\],
+html.light .bg-\[\#06070A\],
+html.light .bg-\[\#07080B\],
+html.light .bg-\[\#08090C\],
+html.light .bg-\[\#08090D\],
+html.light .bg-\[\#090A0E\],
+html.light .bg-\[\#0D0E13\] {
+  background-color: #f1f5f9 !important;
+}
+html.light .bg-\[\#101219\],
+html.light .bg-\[\#111319\],
+html.light .bg-\[\#121318\],
+html.light .bg-\[\#121319\],
+html.light .bg-\[\#12141B\],
+html.light .bg-\[\#13151B\],
+html.light .bg-\[\#13151C\],
+html.light .bg-\[\#14161D\],
+html.light .bg-\[\#14161E\],
+html.light .bg-\[\#14161F\],
+html.light .bg-\[\#15171E\],
+html.light .bg-\[\#15171F\],
+html.light .bg-\[\#16181F\],
+html.light .bg-\[\#161820\],
+html.light .bg-\[\#1A1C24\] {
+  background-color: #e8edf5 !important;
+}
+
+html.light .hover\:bg-\[\#13151C\]:hover,
+html.light .hover\:bg-\[\#191B24\]:hover,
+html.light .hover\:bg-\[\#1A1C24\]:hover,
+html.light .hover\:bg-\[\#1A1D27\]:hover,
+html.light .hover\:bg-\[\#1C1E27\]:hover {
+  background-color: #dde4ef !important;
+}
+
+html.light .border-\[\#1A1C24\],
+html.light .border-\[\#1B1D26\],
+html.light .border-\[\#1C1E26\],
+html.light .border-\[\#1E2028\],
+html.light .border-\[\#1F2129\],
+html.light .border-\[\#222530\],
+html.light .border-\[\#232631\],
+html.light .border-\[\#242732\],
+html.light .border-\[\#252834\],
+html.light .border-\[\#262936\],
+html.light .border-\[\#282B36\],
+html.light .border-\[\#2A2D39\] {
+  border-color: #dbe1ec !important;
+}
+html.light .divide-\[\#1A1C24\] > :not(:last-child) {
+  border-color: #e2e8f0 !important;
+}
+
+html.light .text-\[\#F4F3F0\],
+html.light .text-\[\#E5E7EB\],
+html.light .text-\[\#D1D5DB\] {
+  color: #0f172a !important;
+}
+html.light .text-\[\#C7C9D1\],
+html.light .text-\[\#B4B7C2\],
+html.light .text-\[\#9CA3AF\] {
+  color: #334155 !important;
+}
+html.light .text-\[\#8E929B\],
+html.light .text-\[\#737885\],
+html.light .text-\[\#6B7280\] {
+  color: #64748b !important;
+}
+html.light .hover\:text-white:hover,
+html.light .hover\:text-\[\#F4F3F0\]:hover {
+  color: #0f172a !important;
+}
+html.light .bg-\[\#E11D48\]:hover,
+html.light .bg-\[\#E11D48\].text-white:hover {
+  color: var(--kago-accent-on-accent) !important;
+}
+html.light .text-\[\#FDA4AF\] {
+  color: var(--kago-accent) !important;
 }
 
 @media (prefers-reduced-motion: reduce) {

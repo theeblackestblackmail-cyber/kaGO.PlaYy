@@ -39,6 +39,14 @@ import {
 } from './utils/nativeMediaBridge';
 import { mergeAutoplayQueue } from './utils/streamFilter';
 import { fetchRelatedRadioTracks } from './utils/streamRadio';
+import {
+  applyThemeToDocument,
+  DEFAULT_ACCENT_HEX,
+  loadThemePreferences,
+  saveThemePreferences,
+  type ThemeMode,
+  type ThemePreferences,
+} from './utils/themeManager';
 
 export default function App() {
   const isOnline = useOnlineStatus();
@@ -66,6 +74,12 @@ export default function App() {
     }
   });
   const [isFetchingRadio, setIsFetchingRadio] = useState(false);
+  const [themePrefs, setThemePrefs] = useState<ThemePreferences>(() => loadThemePreferences());
+
+  useEffect(() => {
+    applyThemeToDocument(themePrefs);
+    saveThemePreferences(themePrefs);
+  }, [themePrefs]);
 
   const songPickerRef = useRef<HTMLInputElement | null>(null);
   const folderPickerRef = useRef<HTMLInputElement | null>(null);
@@ -230,7 +244,11 @@ export default function App() {
   // Subscribe to Android native MediaSession (Samsung Now Bar / Lockscreen) & native PiP
   useEffect(() => {
     const unsubMedia = subscribeNativeMediaActions((detail) => {
-      if (detail.action === 'play' || detail.action === 'pause' || detail.action === 'toggle') {
+      if (detail.action === 'play') {
+        void audioEngine.play();
+      } else if (detail.action === 'pause') {
+        audioEngine.pause();
+      } else if (detail.action === 'toggle') {
         void audioEngine.togglePlay();
       } else if (detail.action === 'next') {
         handleNextRef.current();
@@ -334,8 +352,8 @@ export default function App() {
           ? [{ src: track.artworkUrl, sizes: '512x512', type: 'image/jpeg' }]
           : [],
       });
-      navigator.mediaSession.setActionHandler('play', () => void audioEngine.togglePlay());
-      navigator.mediaSession.setActionHandler('pause', () => void audioEngine.togglePlay());
+      navigator.mediaSession.setActionHandler('play', () => void audioEngine.play());
+      navigator.mediaSession.setActionHandler('pause', () => audioEngine.pause());
       navigator.mediaSession.setActionHandler('previoustrack', () => handlePrevRef.current());
       navigator.mediaSession.setActionHandler('nexttrack', () => handleNextRef.current());
       navigator.mediaSession.setActionHandler('seekbackward', () => audioEngine.seekBy(-10));
@@ -707,6 +725,20 @@ export default function App() {
             storedTrackCount={allLibraryTracks.length}
             isOnline={isOnline}
             autoplayRadioEnabled={autoplayRadioEnabled}
+            themePrefs={themePrefs}
+            onChangeThemeMode={(mode: ThemeMode) =>
+              setThemePrefs((prev) => ({ ...prev, mode }))
+            }
+            onChangeAccentColor={(accentHex, accentAlpha) =>
+              setThemePrefs((prev) => ({ ...prev, accentHex, accentAlpha }))
+            }
+            onResetAccentColor={() =>
+              setThemePrefs((prev) => ({
+                ...prev,
+                accentHex: DEFAULT_ACCENT_HEX,
+                accentAlpha: 100,
+              }))
+            }
             onToggleAutoplayRadio={handleToggleAutoplayRadio}
             onOpenDsp={() => setIsDspOpen(true)}
             onUpdateDsp={handleUpdateDsp}

@@ -43,8 +43,16 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, h);
 
+      const rootEl = document.documentElement;
+      const rootStyle = getComputedStyle(rootEl);
+      const accentDark = rootStyle.getPropertyValue('--kago-accent-dark').trim() || '#9F1239';
+      const accentBase = rootStyle.getPropertyValue('--kago-accent').trim() || '#E11D48';
+      const accentLight = rootStyle.getPropertyValue('--kago-accent-light').trim() || '#FF5A5F';
+      const accentSoft = rootStyle.getPropertyValue('--kago-accent-soft').trim() || '#FDA4AF';
+      const isLightMode = rootEl.classList.contains('light');
+
       // Subtle reference grid lines
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+      ctx.strokeStyle = isLightMode ? 'rgba(15, 23, 42, 0.08)' : 'rgba(255, 255, 255, 0.04)';
       ctx.lineWidth = 1;
       for (let g = 1; g <= 3; g++) {
         const gy = Math.round((h / 4) * g) + 0.5;
@@ -106,16 +114,16 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
         const y = h - barH;
 
         const grad = ctx.createLinearGradient(x, h, x, y);
-        grad.addColorStop(0, '#9F1239');
-        grad.addColorStop(0.55, '#E11D48');
-        grad.addColorStop(1, '#FF5A5F');
+        grad.addColorStop(0, accentDark);
+        grad.addColorStop(0.55, accentBase);
+        grad.addColorStop(1, accentLight);
 
         ctx.fillStyle = grad;
         ctx.fillRect(x, y, barW, barH);
 
         // Falling peak cap
         const peakY = Math.max(2, h - peaksRef.current[i] * (h - 14) - 3);
-        ctx.fillStyle = isPlaying ? '#FDA4AF' : '#3E4251';
+        ctx.fillStyle = isPlaying ? accentSoft : isLightMode ? '#94A3B8' : '#3E4251';
         ctx.fillRect(x, peakY, barW, 2);
       }
 

@@ -10,6 +10,10 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
@@ -39,6 +43,11 @@ public class KaGoMediaService extends Service {
 
     private MediaSessionCompat mediaSession;
     private PowerManager.WakeLock wakeLock;
+    private WifiManager.WifiLock wifiLock;
+    private AudioManager audioManager;
+    private AudioFocusRequest audioFocusRequest;
+    private volatile boolean hasAudioFocus = false;
+    private volatile boolean pausedForTransientFocusLoss = false;
     private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
 
     private String currentTitle = "kaGO.PIaY";
@@ -107,7 +116,29 @@ public class KaGoMediaService extends Service {
         });
 
         mediaSession.setActive(true);
+        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
     }
+
+    private final AudioManager.OnAudioFocusChangeListener audioFocusListener = focusChange -> {
+        if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+            hasAudioFocus = true;
+            if (pausedForTransientFocusLoss) {
+                pausedForTransientFocusLoss = false;
+                MainActivity.dispatchMediaActionToWeb("play", 0L);
+            }
+        } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+            if (isCurrentlyPlaying) {
+                pausedForTransientFocusLoss = true;
+                MainActivity.dispatchMediaActionToWeb("pause", 0L);
+            }
+        } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
+            pausedForTransientFocusLoss = false;
+            hasAudioFocus = false;
+            if (isCurrentlyPlaying) {
+                MainActivity.dispatchMediaActionToWeb("pause", 0L);
+            }
+        }
+    };
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -118,7 +149,9 @@ public class KaGoMediaService extends Service {
             if (ACTION_STOP_SERVICE.equals(action)) {
                 isCurrentlyPlaying = false;
                 currentIsPlaying = false;
-                releaseWakeLock();
+                pausedForTransientFocusLoss = false;
+                abandonAudioFocus();
+                releaseWakeAndWifiLocks();
                 stopForegroundCompat(true);
                 stopSelf();
                 return START_NOT_STICKY;
@@ -135,9 +168,14 @@ public class KaGoMediaService extends Service {
                 isCurrentlyPlaying = currentIsPlaying;
 
                 if (currentIsPlaying) {
-                    acquireWakeLock();
+                    pausedForTransientFocusLoss = false;
+                    requestAudioFocus();
+                    acquireWakeAndWifiLocks();
                 } else {
-                    releaseWakeLock();
+                    if (!pausedForTransientFocusLoss) {
+                        abandonAudioFocus();
+                    }
+                    releaseWakeAndWifiLocks();
                 }
 
                 updateMediaMetadata();
@@ -152,6 +190,8 @@ public class KaGoMediaService extends Service {
     @Override
     public void onTaskRemoved(Intent rootIntent) {
         if (!isCurrentlyPlaying) {
+            abandonAudioFocus();
+            releaseWakeAndWifiLocks();
             stopForegroundCompat(true);
             stopSelf();
         }
@@ -162,7 +202,9 @@ public class KaGoMediaService extends Service {
     public void onDestroy() {
         isServiceRunning = false;
         isCurrentlyPlaying = false;
-        releaseWakeLock();
+        pausedForTransientFocusLoss = false;
+        abandonAudioFocus();
+        releaseWakeAndWifiLocks();
         artworkExecutor.shutdownNow();
         if (mediaSession != null) {
             mediaSession.setActive(false);
@@ -317,7 +359,51 @@ public class KaGoMediaService extends Service {
         });
     }
 
-    private void acquireWakeLock() {
+    private void requestAudioFocus() {
+        if (audioManager == null) {
+            audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        }
+        if (audioManager == null || hasAudioFocus) return;
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                AudioAttributes attrs = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build();
+                audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(attrs)
+                    .setAcceptsDelayedFocusGain(true)
+                    .setOnAudioFocusChangeListener(audioFocusListener)
+                    .build();
+                int res = audioManager.requestAudioFocus(audioFocusRequest);
+                hasAudioFocus = (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
+            } else {
+                int res = audioManager.requestAudioFocus(
+                    audioFocusListener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN
+                );
+                hasAudioFocus = (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void abandonAudioFocus() {
+        if (audioManager == null || !hasAudioFocus) return;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest(audioFocusRequest);
+            } else {
+                audioManager.abandonAudioFocus(audioFocusListener);
+            }
+        } catch (Exception ignored) {
+        }
+        hasAudioFocus = false;
+    }
+
+    private void acquireWakeAndWifiLocks() {
         if (wakeLock == null) {
             PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
             if (pm != null) {
@@ -328,12 +414,35 @@ public class KaGoMediaService extends Service {
         if (wakeLock != null && !wakeLock.isHeld()) {
             wakeLock.acquire(4 * 60 * 60 * 1000L);
         }
+
+        if (wifiLock == null) {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm != null) {
+                int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                    ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                    : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                wifiLock = wm.createWifiLock(mode, "kaGOPIaY::StreamingWifiLock");
+                wifiLock.setReferenceCounted(false);
+            }
+        }
+        if (wifiLock != null && !wifiLock.isHeld()) {
+            try {
+                wifiLock.acquire();
+            } catch (Exception ignored) {
+            }
+        }
     }
 
-    private void releaseWakeLock() {
+    private void releaseWakeAndWifiLocks() {
         if (wakeLock != null && wakeLock.isHeld()) {
             try {
                 wakeLock.release();
+            } catch (Exception ignored) {
+            }
+        }
+        if (wifiLock != null && wifiLock.isHeld()) {
+            try {
+                wifiLock.release();
             } catch (Exception ignored) {
             }
         }

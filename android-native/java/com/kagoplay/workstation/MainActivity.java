@@ -9,9 +9,12 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.util.Base64;
 import android.util.Rational;
+import android.view.View;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -55,6 +58,7 @@ public class MainActivity extends BridgeActivity {
     private boolean bridgeAttached = false;
     private volatile String pendingFolderRequestId = null;
     private final ExecutorService networkExecutor = Executors.newFixedThreadPool(4);
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Set<String> allowedDocumentUris =
         Collections.newSetFromMap(new ConcurrentHashMap<>());
 
@@ -73,7 +77,25 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
+    public void onResume() {
+        super.onResume();
+        mainHandler.removeCallbacksAndMessages(null);
+        if (getBridge() != null && getBridge().getWebView() != null) {
+            WebView webView = getBridge().getWebView();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                try {
+                    webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+                } catch (Exception ignored) {
+                }
+            }
+            webView.onResume();
+            webView.resumeTimers();
+        }
+    }
+
+    @Override
     public void onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null);
         super.onDestroy();
         networkExecutor.shutdownNow();
     }
@@ -88,6 +110,12 @@ public class MainActivity extends BridgeActivity {
         settings.setDomStorageEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            try {
+                webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+            } catch (Exception ignored) {
+            }
+        }
         String ua = settings.getUserAgentString();
         if (ua != null && ua.contains("; wv")) {
             settings.setUserAgentString(ua.replace("; wv", ""));
@@ -248,22 +276,64 @@ public class MainActivity extends BridgeActivity {
         }
     }
 
+    private boolean isInPipCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            return isInPictureInPictureMode();
+        }
+        return false;
+    }
+
+    private void keepWebViewAwakeNow() {
+        if (!KaGoMediaService.isCurrentlyPlaying || getBridge() == null || getBridge().getWebView() == null) {
+            return;
+        }
+        WebView webView = getBridge().getWebView();
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
+            }
+            webView.onResume();
+            webView.resumeTimers();
+            if (!isInPipCompat()) {
+                webView.dispatchWindowVisibilityChanged(View.VISIBLE);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void scheduleBackgroundKeepalive(final String phase) {
+        if (!KaGoMediaService.isCurrentlyPlaying) return;
+        keepWebViewAwakeNow();
+        dispatchJsEvent("kago-native-keepalive", "{\"phase\":\"" + phase + "\"}");
+
+        final long[] delays = new long[]{160L, 520L, 1200L, 2400L};
+        for (final long delay : delays) {
+            mainHandler.postDelayed(() -> {
+                if (!KaGoMediaService.isCurrentlyPlaying) return;
+                keepWebViewAwakeNow();
+                dispatchJsEvent("kago-native-keepalive", "{\"phase\":\"" + phase + "_retry\"}");
+            }, delay);
+        }
+    }
+
     @Override
     public void onPause() {
         super.onPause();
-        // Keep WebView audio/JS active when minimized or screen-locked while music plays
-        if (KaGoMediaService.isCurrentlyPlaying && getBridge() != null && getBridge().getWebView() != null) {
-            getBridge().getWebView().onResume();
-            getBridge().getWebView().resumeTimers();
-        }
+        // Keep WebView audio/JS active when minimized or switching apps while music plays
+        scheduleBackgroundKeepalive("pause");
     }
 
     @Override
     public void onStop() {
         super.onStop();
-        if (KaGoMediaService.isCurrentlyPlaying && getBridge() != null && getBridge().getWebView() != null) {
-            getBridge().getWebView().onResume();
-            getBridge().getWebView().resumeTimers();
+        scheduleBackgroundKeepalive("stop");
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (!hasFocus && KaGoMediaService.isCurrentlyPlaying) {
+            scheduleBackgroundKeepalive("blur");
         }
     }
 
