@@ -108,8 +108,10 @@ public class KaGoMediaService extends Service {
             public void onStop() {
                 isCurrentlyPlaying = false;
                 currentIsPlaying = false;
+                pausedForTransientFocusLoss = false;
                 updatePlaybackState();
-                releaseWakeLock();
+                abandonAudioFocus();
+                releaseWakeAndWifiLocks();
                 stopForegroundCompat(true);
                 stopSelf();
             }
