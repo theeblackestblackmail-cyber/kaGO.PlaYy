@@ -8,6 +8,7 @@ import {
   subscribeNativeKeepalive,
 } from '../utils/nativeMediaBridge';
 import {
+  computeMasterOutputGain,
   extractYouTubeSearchResults,
   rankYouTubeSearchResults,
   shouldAutoResumeBackgroundPause,
@@ -288,6 +289,9 @@ interface YtPlayerInstance {
   stopVideo: () => void;
   seekTo: (seconds: number, allowSeekAhead?: boolean) => void;
   setVolume: (volume: number) => void;
+  unMute?: () => void;
+  isMuted?: () => boolean;
+  getVolume?: () => number;
   getCurrentTime: () => number;
   getDuration: () => number;
   getPlayerState: () => number;
@@ -337,6 +341,7 @@ class DualChannelAudioEngine {
   private ctx: AudioContext | null = null;
   private eqFilters: BiquadFilterNode[] = [];
   private bassBoostFilter: BiquadFilterNode | null = null;
+  private masterGainNode: GainNode | null = null;
   private compressor: DynamicsCompressorNode | null = null;
   private analyser: AnalyserNode | null = null;
   private channelA: ChannelStrip | null = null;
@@ -537,13 +542,18 @@ class DualChannelAudioEngine {
     bassBoost.gain.value = this.dspSettings.bassBoostEnabled ? this.dspSettings.bassBoostDb : 0;
     this.bassBoostFilter = bassBoost;
 
-    // Protective Dynamics Limiter
+    // Unthrottled Master Headroom Gain (full device speaker utilization without clipping)
+    const masterGain = ctx.createGain();
+    masterGain.gain.value = computeMasterOutputGain(this.dspSettings);
+    this.masterGainNode = masterGain;
+
+    // Transparent Brickwall Peak Guard only near 0 dBFS (never squashes normal playback loudness)
     const comp = ctx.createDynamicsCompressor();
-    comp.threshold.value = -3;
-    comp.knee.value = 12;
-    comp.ratio.value = 6;
-    comp.attack.value = 0.003;
-    comp.release.value = 0.15;
+    comp.threshold.value = -0.3;
+    comp.knee.value = 0;
+    comp.ratio.value = 20;
+    comp.attack.value = 0.001;
+    comp.release.value = 0.08;
     this.compressor = comp;
 
     // 60fps Analyser
@@ -552,12 +562,13 @@ class DualChannelAudioEngine {
     analyser.smoothingTimeConstant = 0.78;
     this.analyser = analyser;
 
-    // Wire EQ -> Bass Boost -> Compressor -> Analyser -> Destination
+    // Wire EQ -> Bass Boost -> Master Gain -> Peak Guard -> Analyser -> Destination
     for (let i = 0; i < eqNodes.length - 1; i++) {
       eqNodes[i].connect(eqNodes[i + 1]);
     }
     eqNodes[eqNodes.length - 1].connect(bassBoost);
-    bassBoost.connect(comp);
+    bassBoost.connect(masterGain);
+    masterGain.connect(comp);
     comp.connect(analyser);
     analyser.connect(ctx.destination);
 
@@ -577,6 +588,8 @@ class DualChannelAudioEngine {
     const audioEl = new Audio();
     audioEl.crossOrigin = 'anonymous';
     audioEl.preload = 'auto';
+    audioEl.volume = 1.0;
+    audioEl.muted = false;
     const mediaSource = ctx.createMediaElementSource(audioEl);
     mediaSource.connect(gainNode);
 
@@ -951,6 +964,12 @@ class DualChannelAudioEngine {
                 clearTimeout(timeoutId);
                 this.ytReady = true;
                 this.syncYouTubeHostGeometry();
+                try {
+                  ev.target.unMute?.();
+                  ev.target.setVolume(100);
+                } catch {
+                  // Ignore
+                }
                 if (this.ytActive && this.isPlaying) {
                   try {
                     ev.target.playVideo();
@@ -968,6 +987,14 @@ class DualChannelAudioEngine {
                 if (ev.data === statePlaying) {
                   this.clearYtStartupWatchdog();
                   this.isPlaying = true;
+                  try {
+                    ev.target.unMute?.();
+                    if (!this.isCrossfading) {
+                      ev.target.setVolume(100);
+                    }
+                  } catch {
+                    // Ignore
+                  }
                   const dur = ev.target.getDuration();
                   if (Number.isFinite(dur) && dur > 0) {
                     this.duration = dur;
@@ -1245,6 +1272,11 @@ class DualChannelAudioEngine {
       if (seq !== this.playSeq) return;
 
       if (player) {
+        try {
+          player.unMute?.();
+        } catch {
+          // Ignore
+        }
         if (alreadyMounted) {
           try {
             player.loadVideoById(track.youtubeId, 0);
@@ -1258,6 +1290,7 @@ class DualChannelAudioEngine {
         } else {
           this.clearYtVolumeFade();
           try {
+            player.unMute?.();
             player.setVolume(100);
           } catch {
             // Ignore
@@ -1284,6 +1317,8 @@ class DualChannelAudioEngine {
     if (track.source === 'synth' || (!track.streamUrl && track.source === 'stream' && track.synthProfile)) {
       await this.startSynthOnStrip(incomingStrip, track);
     } else if (track.source === 'local') {
+      incomingStrip.audioEl.volume = 1.0;
+      incomingStrip.audioEl.muted = false;
       const blob = await localDb.getAudioBlob(track.id);
       if (blob) {
         const url = URL.createObjectURL(blob);
@@ -1300,6 +1335,8 @@ class DualChannelAudioEngine {
         await incomingStrip.audioEl.play().catch(() => {});
       }
     } else if (track.streamUrl) {
+      incomingStrip.audioEl.volume = 1.0;
+      incomingStrip.audioEl.muted = false;
       const proxied =
         track.streamUrl.startsWith('http') && !track.streamUrl.startsWith(window.location.origin)
           ? `/api/stream/proxy?url=${encodeURIComponent(track.streamUrl)}`
@@ -1384,6 +1421,8 @@ class DualChannelAudioEngine {
     if (this.ytActive && this.ytPlayer && this.ytReady) {
       this.isPlaying = true;
       try {
+        this.ytPlayer.unMute?.();
+        this.ytPlayer.setVolume(100);
         this.ytPlayer.playVideo();
       } catch {
         // Ignore
@@ -1398,6 +1437,8 @@ class DualChannelAudioEngine {
     if (!active) return;
 
     this.isPlaying = true;
+    active.audioEl.volume = 1.0;
+    active.audioEl.muted = false;
     if (active.synthDriver || this.currentTrack.source === 'synth' || !active.audioEl.src) {
       if (!active.synthDriver) {
         await this.startSynthOnStrip(active, this.currentTrack);
@@ -1472,6 +1513,9 @@ class DualChannelAudioEngine {
           now,
           0.02
         );
+      }
+      if (this.masterGainNode) {
+        this.masterGainNode.gain.setTargetAtTime(computeMasterOutputGain(next), now, 0.02);
       }
     }
   }

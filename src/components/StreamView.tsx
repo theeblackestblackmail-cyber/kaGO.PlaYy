@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   BadgeCheck,
+  Check,
   Disc3,
   ListPlus,
   Loader2,
@@ -10,16 +11,28 @@ import {
   Search,
   Sparkles,
   Trash2,
+  UserCheck,
 } from 'lucide-react';
 import { CURATED_STREAM_BANK, STREAM_GENRES } from '../data/presetsAndStems';
 import { localDb } from '../db/localDb';
-import type { AudioEngineSnapshot, Track } from '../types/audio';
+import type {
+  AudioEngineSnapshot,
+  StreamArtistResult,
+  StreamSearchCategory,
+  Track,
+} from '../types/audio';
 import { formatDuration } from '../utils/lrcParser';
 import { hasNativeHttpBridge, nativeFetchText } from '../utils/nativeMediaBridge';
 import {
+  buildCategorySearchPlan,
+  extractYouTubeArtists,
+  extractYouTubeCollections,
+  extractYouTubePlaylistTracks,
+  extractYouTubePodcasts,
   extractYouTubeSearchResults,
   isIndividualSong,
   parseYouTubeSuggestResponse,
+  pushRecentSearch,
   rankYouTubeSearchResults,
   toYouTubeTracks,
 } from '../utils/streamFilter';
@@ -40,6 +53,17 @@ const POPULAR_PICKS = [
   'Rema Calm Down',
 ];
 
+const STREAM_CATEGORIES: Array<{ id: StreamSearchCategory; label: string }> = [
+  { id: 'all', label: 'All' },
+  { id: 'songs', label: 'Songs' },
+  { id: 'videos', label: 'Videos' },
+  { id: 'albums', label: 'Albums' },
+  { id: 'artists', label: 'Artists' },
+  { id: 'playlists', label: 'Playlists' },
+  { id: 'featured_playlists', label: 'Featured Playlists' },
+  { id: 'podcasts', label: 'Podcasts' },
+];
+
 function formatCompactViews(views?: number): string {
   if (!views || views <= 0) return '';
   if (views >= 1_000_000_000) return `${(views / 1_000_000_000).toFixed(1)}B views`;
@@ -57,14 +81,17 @@ export const StreamView: React.FC<StreamViewProps> = ({
 }) => {
   const [query, setQuery] = useState('');
   const [selectedGenre, setSelectedGenre] = useState<string>('');
+  const [selectedCategory, setSelectedCategory] = useState<StreamSearchCategory>('all');
   const [recentSearches, setRecentSearches] = useState<string[]>(() =>
     localDb.loadRecentSearches()
   );
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [results, setResults] = useState<Track[]>(CURATED_STREAM_BANK);
+  const [artistResults, setArtistResults] = useState<StreamArtistResult[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [recoveringId, setRecoveringId] = useState<string | null>(null);
+  const [loadingCollectionId, setLoadingCollectionId] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string>('');
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
 
@@ -125,39 +152,68 @@ export const StreamView: React.FC<StreamViewProps> = ({
   const searchYouTubeNatively = async (
     searchTerm: string,
     genreFilter: string,
+    category: StreamSearchCategory = 'all',
     excludeId?: string
-  ): Promise<Track[]> => {
-    if (!hasNativeHttpBridge()) return [];
+  ): Promise<{ tracks: Track[]; artists: StreamArtistResult[] }> => {
+    if (!hasNativeHttpBridge()) return { tracks: [], artists: [] };
+    const plan = buildCategorySearchPlan(searchTerm, genreFilter, category);
+    const spParam = plan.sp ? `&sp=${plan.sp}` : '';
     const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(
-      searchTerm
-    )}&sp=EgIQAQ%3D%3D`;
+      plan.searchQuery
+    )}${spParam}`;
     const nativeRes = await nativeFetchText(ytUrl, 9000);
-    if (!nativeRes?.ok || !nativeRes.text) return [];
+    if (!nativeRes?.ok || !nativeRes.text) return { tracks: [], artists: [] };
+
+    const artists = extractYouTubeArtists(nativeRes.text);
+    if (category === 'albums' || category === 'playlists' || category === 'featured_playlists') {
+      return {
+        tracks: extractYouTubeCollections(nativeRes.text, category, genreFilter),
+        artists,
+      };
+    }
+    if (category === 'podcasts') {
+      return {
+        tracks: extractYouTubePodcasts(nativeRes.text, genreFilter),
+        artists,
+      };
+    }
 
     const extracted = extractYouTubeSearchResults(nativeRes.text).filter(
       (item) => !excludeId || item.videoId !== excludeId
     );
-    const ranked = rankYouTubeSearchResults(extracted, searchTerm).slice(0, 12);
-    return toYouTubeTracks(ranked, genreFilter);
+    const rankingTerm = searchTerm.trim() || plan.searchQuery;
+    const ranked = rankYouTubeSearchResults(extracted, rankingTerm, category).slice(0, 15);
+    const tracks = toYouTubeTracks(ranked, genreFilter).map((t) => ({
+      ...t,
+      resultType: category === 'videos' ? ('video' as const) : ('song' as const),
+    }));
+    return { tracks, artists };
   };
 
-  const executeSearch = async (searchText: string, genreFilter = selectedGenre) => {
+  const executeSearch = async (
+    searchText: string,
+    genreFilter = selectedGenre,
+    category: StreamSearchCategory = selectedCategory
+  ) => {
     const cleanQ = searchText.trim();
     setShowSuggestions(false);
 
     if (cleanQ) {
-      setRecentSearches((prev) =>
-        [cleanQ, ...prev.filter((item) => item.toLowerCase() !== cleanQ.toLowerCase())].slice(0, 8)
-      );
+      setRecentSearches((prev) => pushRecentSearch(prev, cleanQ));
     }
 
     setIsLoading(true);
     setStatusNote('');
-    const effectiveTerm =
-      [cleanQ, genreFilter ? `${genreFilter} music` : ''].filter(Boolean).join(' ') || 'top music hits';
+
+    const isCollectionOrPodcast =
+      category === 'albums' ||
+      category === 'playlists' ||
+      category === 'featured_playlists' ||
+      category === 'podcasts';
 
     try {
       let liveSongs: Track[] = [];
+      let liveArtists: StreamArtistResult[] = [];
       let sourceFlag = 'live';
 
       // 1. Try server /api/stream/search (AI Studio / Web Node server)
@@ -165,29 +221,38 @@ export const StreamView: React.FC<StreamViewProps> = ({
         const params = new URLSearchParams();
         if (cleanQ) params.set('q', cleanQ);
         if (genreFilter) params.set('genre', genreFilter);
+        params.set('category', category);
 
         const res = await fetch(`/api/stream/search?${params.toString()}`);
         if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
-          const data = (await res.json()) as { results?: Track[]; source?: string };
-          liveSongs = (data.results || []).filter((t) =>
-            isIndividualSong(t.title, t.album, t.duration)
-          );
+          const data = (await res.json()) as {
+            results?: Track[];
+            artists?: StreamArtistResult[];
+            source?: string;
+          };
+          const rawResults = data.results || [];
+          liveSongs = isCollectionOrPodcast
+            ? rawResults
+            : rawResults.filter((t) => isIndividualSong(t.title, t.album, t.duration));
+          liveArtists = Array.isArray(data.artists) ? data.artists : [];
           sourceFlag = data.source || 'live';
         }
       } catch {
         // Fall through to native APK / Audius search
       }
 
-      // 2. Android APK native YouTube search bridge (fetches real YouTube directly without server/CORS)
-      if (liveSongs.length === 0 && hasNativeHttpBridge()) {
-        liveSongs = await searchYouTubeNatively(effectiveTerm, genreFilter);
-        if (liveSongs.length > 0) {
+      // 2. Android APK native YouTube search bridge
+      if (liveSongs.length === 0 && liveArtists.length === 0 && hasNativeHttpBridge()) {
+        const nativeOut = await searchYouTubeNatively(cleanQ, genreFilter, category);
+        liveSongs = nativeOut.tracks;
+        liveArtists = nativeOut.artists;
+        if (liveSongs.length > 0 || liveArtists.length > 0) {
           sourceFlag = 'live';
         }
       }
 
-      // 3. Last-resort CORS Audius fallback if YouTube wasn't reachable
-      if (liveSongs.length === 0) {
+      // 3. Last-resort CORS Audius fallback
+      if (liveSongs.length === 0 && category !== 'artists') {
         const audiusQ = [cleanQ, genreFilter].filter(Boolean).join(' ') || 'synthwave';
         const aRes = await fetch(
           `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(audiusQ)}&limit=12`
@@ -227,6 +292,25 @@ export const StreamView: React.FC<StreamViewProps> = ({
         }
       }
 
+      // Derive artist cards from official song results if Artists tab yielded no dedicated channel cards
+      if (category === 'artists' && liveArtists.length === 0 && liveSongs.length > 0) {
+        const seenNames = new Set<string>();
+        for (const t of liveSongs) {
+          const key = t.artist.toLowerCase();
+          if (seenNames.has(key)) continue;
+          seenNames.add(key);
+          liveArtists.push({
+            id: `derived-${key}`,
+            name: t.artist,
+            thumbnailUrl: t.artworkUrl,
+            subscriberText: 'Artists',
+            isOfficial: t.isOfficial,
+          });
+        }
+      }
+
+      setArtistResults(liveArtists);
+
       const localMatches = CURATED_STREAM_BANK.filter((item) => {
         const matchesGenre = !genreFilter || item.genre?.toLowerCase() === genreFilter.toLowerCase();
         const matchesQuery =
@@ -238,11 +322,12 @@ export const StreamView: React.FC<StreamViewProps> = ({
       });
 
       const merged = liveSongs.length > 0 ? liveSongs : localMatches;
-      setResults(merged.length > 0 ? merged : CURATED_STREAM_BANK);
-      if (sourceFlag === 'fallback' && liveSongs.length === 0) {
+      setResults(merged.length > 0 ? merged : category === 'artists' ? [] : CURATED_STREAM_BANK);
+      if (sourceFlag === 'fallback' && liveSongs.length === 0 && liveArtists.length === 0) {
         setStatusNote('Showing curated offline sound bank tracks (individual songs only).');
       }
     } catch {
+      setArtistResults([]);
       const localMatches = CURATED_STREAM_BANK.filter(
         (item) => !genreFilter || item.genre?.toLowerCase() === genreFilter.toLowerCase()
       );
@@ -255,13 +340,92 @@ export const StreamView: React.FC<StreamViewProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    void executeSearch(query, selectedGenre);
+    void executeSearch(query, selectedGenre, selectedCategory);
   };
 
   const handleGenreClick = (genre: string) => {
     const nextGenre = selectedGenre === genre ? '' : genre;
     setSelectedGenre(nextGenre);
-    void executeSearch(query, nextGenre);
+    void executeSearch(query, nextGenre, selectedCategory);
+  };
+
+  const handleCategoryClick = (category: StreamSearchCategory) => {
+    setSelectedCategory(category);
+    void executeSearch(query, selectedGenre, category);
+  };
+
+  const resolvePlaylistTracks = async (playlistId: string, title: string): Promise<Track[]> => {
+    try {
+      const res = await fetch(
+        `/api/stream/playlist?list=${encodeURIComponent(playlistId)}&title=${encodeURIComponent(title)}`
+      );
+      if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
+        const data = (await res.json()) as { tracks?: Track[] };
+        if (Array.isArray(data.tracks) && data.tracks.length > 0) {
+          return data.tracks;
+        }
+      }
+    } catch {
+      // Fall through to Android native HTTP bridge
+    }
+
+    if (hasNativeHttpBridge()) {
+      const nativeRes = await nativeFetchText(
+        `https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`,
+        9000
+      );
+      if (nativeRes?.ok && nativeRes.text) {
+        return extractYouTubePlaylistTracks(nativeRes.text, title);
+      }
+    }
+
+    return [];
+  };
+
+  const handleCollectionAction = async (collection: Track, mode: 'play' | 'queue') => {
+    if (!collection.youtubePlaylistId) {
+      if (mode === 'play') onPlayTrack(collection);
+      else {
+        onAddToQueue(collection);
+        onSaveTrackToLibrary(collection);
+      }
+      return;
+    }
+
+    setLoadingCollectionId(collection.id);
+    try {
+      let tracks = await resolvePlaylistTracks(collection.youtubePlaylistId, collection.title);
+      if (tracks.length === 0) {
+        const fallback = await searchYouTubeNatively(
+          `${collection.artist} ${collection.title}`,
+          collection.genre || '',
+          'songs'
+        );
+        tracks = fallback.tracks;
+      }
+
+      if (tracks.length === 0) {
+        setStatusNote(`Could not load tracks from "${collection.title}". Try searching the song title.`);
+        return;
+      }
+
+      if (mode === 'play') {
+        onPlayTrack(tracks[0]);
+        tracks.slice(1).forEach((t) => {
+          onAddToQueue(t);
+          onSaveTrackToLibrary(t);
+        });
+        setStatusNote(`Playing "${tracks[0].title}" + queued ${tracks.length - 1} tracks from "${collection.title}".`);
+      } else {
+        tracks.forEach((t) => {
+          onAddToQueue(t);
+          onSaveTrackToLibrary(t);
+        });
+        setStatusNote(`Added ${tracks.length} tracks from "${collection.title}" to queue.`);
+      }
+    } finally {
+      setLoadingCollectionId(null);
+    }
   };
 
   const handleAutoRecover = async (track: Track) => {
@@ -313,11 +477,13 @@ export const StreamView: React.FC<StreamViewProps> = ({
       }
 
       if (!recoveredTrack && hasNativeHttpBridge()) {
-        const altTracks = await searchYouTubeNatively(
+        const altOut = await searchYouTubeNatively(
           `${track.artist} ${track.title} topic`,
           track.genre || '',
+          'songs',
           track.youtubeId
         );
+        const altTracks = altOut.tracks;
         if (altTracks[0]?.youtubeId) {
           recoveredTrack = {
             ...track,
@@ -402,7 +568,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
                     onClick={() => {
                       setQuery(item);
                       setShowSuggestions(false);
-                      void executeSearch(item, selectedGenre);
+                      void executeSearch(item, selectedGenre, selectedCategory);
                     }}
                     className="flex w-full items-center gap-2.5 border-b border-[#1A1C24] px-3.5 py-2.5 text-left text-xs text-[#E5E7EB] last:border-b-0 hover:bg-[#1A1D27] hover:text-white cursor-pointer"
                   >
@@ -423,6 +589,34 @@ export const StreamView: React.FC<StreamViewProps> = ({
           </button>
         </form>
 
+        {/* Horizontally Scrollable Stream Search Categories (All, Songs, Videos, Albums, Artists, Playlists, Featured Playlists, Podcasts) */}
+        <div
+          role="tablist"
+          aria-label="Stream search categories"
+          className="no-scrollbar mt-3.5 flex items-center gap-2 overflow-x-auto pb-1"
+        >
+          {STREAM_CATEGORIES.map((cat) => {
+            const active = selectedCategory === cat.id;
+            return (
+              <button
+                key={cat.id}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                onClick={() => handleCategoryClick(cat.id)}
+                className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3.5 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+                  active
+                    ? 'border-[#E11D48] bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
+                    : 'border-[#252834] bg-[#13151C] text-[#B4B7C2] hover:border-[#3A3F50] hover:text-white'
+                }`}
+              >
+                {active && <Check className="h-3.5 w-3.5 stroke-[2.5]" />}
+                <span>{cat.label}</span>
+              </button>
+            );
+          })}
+        </div>
+
         {/* Popular Song Recommendations */}
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <span className="inline-flex items-center gap-1 text-xs text-[#8E929B]">
@@ -435,7 +629,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
               type="button"
               onClick={() => {
                 setQuery(term);
-                void executeSearch(term, '');
+                void executeSearch(term, '', selectedCategory);
               }}
               className="rounded-md border border-[#252834] bg-[#14161D] px-2.5 py-1 text-xs text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
             >
@@ -454,7 +648,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
                 type="button"
                 onClick={() => {
                   setQuery(term);
-                  void executeSearch(term, selectedGenre);
+                  void executeSearch(term, selectedGenre, selectedCategory);
                 }}
                 className="rounded-md border border-[#252834] bg-[#14161D] px-2.5 py-1 text-xs text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
               >
@@ -494,119 +688,211 @@ export const StreamView: React.FC<StreamViewProps> = ({
         </div>
       </section>
 
-      {/* 3-Column Stream Results Grid */}
-      <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {results.map((track) => {
-          const isCurrent = engine.currentTrack?.id === track.id;
-          const isTrackPlaying = isCurrent && engine.isPlaying;
-          const isRecovering = recoveringId === track.id;
-          const viewsLabel = formatCompactViews(track.viewCount);
-
-          return (
-            <article
-              key={track.id}
-              className={`flex flex-col justify-between rounded-xl border p-4 transition-colors ${
-                isCurrent
-                  ? 'border-[#E11D48] bg-[#13090E]'
-                  : 'border-[#1F2129] bg-[#0D0E12] hover:border-[#303444]'
-              }`}
-            >
-              <div>
-                <div className="relative aspect-[16/10] w-full overflow-hidden rounded-lg border border-[#222530] bg-[#14161E]">
-                  {track.artworkUrl ? (
+      {/* Matching Artists Section (shown on All when artists match or on Artists category) */}
+      {artistResults.length > 0 && (selectedCategory === 'all' || selectedCategory === 'artists') && (
+        <section className="space-y-3">
+          <div className="flex items-center justify-between">
+            <h2 className="font-display text-sm font-bold uppercase tracking-wider text-[#9CA3AF]">
+              Artists
+            </h2>
+            <span className="font-mono-tabular text-xs text-[#6B7280]">
+              Tap an artist to view top songs
+            </span>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {artistResults.slice(0, selectedCategory === 'artists' ? 8 : 3).map((artist) => (
+              <button
+                key={artist.id}
+                type="button"
+                onClick={() => {
+                  setQuery(artist.name);
+                  setSelectedCategory('songs');
+                  void executeSearch(artist.name, selectedGenre, 'songs');
+                }}
+                className="flex items-center gap-3.5 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-3.5 text-left transition-colors hover:border-[#E11D48] cursor-pointer"
+              >
+                <div className="h-14 w-14 shrink-0 overflow-hidden rounded-full border border-[#282B36] bg-[#14161D]">
+                  {artist.thumbnailUrl ? (
                     <img
-                      src={track.artworkUrl}
-                      alt={track.title}
+                      src={artist.thumbnailUrl}
+                      alt={artist.name}
                       referrerPolicy="no-referrer"
                       className="h-full w-full object-cover"
                     />
                   ) : (
-                    <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-[#161822] to-[#0A0B0F]">
-                      <Disc3 className="h-10 w-10 text-[#E11D48]" />
+                    <div className="flex h-full w-full items-center justify-center">
+                      <UserCheck className="h-6 w-6 text-[#E11D48]" />
                     </div>
                   )}
-                  <span className="absolute bottom-2 right-2 rounded bg-black/85 px-2 py-0.5 font-mono-tabular text-xs font-semibold text-[#F4F3F0] border border-[#2B2E3A]">
-                    {formatDuration(track.duration)}
-                  </span>
                 </div>
-
-                <div className="mt-3">
+                <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
-                    <h2 className="font-display text-base font-bold text-[#F4F3F0] truncate">
-                      {track.title}
-                    </h2>
-                    {track.isOfficial && (
-                      <BadgeCheck
-                        className="h-4 w-4 shrink-0 text-[#E11D48]"
-                        aria-label="Official artist track"
-                      />
+                    <span className="truncate font-display text-sm font-bold text-[#F4F3F0]">
+                      {artist.name}
+                    </span>
+                    {artist.isOfficial && (
+                      <BadgeCheck className="h-4 w-4 shrink-0 text-[#E11D48]" />
                     )}
                   </div>
-                  <p className="mt-0.5 text-xs text-[#8E929B] truncate">{track.artist}</p>
-                  <div className="mt-1.5 flex items-center gap-2 font-mono-tabular text-[11px] text-[#6B7280]">
-                    <span className="truncate">ID: {track.id}</span>
-                    {viewsLabel && (
-                      <>
-                        <span aria-hidden="true">·</span>
-                        <span className="text-[#9CA3AF] truncate">{viewsLabel}</span>
-                      </>
+                  <p className="mt-0.5 truncate text-xs text-[#8E929B]">
+                    Artists{artist.subscriberText && artist.subscriberText !== 'Artist' ? ` · ${artist.subscriberText}` : ''}
+                  </p>
+                </div>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* 3-Column Stream Results Grid */}
+      {results.length > 0 && (
+        <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {results.map((track) => {
+            const isCurrent = engine.currentTrack?.id === track.id;
+            const isTrackPlaying = isCurrent && engine.isPlaying;
+            const isRecovering = recoveringId === track.id;
+            const isCollectionBusy = loadingCollectionId === track.id;
+            const viewsLabel = formatCompactViews(track.viewCount);
+            const isPlaylistCollection = Boolean(track.youtubePlaylistId);
+
+            return (
+              <article
+                key={track.id}
+                className={`flex flex-col justify-between rounded-xl border p-4 transition-colors ${
+                  isCurrent
+                    ? 'border-[#E11D48] bg-[#13090E]'
+                    : 'border-[#1F2129] bg-[#0D0E12] hover:border-[#303444]'
+                }`}
+              >
+                <div>
+                  <div className="relative aspect-[16/10] w-full overflow-hidden rounded-lg border border-[#222530] bg-[#14161E]">
+                    {track.artworkUrl ? (
+                      <img
+                        src={track.artworkUrl}
+                        alt={track.title}
+                        referrerPolicy="no-referrer"
+                        className="h-full w-full object-cover"
+                      />
+                    ) : (
+                      <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-[#161822] to-[#0A0B0F]">
+                        <Disc3 className="h-10 w-10 text-[#E11D48]" />
+                      </div>
                     )}
-                    {track.recoveredFrom && (
-                      <>
-                        <span aria-hidden="true">·</span>
-                        <span className="text-[#FF4D6D] truncate">{track.recoveredFrom}</span>
-                      </>
+                    {track.resultType && track.resultType !== 'song' && (
+                      <span className="absolute left-2 top-2 rounded bg-black/85 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-[#F4F3F0] border border-[#2B2E3A]">
+                        {track.resultType}
+                      </span>
                     )}
+                    <span className="absolute bottom-2 right-2 rounded bg-black/85 px-2 py-0.5 font-mono-tabular text-xs font-semibold text-[#F4F3F0] border border-[#2B2E3A]">
+                      {isPlaylistCollection && track.trackCount
+                        ? `${track.trackCount} tracks`
+                        : formatDuration(track.duration)}
+                    </span>
+                  </div>
+
+                  <div className="mt-3">
+                    <div className="flex items-center gap-1.5">
+                      <h2 className="font-display text-base font-bold text-[#F4F3F0] truncate">
+                        {track.title}
+                      </h2>
+                      {track.isOfficial && (
+                        <BadgeCheck
+                          className="h-4 w-4 shrink-0 text-[#E11D48]"
+                          aria-label="Official artist track"
+                        />
+                      )}
+                    </div>
+                    <p className="mt-0.5 text-xs text-[#8E929B] truncate">{track.artist}</p>
+                    <div className="mt-1.5 flex items-center gap-2 font-mono-tabular text-[11px] text-[#6B7280]">
+                      <span className="truncate">
+                        {isPlaylistCollection ? track.album : `ID: ${track.id}`}
+                      </span>
+                      {viewsLabel && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-[#9CA3AF] truncate">{viewsLabel}</span>
+                        </>
+                      )}
+                      {track.recoveredFrom && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-[#FF4D6D] truncate">{track.recoveredFrom}</span>
+                        </>
+                      )}
+                    </div>
                   </div>
                 </div>
-              </div>
 
-              <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-[#1A1C24] pt-3">
-                <button
-                  type="button"
-                  onClick={() => handleAutoRecover(track)}
-                  disabled={isRecovering}
-                  className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-2.5 py-2 text-xs font-medium text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors whitespace-nowrap cursor-pointer"
-                >
-                  <RefreshCw className={`h-3.5 w-3.5 ${isRecovering ? 'animate-spin text-[#E11D48]' : ''}`} />
-                  <span>Auto-Recovery</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    onAddToQueue(track);
-                    onSaveTrackToLibrary(track);
-                  }}
-                  aria-label={`Queue ${track.title}`}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-2 text-xs font-medium text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors whitespace-nowrap cursor-pointer"
-                >
-                  <ListPlus className="h-3.5 w-3.5" />
-                  <span>Queue</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => (isCurrent ? onTogglePlay() : onPlayTrack(track))}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] transition-colors whitespace-nowrap cursor-pointer"
-                >
-                  {isTrackPlaying ? (
-                    <>
-                      <Pause className="h-3.5 w-3.5 fill-current" />
-                      <span>Pause</span>
-                    </>
-                  ) : (
-                    <>
-                      <Play className="h-3.5 w-3.5 fill-current" />
-                      <span>Play</span>
-                    </>
+                <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-[#1A1C24] pt-3">
+                  {!isPlaylistCollection && (
+                    <button
+                      type="button"
+                      onClick={() => handleAutoRecover(track)}
+                      disabled={isRecovering}
+                      className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-2.5 py-2 text-xs font-medium text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      <RefreshCw
+                        className={`h-3.5 w-3.5 ${isRecovering ? 'animate-spin text-[#E11D48]' : ''}`}
+                      />
+                      <span>Auto-Recovery</span>
+                    </button>
                   )}
-                </button>
-              </div>
-            </article>
-          );
-        })}
-      </section>
+
+                  <button
+                    type="button"
+                    disabled={isCollectionBusy}
+                    onClick={() => {
+                      if (isPlaylistCollection) {
+                        void handleCollectionAction(track, 'queue');
+                      } else {
+                        onAddToQueue(track);
+                        onSaveTrackToLibrary(track);
+                      }
+                    }}
+                    aria-label={`Queue ${track.title}`}
+                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-2 text-xs font-medium text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors whitespace-nowrap cursor-pointer"
+                  >
+                    <ListPlus className="h-3.5 w-3.5" />
+                    <span>{isPlaylistCollection ? 'Queue All' : 'Queue'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={isCollectionBusy}
+                    onClick={() => {
+                      if (isPlaylistCollection) {
+                        void handleCollectionAction(track, 'play');
+                      } else if (isCurrent) {
+                        onTogglePlay();
+                      } else {
+                        onPlayTrack(track);
+                      }
+                    }}
+                    className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] disabled:opacity-60 transition-colors whitespace-nowrap cursor-pointer"
+                  >
+                    {isCollectionBusy ? (
+                      <>
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        <span>Loading...</span>
+                      </>
+                    ) : isTrackPlaying ? (
+                      <>
+                        <Pause className="h-3.5 w-3.5 fill-current" />
+                        <span>Pause</span>
+                      </>
+                    ) : (
+                      <>
+                        <Play className="h-3.5 w-3.5 fill-current" />
+                        <span>{isPlaylistCollection ? 'Play All' : 'Play'}</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </section>
+      )}
     </div>
   );
 };

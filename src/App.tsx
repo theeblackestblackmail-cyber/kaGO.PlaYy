@@ -38,6 +38,7 @@ import {
   syncNativeNowPlaying,
 } from './utils/nativeMediaBridge';
 import { mergeAutoplayQueue } from './utils/streamFilter';
+import { fetchSyncedLyricsForTrack } from './utils/lyricsFetcher';
 import { fetchRelatedRadioTracks } from './utils/streamRadio';
 import {
   applyThemeToDocument,
@@ -74,6 +75,8 @@ export default function App() {
     }
   });
   const [isFetchingRadio, setIsFetchingRadio] = useState(false);
+  const [isFetchingLyrics, setIsFetchingLyrics] = useState(false);
+  const [lyricsHydrated, setLyricsHydrated] = useState(false);
   const [themePrefs, setThemePrefs] = useState<ThemePreferences>(() => loadThemePreferences());
 
   useEffect(() => {
@@ -87,6 +90,8 @@ export default function App() {
   const requestedNotifPermRef = useRef(false);
   const radioSeedEpochRef = useRef(0);
   const playedHistoryIdsRef = useRef<Set<string>>(new Set());
+  const fetchingLyricsIdsRef = useRef<Set<string>>(new Set());
+  const attemptedLyricsIdsRef = useRef<Set<string>>(new Set());
 
   // Hydrate offline DB on startup
   useEffect(() => {
@@ -101,6 +106,7 @@ export default function App() {
       setSavedTracks(dbTracks);
       setPlaylists(dbPlaylists);
       setLyricsMap(dbLyrics);
+      setLyricsHydrated(true);
     })();
     return () => {
       active = false;
@@ -118,6 +124,14 @@ export default function App() {
     const seen = new Set(allLibraryTracks.map((t) => t.id));
     return [...allLibraryTracks, ...CURATED_STREAM_BANK.filter((c) => !seen.has(c.id))];
   }, [allLibraryTracks]);
+
+  const syncLyricsTracks = useMemo(() => {
+    const cur = engine.currentTrack;
+    if (!cur || allLibraryTracks.some((t) => t.id === cur.id)) {
+      return allLibraryTracks;
+    }
+    return [cur, ...allLibraryTracks];
+  }, [allLibraryTracks, engine.currentTrack]);
 
   const populateRelatedRadio = useCallback(
     async (seedTrack: Track, replaceExistingAuto: boolean) => {
@@ -616,14 +630,50 @@ export default function App() {
     await localDb.deleteTrack(trackId);
   };
 
-  const handleSaveLyrics = async (entry: StoredLyrics) => {
+  const handleSaveLyrics = useCallback(async (entry: StoredLyrics) => {
     setLyricsMap((prev) => ({ ...prev, [entry.trackId]: entry }));
     await localDb.saveLyrics(entry);
-  };
+  }, []);
+
+  const handleFetchTrackLyrics = useCallback(
+    async (track: Track, customQuery?: string) => {
+      if (!track || fetchingLyricsIdsRef.current.has(track.id)) return;
+      fetchingLyricsIdsRef.current.add(track.id);
+      setIsFetchingLyrics(true);
+      try {
+        const fetched = await fetchSyncedLyricsForTrack(track, customQuery);
+        if (fetched?.rawLrc) {
+          await handleSaveLyrics({
+            trackId: track.id,
+            rawLrc: fetched.rawLrc,
+            offsetSeconds: lyricsMap[track.id]?.offsetSeconds ?? 0,
+            updatedAt: Date.now(),
+          });
+        }
+      } finally {
+        fetchingLyricsIdsRef.current.delete(track.id);
+        setIsFetchingLyrics(false);
+      }
+    },
+    [handleSaveLyrics, lyricsMap]
+  );
+
+  // Automatically fetch & cache synced LRC lyrics whenever a new song without local lyrics starts playing
+  useEffect(() => {
+    if (!lyricsHydrated) return;
+    const track = engine.currentTrack;
+    if (!track || track.source === 'synth') return;
+    const hasSaved = Boolean(lyricsMap[track.id]?.rawLrc?.trim() || track.lrcLyrics?.trim());
+    if (hasSaved || attemptedLyricsIdsRef.current.has(track.id)) return;
+    attemptedLyricsIdsRef.current.add(track.id);
+    void handleFetchTrackLyrics(track);
+  }, [lyricsHydrated, engine.currentTrack?.id, lyricsMap, handleFetchTrackLyrics]);
 
   const handleUpdateLyricsOffset = async (trackId: string, offsetSeconds: number) => {
     const existing = lyricsMap[trackId];
-    const track = allLibraryTracks.find((t) => t.id === trackId);
+    const track =
+      allLibraryTracks.find((t) => t.id === trackId) ||
+      (engine.currentTrack?.id === trackId ? engine.currentTrack : undefined);
     const entry: StoredLyrics = {
       trackId,
       rawLrc: existing?.rawLrc ?? track?.lrcLyrics ?? '',
@@ -773,9 +823,11 @@ export default function App() {
 
         {activeTab === 'lyrics' && (
           <SyncLyricsView
-            tracks={allLibraryTracks}
+            tracks={syncLyricsTracks}
             engine={engine}
             lyricsMap={lyricsMap}
+            isFetchingLyrics={isFetchingLyrics}
+            onFetchTrackLyrics={(tr, customQ) => void handleFetchTrackLyrics(tr, customQ)}
             onSaveLyrics={handleSaveLyrics}
             onSeek={(sec) => audioEngine.seek(sec)}
             onPlayTrack={playTrack}
@@ -823,8 +875,11 @@ export default function App() {
         onOpenDsp={() => setIsDspOpen(true)}
         onUpdateLyricsOffset={(id, offset) => void handleUpdateLyricsOffset(id, offset)}
         onOpenStream={() => setActiveTab('stream')}
+        onOpenLyricsStudio={() => setActiveTab('lyrics')}
         autoplayRadioEnabled={autoplayRadioEnabled}
         isFetchingRadio={isFetchingRadio}
+        isFetchingLyrics={isFetchingLyrics}
+        onFetchTrackLyrics={(tr, customQ) => void handleFetchTrackLyrics(tr, customQ)}
         onToggleAutoplayRadio={handleToggleAutoplayRadio}
       />
 

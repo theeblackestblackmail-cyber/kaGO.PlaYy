@@ -1,14 +1,19 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  Disc3,
   Heart,
+  Loader2,
+  Mic2,
   Minus,
   Pause,
   Play,
   Plus,
   Radio,
+  RefreshCw,
   RotateCcw,
   RotateCw,
+  Search,
   SkipBack,
   SkipForward,
   Sliders,
@@ -16,6 +21,8 @@ import {
 } from 'lucide-react';
 import type { DspSettings, StoredLyrics, Track } from '../types/audio';
 import { findActiveLyricIndex, formatDuration, parseLrc } from '../utils/lrcParser';
+import { sanitizeTrackForLyrics } from '../utils/lyricsFetcher';
+import { fetchRelatedRadioTracks } from '../utils/streamRadio';
 import { SpectrumVisualizer } from './SpectrumVisualizer';
 import { VinylTurntable } from './VinylTurntable';
 import { WatchVideoViewport } from './WatchVideoViewport';
@@ -46,8 +53,11 @@ interface FullscreenPlayerProps {
   onOpenDsp: () => void;
   onUpdateLyricsOffset: (trackId: string, offset: number) => void;
   onOpenStream: () => void;
+  onOpenLyricsStudio?: () => void;
   autoplayRadioEnabled: boolean;
   isFetchingRadio: boolean;
+  isFetchingLyrics?: boolean;
+  onFetchTrackLyrics?: (track: Track, customQuery?: string) => void;
   onToggleAutoplayRadio: () => void;
 }
 
@@ -75,11 +85,17 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   onOpenDsp,
   onUpdateLyricsOffset,
   onOpenStream,
+  onOpenLyricsStudio,
   autoplayRadioEnabled,
   isFetchingRadio,
+  isFetchingLyrics = false,
+  onFetchTrackLyrics,
   onToggleAutoplayRadio,
 }) => {
   const [subTab, setSubTab] = useState<FullscreenSubTab>('turntable');
+  const [fallbackRelated, setFallbackRelated] = useState<Track[]>([]);
+  const [loadingWatchRelated, setLoadingWatchRelated] = useState(false);
+  const [lyricSearchQuery, setLyricSearchQuery] = useState('');
   const activeLineRef = useRef<HTMLButtonElement | null>(null);
 
   const rawLrc = storedLyrics?.rawLrc ?? track?.lrcLyrics ?? '';
@@ -90,11 +106,69 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
     [parsedLines, currentTime, offsetSeconds]
   );
 
+  // Sync manual search box when switching tracks
+  useEffect(() => {
+    if (!track) return;
+    const { searchQuery } = sanitizeTrackForLyrics(track.title, track.artist);
+    setLyricSearchQuery(searchQuery || track.title);
+  }, [track?.id]);
+
+  // Smoothly auto-center active lyric line while Sync Lyrics tab is open
   useEffect(() => {
     if (subTab === 'lyrics' && activeLineRef.current) {
       activeLineRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   }, [activeIdx, subTab]);
+
+  // Build horizontally scrollable related video suggestions from live queue (+ fallback fetch)
+  const queueRelated = useMemo(() => {
+    if (!track) return [];
+    const seen = new Set<string>([track.id]);
+    const list: Track[] = [];
+    for (const q of queue) {
+      if (seen.has(q.id)) continue;
+      if (q.autoQueued || Boolean(q.youtubeId) || q.source === 'stream') {
+        seen.add(q.id);
+        list.push(q);
+      }
+    }
+    return list;
+  }, [queue, track?.id]);
+
+  useEffect(() => {
+    setFallbackRelated([]);
+  }, [track?.id]);
+
+  useEffect(() => {
+    if (!isOpen || subTab !== 'video' || !track) return;
+    if (queueRelated.length >= 3) {
+      return;
+    }
+    let cancelled = false;
+    setLoadingWatchRelated(true);
+    void fetchRelatedRadioTracks(track, [track.id, ...queueRelated.map((t) => t.id)])
+      .then((fetched) => {
+        if (!cancelled) setFallbackRelated(fetched);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingWatchRelated(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, subTab, track?.id, queueRelated.length]);
+
+  const relatedSuggestions = useMemo(() => {
+    if (!track) return [];
+    const merged: Track[] = [];
+    const seen = new Set<string>([track.id]);
+    for (const item of [...queueRelated, ...fallbackRelated]) {
+      if (seen.has(item.id)) continue;
+      seen.add(item.id);
+      merged.push(item);
+    }
+    return merged.slice(0, 12);
+  }, [queueRelated, fallbackRelated, track?.id]);
 
   if (!isOpen || !track) return null;
 
@@ -177,12 +251,13 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
           )}
 
           {subTab === 'video' && (
-            <div className="space-y-5">
+            <div className="space-y-3.5">
               <WatchVideoViewport
                 track={track}
                 isPlaying={isPlaying}
                 currentTime={currentTime}
                 zIndex={60}
+                compact
                 isInAppPip={isInAppPip}
                 onToggleInAppPip={() => {
                   onToggleInAppPip();
@@ -193,18 +268,120 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                   onOpenStream();
                 }}
               />
-              <SpectrumVisualizer isPlaying={isPlaying} dsp={dsp} compact />
+
+              {/* Horizontal Related Videos Scroller (3 rectangles visible side-by-side) */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold uppercase tracking-wider text-[#C7C9D1]">
+                      Up Next · Related Videos
+                    </span>
+                    {(isFetchingRadio || loadingWatchRelated) && (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#E11D48]" />
+                    )}
+                  </div>
+                  <span className="font-mono-tabular text-[11px] text-[#8E929B]">
+                    Scroll for more
+                  </span>
+                </div>
+
+                {relatedSuggestions.length > 0 ? (
+                  <div
+                    data-testid="related-video-suggestions"
+                    className="no-scrollbar flex gap-2.5 overflow-x-auto snap-x snap-mandatory pb-1"
+                  >
+                    {relatedSuggestions.map((rec) => (
+                      <button
+                        key={rec.id}
+                        type="button"
+                        onClick={() => onPlayTrack({ ...rec, autoQueued: false })}
+                        className="group w-[calc((100%-20px)/3)] min-w-[110px] sm:min-w-[168px] shrink-0 snap-start overflow-hidden rounded-xl border border-[#222530] bg-[#0D0E12] text-left hover:border-[#E11D48] transition-colors cursor-pointer"
+                      >
+                        <div className="relative aspect-video w-full overflow-hidden bg-[#14161E]">
+                          {rec.artworkUrl ? (
+                            <img
+                              src={rec.artworkUrl}
+                              alt={rec.title}
+                              referrerPolicy="no-referrer"
+                              className="h-full w-full object-cover transition-transform duration-200 group-hover:scale-105"
+                            />
+                          ) : (
+                            <div className="flex h-full w-full items-center justify-center">
+                              <Disc3 className="h-6 w-6 text-[#E11D48]" />
+                            </div>
+                          )}
+                          <div className="absolute inset-0 flex items-center justify-center bg-black/25 opacity-0 transition-opacity group-hover:opacity-100">
+                            <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[#E11D48] text-white shadow">
+                              <Play className="h-3.5 w-3.5 fill-current ml-0.5" />
+                            </span>
+                          </div>
+                          <span className="absolute bottom-1 right-1 rounded bg-black/85 px-1.5 py-0.5 font-mono-tabular text-[10px] font-semibold text-[#F4F3F0]">
+                            {formatDuration(rec.duration)}
+                          </span>
+                        </div>
+                        <div className="p-2">
+                          <p className="truncate text-xs font-semibold text-[#F4F3F0] group-hover:text-[#FF4D6D]">
+                            {rec.title}
+                          </p>
+                          <p className="mt-0.5 truncate text-[11px] text-[#8E929B]">
+                            {rec.artist}
+                          </p>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-xl border border-[#1F2129] bg-[#0D0E12] px-4 py-3 text-xs text-[#8E929B]">
+                    {loadingWatchRelated || isFetchingRadio
+                      ? 'Finding related videos for this track...'
+                      : 'No related video suggestions yet.'}
+                  </div>
+                )}
+              </div>
+
+              {/* Shorter Spectrum Visualizer directly below Next Video Suggestions */}
+              <SpectrumVisualizer isPlaying={isPlaying} dsp={dsp} height={52} />
             </div>
           )}
 
           {subTab === 'lyrics' && (
-            <div className="space-y-5">
-              {/* Calibration Bar */}
+            <div className="space-y-4">
+              {/* Sync Status & Calibration Header */}
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#1F2129] bg-[#0D0E12] px-4 py-3">
-                <span className="text-xs font-semibold text-[#C7C9D1]">
-                  Timing Offset Calibration
-                </span>
-                <div className="flex items-center gap-2">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Mic2 className="h-4 w-4 shrink-0 text-[#E11D48]" />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-semibold text-[#F4F3F0]">Synced Lyrics</span>
+                      {isFetchingLyrics && (
+                        <span className="inline-flex items-center gap-1 font-mono-tabular text-[11px] text-[#FF4D6D]">
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          <span>Fetching...</span>
+                        </span>
+                      )}
+                    </div>
+                    <p className="truncate font-mono-tabular text-[11px] text-[#8E929B]">
+                      Tap any lyric line to jump playback
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {onFetchTrackLyrics && (
+                    <button
+                      type="button"
+                      disabled={isFetchingLyrics}
+                      onClick={() => onFetchTrackLyrics(track)}
+                      aria-label="Refresh synced lyrics"
+                      className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[#2A2D39] bg-[#14161D] px-2.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] disabled:opacity-50 cursor-pointer"
+                    >
+                      <RefreshCw
+                        className={`h-3 w-3 text-[#E11D48] ${isFetchingLyrics ? 'animate-spin' : ''}`}
+                      />
+                      <span>Sync</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
                     aria-label="Decrease lyric timing offset"
@@ -218,7 +395,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                   >
                     <Minus className="h-3.5 w-3.5" />
                   </button>
-                  <span className="w-14 text-center font-mono-tabular text-xs font-bold text-[#FF4D6D]">
+                  <span className="w-12 text-center font-mono-tabular text-xs font-bold text-[#FF4D6D]">
                     {offsetSeconds >= 0 ? `+${offsetSeconds.toFixed(1)}s` : `${offsetSeconds.toFixed(1)}s`}
                   </span>
                   <button
@@ -237,28 +414,35 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                   <button
                     type="button"
                     onClick={() => onUpdateLyricsOffset(track.id, 0)}
-                    className="rounded-md border border-[#2A2D39] bg-[#14161D] px-2.5 py-1 font-mono-tabular text-xs text-[#8E929B] hover:text-white cursor-pointer"
+                    className="rounded-md border border-[#2A2D39] bg-[#14161D] px-2 py-1 font-mono-tabular text-xs text-[#8E929B] hover:text-white cursor-pointer"
                   >
                     0.0s
                   </button>
                 </div>
               </div>
 
-              {/* Scrollable Glowing Lyrics */}
+              {/* Spotify / Apple Music-Style Real-Time Synced Lyrics Stage */}
               {parsedLines.length > 0 ? (
-                <div className="space-y-3 py-6 text-center">
+                <div
+                  data-testid="fullscreen-synced-lyrics-stage"
+                  className="max-h-[46vh] overflow-y-auto rounded-2xl border border-[#1F2129] bg-[#0D0E12] px-3 py-8 sm:px-6 text-center space-y-2.5"
+                >
                   {parsedLines.map((line, idx) => {
                     const isActive = idx === activeIdx;
+                    const isPast = activeIdx >= 0 && idx < activeIdx;
                     return (
                       <button
                         key={`${line.time}-${idx}`}
                         ref={isActive ? activeLineRef : undefined}
                         type="button"
                         onClick={() => onSeek(line.time)}
-                        className={`block w-full rounded-lg px-4 py-2 transition-all cursor-pointer ${
+                        aria-current={isActive ? 'true' : undefined}
+                        className={`block w-full rounded-xl px-4 py-2.5 transition-all duration-300 cursor-pointer ${
                           isActive
-                            ? 'scale-[1.03] text-xl sm:text-2xl font-bold text-[#FF3B5C] drop-shadow-[0_0_14px_rgba(225,29,72,0.75)]'
-                            : 'text-base sm:text-lg text-[#737885] hover:text-[#D1D5DB]'
+                            ? 'scale-[1.02] border border-[#E11D48]/40 bg-[#E11D48]/15 text-xl sm:text-2xl font-extrabold text-[#FF4D6D] shadow-[0_0_16px_rgba(225,29,72,0.28)]'
+                            : isPast
+                            ? 'text-sm sm:text-base font-medium text-[#6B7280] opacity-70 hover:opacity-100'
+                            : 'text-base sm:text-lg font-semibold text-[#C7C9D1] hover:text-[#F4F3F0]'
                         }`}
                       >
                         {line.text}
@@ -267,10 +451,62 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                   })}
                 </div>
               ) : (
-                <div className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-10 text-center">
-                  <p className="text-sm text-[#8E929B]">
-                    No synced LRC lyrics saved for this track yet. Open the Sync Lyrics screen to import or author timestamps.
-                  </p>
+                <div className="rounded-2xl border border-[#1F2129] bg-[#0D0E12] p-6 sm:p-8 text-center space-y-4">
+                  {isFetchingLyrics ? (
+                    <div className="flex flex-col items-center gap-2.5 py-4">
+                      <Loader2 className="h-7 w-7 animate-spin text-[#E11D48]" />
+                      <p className="text-sm font-semibold text-[#F4F3F0]">
+                        Matching time-synced lyrics for &ldquo;{track.title}&rdquo;...
+                      </p>
+                    </div>
+                  ) : (
+                    <>
+                      <p className="text-sm text-[#8E929B]">
+                        No synced lyrics matched automatically yet. Search by song &amp; artist name or open the Sync Studio.
+                      </p>
+                      {onFetchTrackLyrics && (
+                        <form
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            onFetchTrackLyrics(track, lyricSearchQuery.trim() || undefined);
+                          }}
+                          className="mx-auto flex max-w-md flex-col sm:flex-row gap-2"
+                        >
+                          <div className="relative flex-1">
+                            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#8E929B]" />
+                            <input
+                              type="text"
+                              value={lyricSearchQuery}
+                              onChange={(e) => setLyricSearchQuery(e.target.value)}
+                              placeholder="Artist Song Title..."
+                              aria-label="Search synced lyrics query"
+                              className="w-full rounded-lg border border-[#262936] bg-[#07080B] py-2 pl-9 pr-3 text-xs text-[#F4F3F0] focus:border-[#E11D48] focus:outline-none"
+                            />
+                          </div>
+                          <button
+                            type="submit"
+                            className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-[#E11D48] px-4 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
+                          >
+                            <Search className="h-3.5 w-3.5" />
+                            <span>Find Lyrics</span>
+                          </button>
+                        </form>
+                      )}
+                      {onOpenLyricsStudio && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            onClose();
+                            onOpenLyricsStudio();
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-[#2A2D39] bg-[#14161D] px-3.5 py-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer"
+                        >
+                          <Mic2 className="h-3.5 w-3.5 text-[#E11D48]" />
+                          <span>Open Sync Lyrics Studio</span>
+                        </button>
+                      )}
+                    </>
+                  )}
                 </div>
               )}
             </div>

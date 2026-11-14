@@ -5,8 +5,10 @@ import {
   Edit3,
   Eye,
   FileText,
+  Loader2,
   Minus,
   Plus,
+  RefreshCw,
   RotateCcw,
   Save,
   Upload,
@@ -23,6 +25,8 @@ interface SyncLyricsViewProps {
   tracks: Track[];
   engine: AudioEngineSnapshot;
   lyricsMap: Record<string, StoredLyrics>;
+  isFetchingLyrics?: boolean;
+  onFetchTrackLyrics?: (track: Track, customQuery?: string) => void;
   onSaveLyrics: (entry: StoredLyrics) => Promise<void>;
   onSeek: (seconds: number) => void;
   onPlayTrack: (track: Track) => void;
@@ -33,6 +37,8 @@ export const SyncLyricsView: React.FC<SyncLyricsViewProps> = ({
   tracks,
   engine,
   lyricsMap,
+  isFetchingLyrics = false,
+  onFetchTrackLyrics,
   onSaveLyrics,
   onSeek,
   onPlayTrack,
@@ -189,6 +195,22 @@ export const SyncLyricsView: React.FC<SyncLyricsViewProps> = ({
                 </option>
               ))}
             </select>
+
+            {onFetchTrackLyrics && activeTrack && (
+              <button
+                type="button"
+                disabled={isFetchingLyrics}
+                onClick={() => onFetchTrackLyrics(activeTrack)}
+                className="inline-flex items-center gap-2 rounded-lg border border-[#282B36] bg-[#14161D] px-3.5 py-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] disabled:opacity-50 cursor-pointer"
+              >
+                {isFetchingLyrics ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-[#E11D48]" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5 text-[#E11D48]" />
+                )}
+                <span>Auto-Fetch Synced</span>
+              </button>
+            )}
 
             <button
               type="button"
@@ -355,19 +377,23 @@ export const SyncLyricsView: React.FC<SyncLyricsViewProps> = ({
           }`}
         >
           {parsedLines.length > 0 ? (
-            <div className="mx-auto max-w-2xl space-y-3 text-center max-h-[460px] overflow-y-auto py-8">
+            <div className="mx-auto max-w-2xl space-y-2.5 text-center max-h-[460px] overflow-y-auto py-8">
               {parsedLines.map((line, idx) => {
                 const isActive = idx === activeIdx;
+                const isPast = activeIdx >= 0 && idx < activeIdx;
                 return (
                   <button
                     key={`${line.time}-${idx}`}
                     ref={isActive ? activeLineRef : undefined}
                     type="button"
                     onClick={() => handleLineJump(line.time)}
-                    className={`block w-full rounded-lg px-4 py-2 transition-all cursor-pointer ${
+                    aria-current={isActive ? 'true' : undefined}
+                    className={`block w-full rounded-xl px-4 py-2.5 transition-all duration-300 cursor-pointer ${
                       isActive
-                        ? 'scale-[1.04] text-xl sm:text-2xl font-bold text-[#FF3B5C] drop-shadow-[0_0_16px_rgba(225,29,72,0.78)]'
-                        : 'text-base sm:text-lg text-[#737885] hover:text-[#E5E7EB]'
+                        ? 'scale-[1.03] border border-[#E11D48]/40 bg-[#E11D48]/15 text-xl sm:text-2xl font-extrabold text-[#FF3B5C] shadow-[0_0_16px_rgba(225,29,72,0.3)]'
+                        : isPast
+                        ? 'text-sm sm:text-base font-medium text-[#6B7280] opacity-70 hover:opacity-100'
+                        : 'text-base sm:text-lg font-semibold text-[#C7C9D1] hover:text-[#F4F3F0]'
                     }`}
                   >
                     <span className="mr-3 font-mono-tabular text-xs opacity-50">
@@ -380,13 +406,29 @@ export const SyncLyricsView: React.FC<SyncLyricsViewProps> = ({
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center py-16 text-center">
-              <FileText className="h-10 w-10 text-[#E11D48]" />
+              {isFetchingLyrics ? (
+                <Loader2 className="h-10 w-10 animate-spin text-[#E11D48]" />
+              ) : (
+                <FileText className="h-10 w-10 text-[#E11D48]" />
+              )}
               <h2 className="mt-3 font-display text-lg font-bold text-[#F4F3F0]">
-                Drop an .lrc File Here
+                {isFetchingLyrics
+                  ? 'Fetching Time-Synced Lyrics...'
+                  : 'Fetch or Drop an .lrc File Here'}
               </h2>
               <p className="mt-1 max-w-md text-xs text-[#8E929B]">
-                Drag and drop a synced lyric file, click Import LRC above, or switch to Edit Lyrics to timestamp lines live.
+                Click Auto-Fetch Synced above to match synced lyrics automatically, drag and drop an .lrc file, or switch to Edit Lyrics to timestamp lines live.
               </p>
+              {onFetchTrackLyrics && activeTrack && !isFetchingLyrics && (
+                <button
+                  type="button"
+                  onClick={() => onFetchTrackLyrics(activeTrack)}
+                  className="mt-4 inline-flex items-center gap-2 rounded-lg bg-[#E11D48] px-4 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  <span>Auto-Fetch Synced Lyrics</span>
+                </button>
+              )}
             </div>
           )}
         </section>

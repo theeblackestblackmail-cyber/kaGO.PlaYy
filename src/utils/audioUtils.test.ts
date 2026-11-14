@@ -8,19 +8,32 @@ import {
   repairMojibakeText,
 } from './audioMetadata';
 import {
+  buildCategorySearchPlan,
   buildRadioSeedQuery,
+  computeMasterOutputGain,
+  extractYouTubeArtists,
+  extractYouTubeCollections,
+  extractYouTubePlaylistTracks,
+  extractYouTubePodcasts,
   extractYouTubeRelatedResults,
   extractYouTubeSearchResults,
   isIndividualSong,
+  MAX_RECENT_SEARCHES,
   mergeAutoplayQueue,
   parseYouTubeArtistAndTitle,
   parseYouTubeDuration,
   parseYouTubeSuggestResponse,
   parseYouTubeViewCount,
+  pushRecentSearch,
   rankYouTubeSearchResults,
   shouldAutoResumeBackgroundPause,
   sortStudioQueue,
 } from './streamFilter';
+import {
+  convertPlainLyricsToLrc,
+  pickBestLrclibCandidate,
+  sanitizeTrackForLyrics,
+} from './lyricsFetcher';
 import type { StudioQueueItem, Track } from '../types/audio';
 
 test('sanitizeFilename cleans noisy YouTube rip filenames and separates artist and title', () => {
@@ -323,7 +336,7 @@ test('setup-android-native patches AndroidManifest, Gradle, and copies Java Medi
     assert.ok(manifest.includes('.KaGoMediaService'));
     assert.ok(manifest.includes('smallestScreenSize'));
 
-    const gradle = fs.readFileSync(path.join(tmpRoot, 'android', 'app', 'build.gradle'), 'utf8');
+    const gradle = fs.readFileSync(path.join(androidMain, '..', '..', 'build.gradle'), 'utf8');
     assert.equal(gradle.match(/androidx\.media:media:1\.7\.0/g)?.length, 1);
     assert.equal(gradle.match(/JavaVersion\.VERSION_17/g)?.length, 2);
 
@@ -547,4 +560,219 @@ test('shouldAutoResumeBackgroundPause keeps backgrounded playback alive while re
   );
 });
 
+test('rankYouTubeSearchResults ranks popular official songs #1 even with minor spelling typos', () => {
+  const candidates = [
+    {
+      videoId: 'lowview9999',
+      title: 'We Wega (Fan Upload)',
+      artist: 'Random Channel',
+      durationSeconds: 210,
+      thumbnailUrl: 'https://i.ytimg.com/vi/lowview9999/hqdefault.jpg',
+      viewCount: 850,
+      isOfficial: false,
+      channelName: 'Random Channel',
+    },
+    {
+      videoId: 'popularhit1',
+      title: 'We Wega',
+      artist: 'Wangechi, Scar Mkadinali',
+      durationSeconds: 218,
+      thumbnailUrl: 'https://i.ytimg.com/vi/popularhit1/hqdefault.jpg',
+      viewCount: 3_400_000,
+      isOfficial: true,
+      channelName: 'Wangechi - Topic',
+    },
+    {
+      videoId: 'coverhit002',
+      title: 'We Wega Acoustic Cover',
+      artist: 'Local Singer',
+      durationSeconds: 205,
+      thumbnailUrl: 'https://i.ytimg.com/vi/coverhit002/hqdefault.jpg',
+      viewCount: 15_000,
+      isOfficial: false,
+      channelName: 'Local Singer',
+    },
+  ];
 
+  // Typo "wangeci" (missing 'h') still boosts official 3.4M hit to #1
+  const ranked = rankYouTubeSearchResults(candidates, 'we wega wangeci', 'songs');
+  assert.equal(ranked[0].videoId, 'popularhit1');
+  assert.equal(ranked[ranked.length - 1].videoId, 'coverhit002');
+});
+
+test('buildCategorySearchPlan builds appropriate search queries and YouTube filters for all 8 categories', () => {
+  assert.equal(buildCategorySearchPlan('Drake', '', 'all').sp, undefined);
+  assert.equal(buildCategorySearchPlan('Drake', '', 'songs').sp, 'EgIQAQ%3D%3D');
+  assert.ok(buildCategorySearchPlan('Drake', '', 'videos').searchQuery.includes('official music video'));
+  assert.ok(buildCategorySearchPlan('Drake', '', 'albums').searchQuery.includes('full album'));
+  assert.equal(buildCategorySearchPlan('Drake', '', 'artists').sp, 'EgIQAg%3D%3D');
+  assert.equal(buildCategorySearchPlan('Drake', '', 'playlists').sp, 'EgIQAw%3D%3D');
+  assert.equal(buildCategorySearchPlan('Drake', '', 'featured_playlists').sp, 'EgIQAw%3D%3D');
+  assert.ok(buildCategorySearchPlan('Drake', '', 'podcasts').searchQuery.includes('podcast full episode'));
+});
+
+test('extractYouTubeArtists, extractYouTubeCollections, extractYouTubePodcasts, and extractYouTubePlaylistTracks parse YouTube initialData payloads', () => {
+  const searchPayload = {
+    contents: {
+      twoColumnSearchResultsRenderer: {
+        primaryContents: {
+          sectionListRenderer: {
+            contents: [
+              {
+                itemSectionRenderer: {
+                  contents: [
+                    {
+                      channelRenderer: {
+                        channelId: 'UCartist01',
+                        title: { simpleText: 'Wangechi - Topic' },
+                        thumbnail: { thumbnails: [{ url: '//yt3.ggpht.com/avatar=s176' }] },
+                        subscriberCountText: { simpleText: '240K subscribers' },
+                        ownerBadges: [{ metadataBadgeRenderer: { style: 'BADGE_STYLE_TYPE_VERIFIED_ARTIST' } }],
+                      },
+                    },
+                    {
+                      playlistRenderer: {
+                        playlistId: 'PLalbum001',
+                        title: { simpleText: 'Chonjo EP' },
+                        shortBylineText: { runs: [{ text: 'Wangechi' }] },
+                        videoCount: '6',
+                        thumbnails: [{ thumbnails: [{ url: 'https://i.ytimg.com/vi/abc/hqdefault.jpg' }] }],
+                      },
+                    },
+                    {
+                      videoRenderer: {
+                        videoId: 'pod12345678',
+                        title: { runs: [{ text: 'Behind The Music Podcast Episode 12' }] },
+                        ownerText: { runs: [{ text: 'Studio Talk' }] },
+                        lengthText: { simpleText: '42:10' },
+                        viewCountText: { simpleText: '120K views' },
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+  };
+  const searchHtml = `<html><script>var ytInitialData = ${JSON.stringify(searchPayload)};</script></html>`;
+
+  const artists = extractYouTubeArtists(searchHtml);
+  assert.equal(artists.length, 1);
+  assert.equal(artists[0].name, 'Wangechi');
+  assert.equal(artists[0].thumbnailUrl, 'https://yt3.ggpht.com/avatar=s176');
+  assert.equal(artists[0].isOfficial, true);
+
+  const albums = extractYouTubeCollections(searchHtml, 'albums', 'Hip-Hop');
+  assert.equal(albums.length, 1);
+  assert.equal(albums[0].youtubePlaylistId, 'PLalbum001');
+  assert.equal(albums[0].trackCount, 6);
+  assert.equal(albums[0].resultType, 'album');
+
+  const podcasts = extractYouTubePodcasts(searchHtml, 'Talk');
+  assert.equal(podcasts.length, 1);
+  assert.equal(podcasts[0].youtubeId, 'pod12345678');
+  assert.equal(podcasts[0].resultType, 'podcast');
+
+  const playlistHtml = `<html><script>var ytInitialData = ${JSON.stringify({
+    contents: {
+      twoColumnBrowseResultsRenderer: {
+        tabs: [
+          {
+            tabRenderer: {
+              content: {
+                sectionListRenderer: {
+                  contents: [
+                    {
+                      itemSectionRenderer: {
+                        contents: [
+                          {
+                            playlistVideoListRenderer: {
+                              contents: [
+                                {
+                                  playlistVideoRenderer: {
+                                    videoId: 'trk11111111',
+                                    title: { runs: [{ text: 'Wangechi - We Wega' }] },
+                                    shortBylineText: { runs: [{ text: 'Wangechi' }] },
+                                    lengthText: { simpleText: '3:38' },
+                                  },
+                                },
+                              ],
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      },
+    },
+  })};</script></html>`;
+
+  const playlistTracks = extractYouTubePlaylistTracks(playlistHtml, 'Chonjo EP');
+  assert.equal(playlistTracks.length, 1);
+  assert.equal(playlistTracks[0].youtubeId, 'trk11111111');
+  assert.equal(playlistTracks[0].artist, 'Wangechi');
+  assert.equal(playlistTracks[0].title, 'We Wega');
+  assert.equal(playlistTracks[0].album, 'Chonjo EP');
+});
+
+test('pushRecentSearch deduplicates case-insensitively and limits history to 5 most recent items', () => {
+  let list: string[] = [];
+  for (const term of ['One', 'Two', 'Three', 'Four', 'Five', 'Six', 'two']) {
+    list = pushRecentSearch(list, term);
+  }
+  assert.equal(list.length, MAX_RECENT_SEARCHES);
+  assert.equal(MAX_RECENT_SEARCHES, 5);
+  assert.deepEqual(list, ['two', 'Six', 'Five', 'Four', 'Three']);
+});
+
+test('computeMasterOutputGain unlocks full clean speaker headroom without compressing flat tracks', () => {
+  const flatGain = computeMasterOutputGain({
+    bands: [0, 0, 0, 0, 0],
+    bassBoostEnabled: false,
+    bassBoostDb: 0,
+  });
+  const boostedGain = computeMasterOutputGain({
+    bands: [6, 4, 0, 3, 5],
+    bassBoostEnabled: true,
+    bassBoostDb: 10,
+  });
+
+  assert.ok(flatGain >= 1.3, `Expected flatGain >= 1.3, got ${flatGain}`);
+  assert.ok(boostedGain >= 1.0 && boostedGain < flatGain);
+});
+
+test('sanitizeTrackForLyrics, pickBestLrclibCandidate, and convertPlainLyricsToLrc prepare synced lyrics accurately', () => {
+  const cleaned = sanitizeTrackForLyrics(
+    'Hotline Bling (Official Music Video) [HD]',
+    'Drake - Topic'
+  );
+  assert.equal(cleaned.artistName, 'Drake');
+  assert.equal(cleaned.trackName, 'Hotline Bling');
+
+  const best = pickBestLrclibCandidate(
+    [
+      { id: 1, trackName: 'Test', plainLyrics: 'Line 1\nLine 2\nLine 3\nLine 4', duration: 200 },
+      {
+        id: 2,
+        trackName: 'Test',
+        syncedLyrics: '[00:10.00] Line 1\n[00:20.00] Line 2\n[00:30.00] Line 3',
+        duration: 198,
+      },
+    ],
+    200
+  );
+  assert.equal(best?.id, 2);
+
+  const lrc = convertPlainLyricsToLrc('First verse\nSecond verse\nChorus line', 120);
+  const parsed = parseLrc(lrc);
+  assert.equal(parsed.length, 3);
+  assert.ok(parsed[0].time < parsed[1].time && parsed[1].time < parsed[2].time);
+});

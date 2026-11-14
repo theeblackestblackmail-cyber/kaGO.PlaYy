@@ -43,6 +43,25 @@ export interface SynthProfile {
   description: string;
 }
 
+export type StreamSearchCategory =
+  | 'all'
+  | 'songs'
+  | 'videos'
+  | 'albums'
+  | 'artists'
+  | 'playlists'
+  | 'featured_playlists'
+  | 'podcasts';
+
+export interface StreamArtistResult {
+  id: string;
+  name: string;
+  thumbnailUrl?: string;
+  subscriberText?: string;
+  isOfficial?: boolean;
+  channelId?: string;
+}
+
 export interface Track {
   id: string;
   title: string;
@@ -53,6 +72,9 @@ export interface Track {
   artworkUrl?: string;
   streamUrl?: string;
   youtubeId?: string;
+  youtubePlaylistId?: string;
+  trackCount?: number;
+  resultType?: 'song' | 'video' | 'album' | 'playlist' | 'podcast';
   streamProvider?: 'youtube' | 'audius' | 'synth';
   folderPath?: string;
   trackNumber?: number;

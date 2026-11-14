@@ -21,6 +21,7 @@ import {
   extractYouTubeSearchResults,
   isIndividualSong,
   parseYouTubeSuggestResponse,
+  pushRecentSearch,
   rankYouTubeSearchResults,
   toYouTubeTracks,
 } from '../utils/streamFilter';
@@ -142,9 +143,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
     setShowSuggestions(false);
     if (!cleanQ) return;
 
-    setRecentSearches((prev) =>
-      [cleanQ, ...prev.filter((item) => item.toLowerCase() !== cleanQ.toLowerCase())].slice(0, 8)
-    );
+    setRecentSearches((prev) => pushRecentSearch(prev, cleanQ));
 
     setIsSearching(true);
     setHasSearchedOnline(true);

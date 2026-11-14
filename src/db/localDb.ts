@@ -252,7 +252,7 @@ export const localDb = {
   loadRecentSearches(): string[] {
     try {
       const raw = localStorage.getItem('kagoplay_recent_searches');
-      return raw ? (JSON.parse(raw) as string[]) : [];
+      return raw ? (JSON.parse(raw) as string[]).slice(0, 5) : [];
     } catch {
       return [];
     }
@@ -260,7 +260,7 @@ export const localDb = {
 
   saveRecentSearches(items: string[]): void {
     try {
-      localStorage.setItem('kagoplay_recent_searches', JSON.stringify(items));
+      localStorage.setItem('kagoplay_recent_searches', JSON.stringify(items.slice(0, 5)));
     } catch {
       // Ignore
     }

@@ -369,7 +369,8 @@ public class MainActivity extends BridgeActivity {
         return urlString.startsWith("https://www.youtube.com/")
             || urlString.startsWith("https://m.youtube.com/")
             || urlString.startsWith("https://suggestqueries.google.com/")
-            || urlString.startsWith("https://api.audius.co/");
+            || urlString.startsWith("https://api.audius.co/")
+            || urlString.startsWith("https://lrclib.net/");
     }
 
     private void enterPipInternal() {

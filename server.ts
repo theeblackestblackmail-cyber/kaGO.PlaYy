@@ -5,7 +5,12 @@ import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import {
+  buildCategorySearchPlan,
   buildRadioSeedQuery,
+  extractYouTubeArtists,
+  extractYouTubeCollections,
+  extractYouTubePlaylistTracks,
+  extractYouTubePodcasts,
   extractYouTubeRelatedResults,
   extractYouTubeSearchResults,
   isIndividualSong,
@@ -14,7 +19,15 @@ import {
   sortStudioQueue,
   toYouTubeTracks,
 } from './src/utils/streamFilter';
+import {
+  convertPlainLyricsToLrc,
+  pickBestLrclibCandidate,
+  sanitizeTrackForLyrics,
+  type LrclibCandidate,
+} from './src/utils/lyricsFetcher';
 import type {
+  StreamArtistResult,
+  StreamSearchCategory,
   StudioChatMessage,
   StudioPlaybackState,
   StudioQueueItem,
@@ -129,19 +142,21 @@ interface AudiusTrack {
   artwork?: { '480x480'?: string; '150x150'?: string };
 }
 
-async function searchYouTubeTracks(
-  term: string,
-  genre?: string,
+async function searchYouTubeCategory(
+  rawQuery: string,
+  genre = '',
+  category: StreamSearchCategory = 'all',
   excludeYoutubeId?: string
-): Promise<Track[]> {
+): Promise<{ tracks: Track[]; artists: StreamArtistResult[] }> {
   try {
-    const cleanTerm = term.trim() || 'top music hits';
+    const plan = buildCategorySearchPlan(rawQuery, genre, category);
+    const spParam = plan.sp ? `&sp=${plan.sp}` : '';
     const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(
-      cleanTerm
-    )}&sp=EgIQAQ%3D%3D`;
+      plan.searchQuery
+    )}${spParam}`;
 
     const response = await fetch(url, {
-      signal: AbortSignal.timeout(6500),
+      signal: AbortSignal.timeout(7000),
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -149,16 +164,44 @@ async function searchYouTubeTracks(
         Cookie: 'SOCS=CAI',
       },
     });
-    if (!response.ok) return [];
+    if (!response.ok) return { tracks: [], artists: [] };
     const html = await response.text();
+
+    const artists = extractYouTubeArtists(html);
+
+    if (category === 'albums' || category === 'playlists' || category === 'featured_playlists') {
+      const collections = extractYouTubeCollections(html, category, genre);
+      return { tracks: collections, artists };
+    }
+
+    if (category === 'podcasts') {
+      const podcasts = extractYouTubePodcasts(html, genre);
+      return { tracks: podcasts, artists };
+    }
+
     const extracted = extractYouTubeSearchResults(html).filter(
       (item) => !excludeYoutubeId || item.videoId !== excludeYoutubeId
     );
-    const ranked = rankYouTubeSearchResults(extracted, cleanTerm).slice(0, 12);
-    return toYouTubeTracks(ranked, genre);
+    const rankingQuery = rawQuery.trim() || plan.searchQuery;
+    const ranked = rankYouTubeSearchResults(extracted, rankingQuery, category).slice(0, 15);
+    const tracks = toYouTubeTracks(ranked, genre).map((t) => ({
+      ...t,
+      resultType: category === 'videos' ? ('video' as const) : ('song' as const),
+    }));
+
+    return { tracks, artists };
   } catch {
-    return [];
+    return { tracks: [], artists: [] };
   }
+}
+
+async function searchYouTubeTracks(
+  term: string,
+  genre?: string,
+  excludeYoutubeId?: string
+): Promise<Track[]> {
+  const { tracks } = await searchYouTubeCategory(term, genre || '', 'all', excludeYoutubeId);
+  return tracks;
 }
 
 async function fetchYouTubeWatchRelated(youtubeId: string, genre?: string): Promise<Track[]> {
@@ -277,15 +320,125 @@ async function startServer() {
     }
   });
 
+  app.get('/api/lyrics', async (req, res) => {
+    const rawTitle = String(req.query.title || '').trim();
+    const rawArtist = String(req.query.artist || '').trim();
+    const duration = Number(req.query.duration || 0) || 180;
+    const rawQuery = String(req.query.q || '').trim();
+    const { trackName, artistName, searchQuery } = sanitizeTrackForLyrics(rawTitle, rawArtist);
+    const query = (rawQuery || searchQuery || rawTitle).trim();
+
+    if (!query) {
+      return res.json({ found: false });
+    }
+
+    const headers = {
+      'User-Agent': 'kaGO.PIaY/1.0 (https://github.com/kagoplay)',
+      Accept: 'application/json',
+    };
+
+    try {
+      if (!rawQuery && artistName && trackName) {
+        const getParams = new URLSearchParams({
+          artist_name: artistName,
+          track_name: trackName,
+        });
+        if (duration > 0) getParams.set('duration', String(Math.round(duration)));
+
+        const exactRes = await fetch(`https://lrclib.net/api/get?${getParams.toString()}`, {
+          signal: AbortSignal.timeout(5000),
+          headers,
+        });
+        if (exactRes.ok) {
+          const item = (await exactRes.json()) as LrclibCandidate;
+          if (item.syncedLyrics?.trim()) {
+            return res.json({
+              found: true,
+              rawLrc: item.syncedLyrics.trim(),
+              synced: true,
+              estimated: false,
+              sourceLabel: 'LRCLIB Synced',
+            });
+          }
+          if (item.plainLyrics?.trim()) {
+            const estimatedLrc = convertPlainLyricsToLrc(item.plainLyrics, duration);
+            if (estimatedLrc) {
+              return res.json({
+                found: true,
+                rawLrc: estimatedLrc,
+                synced: false,
+                estimated: true,
+                sourceLabel: 'Estimated Timing',
+              });
+            }
+          }
+        }
+      }
+
+      const searchRes = await fetch(
+        `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`,
+        {
+          signal: AbortSignal.timeout(5500),
+          headers,
+        }
+      );
+      if (searchRes.ok) {
+        const candidates = (await searchRes.json()) as LrclibCandidate[];
+        const best = pickBestLrclibCandidate(candidates, duration);
+        if (best?.syncedLyrics?.trim()) {
+          return res.json({
+            found: true,
+            rawLrc: best.syncedLyrics.trim(),
+            synced: true,
+            estimated: false,
+            sourceLabel: 'LRCLIB Synced',
+          });
+        }
+        if (best?.plainLyrics?.trim()) {
+          const estimatedLrc = convertPlainLyricsToLrc(best.plainLyrics, duration);
+          if (estimatedLrc) {
+            return res.json({
+              found: true,
+              rawLrc: estimatedLrc,
+              synced: false,
+              estimated: true,
+              sourceLabel: 'Estimated Timing',
+            });
+          }
+        }
+      }
+    } catch {
+      // Upstream timeout or unreachable
+    }
+
+    return res.json({ found: false });
+  });
+
   app.get('/api/stream/search', async (req, res) => {
     const query = String(req.query.q || '').trim();
     const genre = String(req.query.genre || '').trim();
-    const baseTerm =
-      [query, genre ? `${genre} music` : ''].filter(Boolean).join(' ') || 'top music hits';
+    const rawCat = String(req.query.category || 'all').trim() as StreamSearchCategory;
+    const allowedCats: StreamSearchCategory[] = [
+      'all',
+      'songs',
+      'videos',
+      'albums',
+      'artists',
+      'playlists',
+      'featured_playlists',
+      'podcasts',
+    ];
+    const category: StreamSearchCategory = allowedCats.includes(rawCat) ? rawCat : 'all';
 
-    const ytResults = await searchYouTubeTracks(baseTerm, genre);
-    if (ytResults.length > 0) {
-      return res.json({ results: ytResults, source: 'live', provider: 'youtube' });
+    const { tracks: ytResults, artists } = await searchYouTubeCategory(query, genre, category);
+    if (ytResults.length > 0 || artists.length > 0) {
+      return res.json({
+        results: ytResults,
+        artists,
+        category,
+        source: 'live',
+        provider: 'youtube',
+      });
     }
 
     const audiusResults = await searchAudiusTracks(
@@ -293,10 +446,41 @@ async function startServer() {
       genre
     );
     if (audiusResults.length > 0) {
-      return res.json({ results: audiusResults, source: 'live', provider: 'audius' });
+      return res.json({
+        results: audiusResults,
+        artists: [],
+        category,
+        source: 'live',
+        provider: 'audius',
+      });
     }
 
-    return res.json({ results: [], source: 'fallback' });
+    return res.json({ results: [], artists: [], category, source: 'fallback' });
+  });
+
+  app.get('/api/stream/playlist', async (req, res) => {
+    const listId = String(req.query.list || '').trim();
+    const title = String(req.query.title || 'Album').trim();
+    if (!listId || !/^[a-zA-Z0-9_-]{8,}$/.test(listId)) {
+      return res.json({ tracks: [] });
+    }
+    try {
+      const url = `https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}`;
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(7000),
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Cookie: 'SOCS=CAI',
+        },
+      });
+      if (!response.ok) return res.json({ tracks: [] });
+      const html = await response.text();
+      return res.json({ tracks: extractYouTubePlaylistTracks(html, title) });
+    } catch {
+      return res.json({ tracks: [] });
+    }
   });
 
   app.get('/api/stream/related', async (req, res) => {

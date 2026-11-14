@@ -12,9 +12,11 @@ interface SpectrumVisualizerProps {
 export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
   isPlaying,
   dsp,
-  height = 148,
+  height,
   compact = false,
 }) => {
+  const resolvedHeight = typeof height === 'number' ? height : compact ? 104 : 148;
+  const isMini = resolvedHeight <= 68;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const peaksRef = useRef<number[]>(new Array(44).fill(0));
   const barsRef = useRef<number[]>(new Array(44).fill(0));
@@ -33,7 +35,7 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const rect = canvas.getBoundingClientRect();
       const width = Math.max(240, Math.floor(rect.width));
-      const h = height;
+      const h = resolvedHeight;
 
       if (canvas.width !== width * dpr || canvas.height !== h * dpr) {
         canvas.width = width * dpr;
@@ -109,7 +111,7 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
           peaksRef.current[i] = Math.max(0.035, peaksRef.current[i] - 0.0085);
         }
 
-        const barH = Math.max(3, barsRef.current[i] * (h - 14));
+        const barH = Math.max(2, barsRef.current[i] * Math.max(16, h - 10));
         const x = i * (barW + gap);
         const y = h - barH;
 
@@ -122,7 +124,7 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
         ctx.fillRect(x, y, barW, barH);
 
         // Falling peak cap
-        const peakY = Math.max(2, h - peaksRef.current[i] * (h - 14) - 3);
+        const peakY = Math.max(1, h - peaksRef.current[i] * Math.max(16, h - 10) - 3);
         ctx.fillStyle = isPlaying ? accentSoft : isLightMode ? '#94A3B8' : '#3E4251';
         ctx.fillRect(x, peakY, barW, 2);
       }
@@ -141,11 +143,19 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
     };
-  }, [isPlaying, height, dsp]);
+  }, [isPlaying, resolvedHeight, dsp]);
 
   return (
-    <div className="rounded-lg border border-[#1B1D26] bg-[#050508] p-3.5">
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-[#8E929B]">
+    <div
+      className={`rounded-lg border border-[#1B1D26] bg-[#050508] ${
+        isMini ? 'px-3 py-2' : 'p-3.5'
+      }`}
+    >
+      <div
+        className={`flex flex-wrap items-center justify-between gap-2 text-[11px] sm:text-xs text-[#8E929B] ${
+          isMini ? 'mb-1.5' : 'mb-2'
+        }`}
+      >
         <span className="font-mono-tabular">20 Hz – 20 kHz Spectrum</span>
         <div className="flex items-center gap-3 font-mono-tabular">
           <span>EQ: {dsp.preset}</span>
@@ -159,7 +169,7 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
         ref={canvasRef}
         data-testid="spectrum-canvas"
         className="w-full block"
-        style={{ height: `${compact ? 104 : height}px` }}
+        style={{ height: `${resolvedHeight}px` }}
       />
     </div>
   );
