@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { sanitizeFilename } from './filenameSanitizer';
 import { parseLrc, formatLrcTimestamp, findActiveLyricIndex, formatDuration } from './lrcParser';
-import { parseId3v2Buffer } from './audioMetadata';
+import {
+  parseId3v2Buffer,
+  repairCorruptedTrack,
+  repairMojibakeText,
+} from './audioMetadata';
 import {
   buildRadioSeedQuery,
   extractYouTubeRelatedResults,
@@ -11,6 +15,9 @@ import {
   mergeAutoplayQueue,
   parseYouTubeArtistAndTitle,
   parseYouTubeDuration,
+  parseYouTubeSuggestResponse,
+  parseYouTubeViewCount,
+  rankYouTubeSearchResults,
   sortStudioQueue,
 } from './streamFilter';
 import type { StudioQueueItem, Track } from '../types/audio';
@@ -68,10 +75,15 @@ test('isIndividualSong strictly rejects 30s previews, mixes, playlists, and >15m
   assert.equal(isIndividualSong('Deep Focus Playlist', 'Study', 300), false);
 });
 
-test('parseYouTubeDuration and parseYouTubeArtistAndTitle parse full-length metadata cleanly', () => {
+test('parseYouTubeDuration, parseYouTubeViewCount, and parseYouTubeArtistAndTitle parse cleanly', () => {
   assert.equal(parseYouTubeDuration('2:54'), 174);
   assert.equal(parseYouTubeDuration('1:02:05'), 3725);
   assert.equal(parseYouTubeDuration('LIVE'), 0);
+
+  assert.equal(parseYouTubeViewCount('2.1B views'), 2_100_000_000);
+  assert.equal(parseYouTubeViewCount('45M views'), 45_000_000);
+  assert.equal(parseYouTubeViewCount('890K views'), 890_000);
+  assert.equal(parseYouTubeViewCount('12,345 views'), 12_345);
 
   const parsed = parseYouTubeArtistAndTitle(
     'Burna Boy - Last Last [Official Audio]',
@@ -81,7 +93,7 @@ test('parseYouTubeDuration and parseYouTubeArtistAndTitle parse full-length meta
   assert.equal(parsed.title, 'Last Last');
 });
 
-test('extractYouTubeSearchResults extracts full-length songs and skips shorts and mixes', () => {
+test('extractYouTubeSearchResults & rankYouTubeSearchResults rank official high-view hits above covers', () => {
   const sampleYtData = {
     contents: {
       twoColumnSearchResultsRenderer: {
@@ -93,10 +105,21 @@ test('extractYouTubeSearchResults extracts full-length songs and skips shorts an
                   contents: [
                     {
                       videoRenderer: {
-                        videoId: 'abc12345678',
-                        title: { runs: [{ text: 'Kavinsky - Nightcall [Official Audio]' }] },
-                        ownerText: { runs: [{ text: 'Kavinsky - Topic' }] },
-                        lengthText: { simpleText: '4:18' },
+                        videoId: 'cover000001',
+                        title: { runs: [{ text: 'OceanSkies - Hotline Bling (Drake Cover)' }] },
+                        ownerText: { runs: [{ text: 'OceanSkies Avenue' }] },
+                        lengthText: { simpleText: '2:53' },
+                        viewCountText: { simpleText: '1,200 views' },
+                      },
+                    },
+                    {
+                      videoRenderer: {
+                        videoId: 'uxpDa-c-4Mc',
+                        title: { runs: [{ text: 'Drake - Hotline Bling' }] },
+                        ownerText: { runs: [{ text: 'Drake' }] },
+                        ownerBadges: [{ metadataBadgeRenderer: { style: 'BADGE_STYLE_TYPE_VERIFIED_ARTIST' } }],
+                        lengthText: { simpleText: '4:55' },
+                        viewCountText: { simpleText: '2.1B views' },
                       },
                     },
                     {
@@ -110,7 +133,7 @@ test('extractYouTubeSearchResults extracts full-length songs and skips shorts an
                     {
                       videoRenderer: {
                         videoId: 'mix00000002',
-                        title: { runs: [{ text: 'Synthwave 1 Hour Mix' }] },
+                        title: { runs: [{ text: 'Drake 1 Hour Mix' }] },
                         ownerText: { runs: [{ text: 'DJ' }] },
                         lengthText: { simpleText: '58:00' },
                       },
@@ -126,11 +149,22 @@ test('extractYouTubeSearchResults extracts full-length songs and skips shorts an
   };
   const html = `<html><script>var ytInitialData = ${JSON.stringify(sampleYtData)};</script></html>`;
   const extracted = extractYouTubeSearchResults(html);
-  assert.equal(extracted.length, 1);
-  assert.equal(extracted[0].videoId, 'abc12345678');
-  assert.equal(extracted[0].artist, 'Kavinsky');
-  assert.equal(extracted[0].title, 'Nightcall');
-  assert.equal(extracted[0].durationSeconds, 258);
+  assert.equal(extracted.length, 2);
+
+  const ranked = rankYouTubeSearchResults(extracted, 'Drake hotline bling');
+  assert.equal(ranked[0].videoId, 'uxpDa-c-4Mc');
+  assert.equal(ranked[0].isOfficial, true);
+  assert.equal(ranked[0].viewCount, 2_100_000_000);
+});
+
+test('parseYouTubeSuggestResponse parses autocomplete arrays cleanly', () => {
+  const payload = JSON.stringify(['drake', ['drake hotline bling', 'drake gods plan', 'drake passionfruit']]);
+  assert.deepEqual(parseYouTubeSuggestResponse(payload), [
+    'drake hotline bling',
+    'drake gods plan',
+    'drake passionfruit',
+  ]);
+  assert.deepEqual(parseYouTubeSuggestResponse('not-json'), []);
 });
 
 test('sortStudioQueue orders by upvotes descending then timestamp ascending', () => {
@@ -152,32 +186,56 @@ test('sortStudioQueue orders by upvotes descending then timestamp ascending', ()
   assert.deepEqual(sorted.map((s) => s.id), ['q3', 'q2', 'q1']);
 });
 
-test('parseId3v2Buffer extracts TIT2, TPE1, TALB, TRCK from ID3v2.3 header', () => {
-  function makeFrame(id: string, text: string): number[] {
-    const textBytes = Array.from(new TextEncoder().encode(text));
-    const size = 1 + textBytes.length;
+test('parseId3v2Buffer extracts UTF-8, UTF-16BE BOM, UTF-16LE BOM, BOM-less UTF-16BE, and v2.4 Data Length Indicator frames', () => {
+  function utf16BeBytes(str: string): number[] {
+    const out: number[] = [];
+    for (let i = 0; i < str.length; i++) {
+      const code = str.charCodeAt(i);
+      out.push((code >> 8) & 0xff, code & 0xff);
+    }
+    return out;
+  }
+  function utf16LeBytes(str: string): number[] {
+    const out: number[] = [];
+    for (let i = 0; i < str.length; i++) {
+      const code = str.charCodeAt(i);
+      out.push(code & 0xff, (code >> 8) & 0xff);
+    }
+    return out;
+  }
+  function makeV4Frame(id: string, payload: number[], flag2 = 0): number[] {
+    const size = payload.length;
     return [
       ...Array.from(new TextEncoder().encode(id)),
-      (size >>> 24) & 0xff,
-      (size >>> 16) & 0xff,
-      (size >>> 8) & 0xff,
-      size & 0xff,
+      (size >>> 21) & 0x7f,
+      (size >>> 14) & 0x7f,
+      (size >>> 7) & 0x7f,
+      size & 0x7f,
       0,
-      0,
-      3, // UTF-8
-      ...textBytes,
+      flag2,
+      ...payload,
     ];
   }
+
+  // TIT2: UTF-16BE with FE FF BOM + ID3v2.4 Data Length Indicator (0x01, 4 extra bytes)
+  const tit2Payload = [0, 0, 0, 12, 1, 0xfe, 0xff, ...utf16BeBytes('See You Again')];
+  // TPE1: UTF-16LE with FF FE BOM
+  const tpe1Payload = [1, 0xff, 0xfe, ...utf16LeBytes('Wiz Khalifa')];
+  // TALB: BOM-less UTF-16BE tagged as encoding 1 (broken tagger quirk)
+  const talbPayload = [1, ...utf16BeBytes('Furious 7')];
+  // TRCK: UTF-8
+  const trckPayload = [3, ...Array.from(new TextEncoder().encode('03/12'))];
+
   const frames = [
-    ...makeFrame('TIT2', 'Neon Horizon'),
-    ...makeFrame('TPE1', 'Analog Ghost'),
-    ...makeFrame('TALB', 'Direct Drive'),
-    ...makeFrame('TRCK', '03/12'),
+    ...makeV4Frame('TIT2', tit2Payload, 0x01),
+    ...makeV4Frame('TPE1', tpe1Payload),
+    ...makeV4Frame('TALB', talbPayload),
+    ...makeV4Frame('TRCK', trckPayload),
   ];
   const tagSize = frames.length;
   const header = [
     0x49, 0x44, 0x33, // ID3
-    3, 0, // v2.3
+    4, 0, // v2.4
     0,
     (tagSize >>> 21) & 0x7f,
     (tagSize >>> 14) & 0x7f,
@@ -186,10 +244,30 @@ test('parseId3v2Buffer extracts TIT2, TPE1, TALB, TRCK from ID3v2.3 header', () 
   ];
   const buf = new Uint8Array([...header, ...frames]).buffer;
   const parsed = parseId3v2Buffer(buf);
-  assert.equal(parsed.title, 'Neon Horizon');
-  assert.equal(parsed.artist, 'Analog Ghost');
-  assert.equal(parsed.album, 'Direct Drive');
+  assert.equal(parsed.title, 'See You Again');
+  assert.equal(parsed.artist, 'Wiz Khalifa');
+  assert.equal(parsed.album, 'Furious 7');
   assert.equal(parsed.trackNumber, 3);
+});
+
+test('repairMojibakeText and repairCorruptedTrack heal swapped UTF-16 CJK mojibake and fallback cleanly', async () => {
+  assert.equal(repairMojibakeText('匀攀攀'), 'See');
+
+  const brokenTrack: Track = {
+    id: 'local-Drake_-_Hotline_Bling_mp3-123456-7890',
+    title: '\uFFFD\uFFFE胯斁揌楸',
+    artist: '\uFFFD一仭吀',
+    album: '\uFFFD蓨玪洉',
+    duration: 180,
+    source: 'local',
+    folderPath: 'Picked Songs',
+    addedAt: 1,
+  };
+
+  const repaired = await repairCorruptedTrack(brokenTrack);
+  assert.ok(repaired);
+  assert.equal(repaired.artist, 'Drake');
+  assert.equal(repaired.title, 'Hotline Bling');
 });
 
 test('setup-android-native patches AndroidManifest, Gradle, and copies Java Media/PiP classes idempotently', async () => {
@@ -235,6 +313,7 @@ test('setup-android-native patches AndroidManifest, Gradle, and copies Java Medi
     applyAndroidNativeOverrides(tmpRoot); // verify idempotency
 
     const manifest = fs.readFileSync(path.join(androidMain, 'AndroidManifest.xml'), 'utf8');
+    assert.ok(manifest.includes('android:hardwareAccelerated="true"'));
     assert.ok(manifest.includes('FOREGROUND_SERVICE_MEDIA_PLAYBACK'));
     assert.ok(manifest.includes('POST_NOTIFICATIONS'));
     assert.ok(manifest.includes('android:supportsPictureInPicture="true"'));

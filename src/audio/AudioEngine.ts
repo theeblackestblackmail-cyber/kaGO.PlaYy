@@ -1,6 +1,8 @@
 import { DEFAULT_DSP_SETTINGS, EQ_FREQUENCIES } from '../data/presetsAndStems';
 import { localDb } from '../db/localDb';
 import type { AudioEngineSnapshot, DspSettings, SynthProfile, Track } from '../types/audio';
+import { hasNativeHttpBridge, nativeFetchText } from '../utils/nativeMediaBridge';
+import { extractYouTubeSearchResults, rankYouTubeSearchResults } from '../utils/streamFilter';
 
 type Listener = (snapshot: AudioEngineSnapshot) => void;
 type TrackEndListener = () => void;
@@ -644,6 +646,19 @@ class DualChannelAudioEngine {
 
   private armYtStartupWatchdog(track: Track, seq: number) {
     this.clearYtStartupWatchdog();
+    // Nudge cued WebView players once after 1.8s before falling back to recovery at 6.5s
+    window.setTimeout(() => {
+      if (seq !== this.playSeq || !this.ytActive || !this.isPlaying || !this.ytPlayer || !this.ytReady) return;
+      try {
+        const state = this.ytPlayer.getPlayerState();
+        if (state === 5 || state === -1) {
+          this.ytPlayer.playVideo();
+        }
+      } catch {
+        // Ignore
+      }
+    }, 1800);
+
     this.ytStartupTimer = window.setTimeout(() => {
       if (seq !== this.playSeq || !this.ytActive || !this.isPlaying || !this.ytPlayer) return;
       try {
@@ -656,7 +671,7 @@ class DualChannelAudioEngine {
       } catch {
         void this.recoverActiveYouTubeTrack(track, seq);
       }
-    }, 4500);
+    }, 6500);
   }
 
   attachYouTubeViewport(el: HTMLElement | null, zIndex = 30): () => void {
@@ -836,6 +851,13 @@ class DualChannelAudioEngine {
                 clearTimeout(timeoutId);
                 this.ytReady = true;
                 this.syncYouTubeHostGeometry();
+                if (this.ytActive && this.isPlaying) {
+                  try {
+                    ev.target.playVideo();
+                  } catch {
+                    // Ignore
+                  }
+                }
                 resolve(ev.target);
               },
               onStateChange: (ev) => {
@@ -920,54 +942,98 @@ class DualChannelAudioEngine {
           )}`
         );
         if (seq !== this.playSeq) return;
-        const data = (await res.json()) as {
-          mode?: string;
-          youtubeId?: string;
-          streamUrl?: string;
-          duration?: number;
-          artworkUrl?: string;
-          recoveredFrom?: string;
-        };
-
-        if (data.mode === 'alternate-youtube' && data.youtubeId && this.ytPlayer && this.ytReady) {
-          const updated: Track = {
-            ...track,
-            youtubeId: data.youtubeId,
-            duration: data.duration || track.duration,
-            artworkUrl: data.artworkUrl || track.artworkUrl,
-            recoveredFrom: data.recoveredFrom || 'Alternate YouTube Audio',
+        if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
+          const data = (await res.json()) as {
+            mode?: string;
+            youtubeId?: string;
+            streamUrl?: string;
+            duration?: number;
+            artworkUrl?: string;
+            recoveredFrom?: string;
           };
-          this.currentTrack = updated;
-          this.duration = updated.duration;
-          this.currentTime = 0;
-          this.ytPlayer.loadVideoById(data.youtubeId, 0);
-          this.emit();
-          return;
-        }
 
-        if (data.mode === 'alternate-stream' && data.streamUrl) {
-          this.stopYouTubePlayback(0);
-          const updated: Track = {
-            ...track,
-            youtubeId: undefined,
-            streamUrl: data.streamUrl,
-            duration: data.duration || track.duration,
-            recoveredFrom: data.recoveredFrom || 'Audius Full-Length Mirror',
-          };
-          this.currentTrack = updated;
-          this.duration = updated.duration;
-          const proxied = `/api/stream/proxy?url=${encodeURIComponent(data.streamUrl)}`;
-          activeStrip.audioEl.src = proxied;
-          try {
-            await activeStrip.audioEl.play();
+          if (data.mode === 'alternate-youtube' && data.youtubeId && this.ytPlayer && this.ytReady) {
+            const updated: Track = {
+              ...track,
+              youtubeId: data.youtubeId,
+              duration: data.duration || track.duration,
+              artworkUrl: data.artworkUrl || track.artworkUrl,
+              recoveredFrom: data.recoveredFrom || 'Alternate YouTube Audio',
+            };
+            this.currentTrack = updated;
+            this.duration = updated.duration;
+            this.currentTime = 0;
+            this.ytPlayer.loadVideoById(data.youtubeId, 0);
             this.emit();
             return;
-          } catch {
-            // Fall through to synth stem
+          }
+
+          if (data.mode === 'alternate-stream' && data.streamUrl) {
+            this.stopYouTubePlayback(0);
+            const updated: Track = {
+              ...track,
+              youtubeId: undefined,
+              streamUrl: data.streamUrl,
+              duration: data.duration || track.duration,
+              recoveredFrom: data.recoveredFrom || 'Audius Full-Length Mirror',
+            };
+            this.currentTrack = updated;
+            this.duration = updated.duration;
+            const proxied = `/api/stream/proxy?url=${encodeURIComponent(data.streamUrl)}`;
+            activeStrip.audioEl.src = proxied;
+            try {
+              await activeStrip.audioEl.play();
+              this.emit();
+              return;
+            } catch {
+              // Fall through
+            }
           }
         }
       } catch {
-        // Fall through to synth stem
+        // Try native APK YouTube recovery below
+      }
+
+      // On Android APK (no Express server), find embeddable -Topic / Lyrics YouTube alternate directly
+      if (seq === this.playSeq && hasNativeHttpBridge() && this.ytPlayer && this.ytReady) {
+        try {
+          const fallbackQuery =
+            this.ytRecoveryAttempts === 1
+              ? `${track.artist} ${track.title} topic`
+              : `${track.title} ${track.artist} lyrics`;
+          const nativeRes = await nativeFetchText(
+            `https://www.youtube.com/results?search_query=${encodeURIComponent(
+              fallbackQuery
+            )}&sp=EgIQAQ%3D%3D`,
+            8000
+          );
+          if (seq !== this.playSeq) return;
+          if (nativeRes?.ok && nativeRes.text) {
+            const candidates = extractYouTubeSearchResults(nativeRes.text).filter(
+              (c) => c.videoId !== track.youtubeId
+            );
+            const ranked = rankYouTubeSearchResults(candidates, fallbackQuery);
+            const alt = ranked[0];
+            if (alt?.videoId) {
+              const updated: Track = {
+                ...track,
+                youtubeId: alt.videoId,
+                duration: alt.durationSeconds || track.duration,
+                artworkUrl: alt.thumbnailUrl || track.artworkUrl,
+                recoveredFrom: `Alternate YouTube (${alt.videoId})`,
+              };
+              this.currentTrack = updated;
+              this.duration = updated.duration;
+              this.currentTime = 0;
+              this.ytPlayer.loadVideoById(alt.videoId, 0);
+              this.ytPlayer.playVideo();
+              this.emit();
+              return;
+            }
+          }
+        } catch {
+          // Fall through to synth stem
+        }
       }
     }
 

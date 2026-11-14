@@ -9,7 +9,10 @@ import {
   extractYouTubeRelatedResults,
   extractYouTubeSearchResults,
   isIndividualSong,
+  parseYouTubeSuggestResponse,
+  rankYouTubeSearchResults,
   sortStudioQueue,
+  toYouTubeTracks,
 } from './src/utils/streamFilter';
 import type {
   StudioChatMessage,
@@ -132,11 +135,9 @@ async function searchYouTubeTracks(
   excludeYoutubeId?: string
 ): Promise<Track[]> {
   try {
-    const queryWithIntent = /\b(audio|lyrics|song|official)\b/i.test(term)
-      ? term
-      : `${term} audio`;
+    const cleanTerm = term.trim() || 'top music hits';
     const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(
-      queryWithIntent
+      cleanTerm
     )}&sp=EgIQAQ%3D%3D`;
 
     const response = await fetch(url, {
@@ -150,23 +151,11 @@ async function searchYouTubeTracks(
     });
     if (!response.ok) return [];
     const html = await response.text();
-    const parsed = extractYouTubeSearchResults(html)
-      .filter((item) => !excludeYoutubeId || item.videoId !== excludeYoutubeId)
-      .slice(0, 12);
-
-    return parsed.map((item) => ({
-      id: `yt-${item.videoId}`,
-      youtubeId: item.videoId,
-      streamProvider: 'youtube' as const,
-      title: item.title,
-      artist: item.artist,
-      album: 'YouTube Music Stream',
-      duration: item.durationSeconds,
-      source: 'stream' as const,
-      artworkUrl: item.thumbnailUrl,
-      genre: genre || 'YouTube',
-      addedAt: Date.now(),
-    }));
+    const extracted = extractYouTubeSearchResults(html).filter(
+      (item) => !excludeYoutubeId || item.videoId !== excludeYoutubeId
+    );
+    const ranked = rankYouTubeSearchResults(extracted, cleanTerm).slice(0, 12);
+    return toYouTubeTracks(ranked, genre);
   } catch {
     return [];
   }
@@ -187,21 +176,10 @@ async function fetchYouTubeWatchRelated(youtubeId: string, genre?: string): Prom
     if (!response.ok) return [];
     const html = await response.text();
     const parsed = extractYouTubeRelatedResults(html, youtubeId).slice(0, 12);
-
-    return parsed.map((item) => ({
-      id: `yt-${item.videoId}`,
-      youtubeId: item.videoId,
-      streamProvider: 'youtube' as const,
-      title: item.title,
-      artist: item.artist,
-      album: 'YouTube Radio Up Next',
-      duration: item.durationSeconds,
-      source: 'stream' as const,
-      artworkUrl: item.thumbnailUrl,
-      genre: genre || 'YouTube',
-      addedAt: Date.now(),
+    return toYouTubeTracks(parsed, genre, {
       autoQueued: true,
-    }));
+      albumLabel: 'YouTube Radio Up Next',
+    });
   } catch {
     return [];
   }
@@ -275,17 +253,45 @@ async function startServer() {
     res.json({ ok: true, studioListeners: clients.size });
   });
 
+  app.get('/api/stream/suggest', async (req, res) => {
+    const query = String(req.query.q || '').trim();
+    if (!query) {
+      return res.json({ suggestions: [] });
+    }
+    try {
+      const suggestUrl = `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(
+        query
+      )}`;
+      const upstream = await fetch(suggestUrl, {
+        signal: AbortSignal.timeout(3500),
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        },
+      });
+      if (!upstream.ok) return res.json({ suggestions: [] });
+      const raw = await upstream.text();
+      return res.json({ suggestions: parseYouTubeSuggestResponse(raw) });
+    } catch {
+      return res.json({ suggestions: [] });
+    }
+  });
+
   app.get('/api/stream/search', async (req, res) => {
     const query = String(req.query.q || '').trim();
     const genre = String(req.query.genre || '').trim();
-    const baseTerm = [query, genre ? `${genre} music` : ''].filter(Boolean).join(' ') || 'synthwave electronic music';
+    const baseTerm =
+      [query, genre ? `${genre} music` : ''].filter(Boolean).join(' ') || 'top music hits';
 
     const ytResults = await searchYouTubeTracks(baseTerm, genre);
     if (ytResults.length > 0) {
       return res.json({ results: ytResults, source: 'live', provider: 'youtube' });
     }
 
-    const audiusResults = await searchAudiusTracks([query, genre].filter(Boolean).join(' ') || 'synthwave', genre);
+    const audiusResults = await searchAudiusTracks(
+      [query, genre].filter(Boolean).join(' ') || 'synthwave',
+      genre
+    );
     if (audiusResults.length > 0) {
       return res.json({ results: audiusResults, source: 'live', provider: 'audius' });
     }
@@ -344,8 +350,8 @@ async function startServer() {
     const excludeId = String(req.query.excludeId || '').trim();
 
     const recoveryQueries = [
-      [title, artist, 'lyrics audio'].filter(Boolean).join(' '),
-      [title, 'official audio'].filter(Boolean).join(' '),
+      [artist, title, 'topic'].filter(Boolean).join(' '),
+      [title, artist, 'lyrics'].filter(Boolean).join(' '),
     ].filter(Boolean);
 
     for (const q of recoveryQueries) {

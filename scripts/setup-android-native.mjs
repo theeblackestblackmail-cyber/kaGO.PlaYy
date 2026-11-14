@@ -36,6 +36,12 @@ export function applyAndroidNativeOverrides(rootDir = process.cwd()) {
     }
   }
 
+  // Enable hardware acceleration for smooth WebView video & PiP playback
+  manifest = manifest.replace(/<application([^>]*)>/, (full, attrs) => {
+    if (attrs.includes('android:hardwareAccelerated')) return full;
+    return `<application${attrs}\n        android:hardwareAccelerated="true">`;
+  });
+
   // Enable Picture-in-Picture and resizeableActivity on MainActivity
   if (!manifest.includes('android:supportsPictureInPicture')) {
     manifest = manifest.replace(

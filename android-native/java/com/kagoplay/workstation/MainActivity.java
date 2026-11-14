@@ -6,6 +6,7 @@ import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.os.Build;
 import android.os.Bundle;
+import android.util.Base64;
 import android.util.Rational;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
@@ -16,7 +17,14 @@ import androidx.core.content.ContextCompat;
 
 import com.getcapacitor.BridgeActivity;
 
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.lang.ref.WeakReference;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends BridgeActivity {
     private static final int REQ_POST_NOTIFICATIONS = 8801;
@@ -24,6 +32,7 @@ public class MainActivity extends BridgeActivity {
 
     private volatile boolean isVideoModeActive = false;
     private boolean bridgeAttached = false;
+    private final ExecutorService networkExecutor = Executors.newFixedThreadPool(4);
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -39,13 +48,26 @@ public class MainActivity extends BridgeActivity {
         attachNativeBridge();
     }
 
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        networkExecutor.shutdownNow();
+    }
+
     private void attachNativeBridge() {
         if (bridgeAttached || getBridge() == null || getBridge().getWebView() == null) {
             return;
         }
         WebView webView = getBridge().getWebView();
         WebSettings settings = webView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        String ua = settings.getUserAgentString();
+        if (ua != null && ua.contains("; wv")) {
+            settings.setUserAgentString(ua.replace("; wv", ""));
+        }
         webView.addJavascriptInterface(new KaGoNativeBridge(), "KaGoNative");
         bridgeAttached = true;
     }
@@ -99,6 +121,23 @@ public class MainActivity extends BridgeActivity {
             String js = "window.dispatchEvent(new CustomEvent('" + eventName + "',{detail:" + detailJson + "}));";
             webView.evaluateJavascript(js, null);
         });
+    }
+
+    private static String escapeJsonString(String input) {
+        if (input == null) return "";
+        return input
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "")
+            .replace("\r", "");
+    }
+
+    private static boolean isAllowedFetchUrl(String urlString) {
+        if (urlString == null) return false;
+        return urlString.startsWith("https://www.youtube.com/")
+            || urlString.startsWith("https://m.youtube.com/")
+            || urlString.startsWith("https://suggestqueries.google.com/")
+            || urlString.startsWith("https://api.audius.co/");
     }
 
     private void enterPipInternal() {
@@ -204,6 +243,72 @@ public class MainActivity extends BridgeActivity {
                     }
                 });
             }
+        }
+
+        @JavascriptInterface
+        public void fetchUrlAsync(final String requestId, final String urlString) {
+            if (!isAllowedFetchUrl(urlString)) {
+                String errJson = "{\"requestId\":\"" + escapeJsonString(requestId)
+                    + "\",\"ok\":false,\"status\":403,\"bodyBase64\":\"\"}";
+                dispatchJsEvent("kago-native-http", errJson);
+                return;
+            }
+
+            networkExecutor.execute(() -> {
+                HttpURLConnection conn = null;
+                int status = 0;
+                try {
+                    URL url = new URL(urlString);
+                    conn = (HttpURLConnection) url.openConnection();
+                    conn.setConnectTimeout(7000);
+                    conn.setReadTimeout(8000);
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setRequestMethod("GET");
+                    conn.setRequestProperty(
+                        "User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                    );
+                    conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
+                    conn.setRequestProperty("Cookie", "SOCS=CAI");
+
+                    status = conn.getResponseCode();
+                    InputStream stream = (status >= 200 && status < 400)
+                        ? conn.getInputStream()
+                        : conn.getErrorStream();
+
+                    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                    if (stream != null) {
+                        byte[] chunk = new byte[8192];
+                        int total = 0;
+                        int read;
+                        while ((read = stream.read(chunk)) != -1) {
+                            buffer.write(chunk, 0, read);
+                            total += read;
+                            if (total >= 4 * 1024 * 1024) break;
+                        }
+                        stream.close();
+                    }
+
+                    byte[] rawBytes = buffer.toByteArray();
+                    String b64 = Base64.encodeToString(rawBytes, Base64.NO_WRAP);
+                    boolean ok = status >= 200 && status < 300;
+                    String detail = "{\"requestId\":\"" + escapeJsonString(requestId)
+                        + "\",\"ok\":" + ok
+                        + ",\"status\":" + status
+                        + ",\"bodyBase64\":\"" + b64 + "\"}";
+                    dispatchJsEvent("kago-native-http", detail);
+                } catch (Exception ex) {
+                    String emptyB64 = Base64.encodeToString("".getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+                    String detail = "{\"requestId\":\"" + escapeJsonString(requestId)
+                        + "\",\"ok\":false,\"status\":" + status
+                        + ",\"bodyBase64\":\"" + emptyB64 + "\"}";
+                    dispatchJsEvent("kago-native-http", detail);
+                } finally {
+                    if (conn != null) {
+                        conn.disconnect();
+                    }
+                }
+            });
         }
     }
 }

@@ -58,6 +58,8 @@ export interface Track {
   lrcLyrics?: string;
   recoveredFrom?: string;
   autoQueued?: boolean;
+  viewCount?: number;
+  isOfficial?: boolean;
 }
 
 export interface Playlist {

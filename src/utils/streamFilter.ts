@@ -3,6 +3,9 @@ import type { StudioQueueItem, Track } from '../types/audio';
 const MIX_OR_PLAYLIST_RE =
   /\b(full\s*album|full\s*mix|dj\s*mix|dj\s*set|megamix|nonstop|non-stop|compilation|playlist|1\s*hour|2\s*hours|continuous\s*mix|mashup\s*mix|radio\s*show|podcast|episode\s*\d+|tutorial|recreating|how\s+to\s+(make|produce)|reaction|track\s*breakdown)\b/i;
 
+const DERIVATIVE_UPLOAD_RE =
+  /\b(type\s*beat|karaoke|instrumental\s*cover|piano\s*cover|guitar\s*cover|violin\s*cover|drum\s*cover|8d\s*audio|slowed\s*(\+|and)?\s*reverb|sped\s*up|nightcore|ai\s*cover|cover\s*by|parody|tribute)\b/i;
+
 export function isIndividualSong(
   title: string,
   collectionName?: string,
@@ -44,13 +47,34 @@ export function parseYouTubeDuration(text?: string): number {
   return 0;
 }
 
+export function parseYouTubeViewCount(text?: string): number {
+  if (!text) return 0;
+  const normalized = text.replace(/,/g, '').trim().toUpperCase();
+  const abbrMatch = normalized.match(/(\d+(?:\.\d+)?)\s*([KMB])\b/);
+  if (abbrMatch) {
+    const val = parseFloat(abbrMatch[1]);
+    const mult =
+      abbrMatch[2] === 'B' ? 1_000_000_000 : abbrMatch[2] === 'M' ? 1_000_000 : 1_000;
+    return Number.isFinite(val) ? Math.round(val * mult) : 0;
+  }
+  const digitsMatch = normalized.match(/(\d+)\s*VIEW/);
+  if (digitsMatch) {
+    const val = parseInt(digitsMatch[1], 10);
+    return Number.isFinite(val) ? val : 0;
+  }
+  return 0;
+}
+
 export function parseYouTubeArtistAndTitle(
   rawTitle: string,
   channelName: string
 ): { artist: string; title: string } {
   const cleanChannel = channelName.replace(/\s*-\s*Topic$/i, '').trim() || 'YouTube Audio';
   const stripped = rawTitle
-    .replace(/\s*[\[(](official\s*(music\s*)?(video|audio|lyric\s*video)|lyrics?|hq|4k|hd|visualizer|audio\s*only)[\])]/gi, '')
+    .replace(
+      /\s*[\[(](official\s*(music\s*)?(video|audio|lyric\s*video)|lyrics?|hq|4k|hd|visualizer|audio\s*only)[\])]/gi,
+      ''
+    )
     .replace(/\s{2,}/g, ' ')
     .trim();
 
@@ -74,10 +98,20 @@ export interface ParsedYouTubeVideo {
   artist: string;
   durationSeconds: number;
   thumbnailUrl: string;
+  viewCount?: number;
+  isOfficial?: boolean;
+  channelName?: string;
 }
 
 interface YouTubeTextRun {
   text?: string;
+}
+
+interface YouTubeOwnerBadge {
+  metadataBadgeRenderer?: {
+    style?: string;
+    tooltip?: string;
+  };
 }
 
 interface YouTubeVideoRenderer {
@@ -87,6 +121,9 @@ interface YouTubeVideoRenderer {
   shortBylineText?: { runs?: YouTubeTextRun[] };
   longBylineText?: { runs?: YouTubeTextRun[] };
   lengthText?: { simpleText?: string };
+  viewCountText?: { simpleText?: string; runs?: YouTubeTextRun[] };
+  shortViewCountText?: { simpleText?: string; runs?: YouTubeTextRun[] };
+  ownerBadges?: YouTubeOwnerBadge[];
 }
 
 function extractYtInitialDataJson(html: string): Record<string, unknown> | null {
@@ -100,6 +137,25 @@ function extractYtInitialDataJson(html: string): Record<string, unknown> | null 
   } catch {
     return null;
   }
+}
+
+function isOfficialYouTubeUpload(v: YouTubeVideoRenderer, rawTitle: string, channelName: string): boolean {
+  if (/-\s*Topic$/i.test(channelName) || /vevo$/i.test(channelName)) return true;
+  if (/\bofficial\s*(music\s*)?(video|audio|lyric)/i.test(rawTitle)) return true;
+  if (Array.isArray(v.ownerBadges)) {
+    for (const badge of v.ownerBadges) {
+      const style = badge?.metadataBadgeRenderer?.style || '';
+      const tip = badge?.metadataBadgeRenderer?.tooltip || '';
+      if (
+        style.includes('VERIFIED_ARTIST') ||
+        style.includes('VERIFIED') ||
+        /official\s*artist/i.test(tip)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 export function extractYouTubeSearchResults(html: string): ParsedYouTubeVideo[] {
@@ -148,6 +204,15 @@ export function extractYouTubeSearchResults(html: string): ParsedYouTubeVideo[] 
       const { artist, title } = parseYouTubeArtistAndTitle(rawTitle, channelName);
       if (!isIndividualSong(title, artist, durationSeconds)) continue;
 
+      const viewText =
+        v.viewCountText?.simpleText ||
+        v.viewCountText?.runs?.map((r) => r.text || '').join('') ||
+        v.shortViewCountText?.simpleText ||
+        v.shortViewCountText?.runs?.map((r) => r.text || '').join('') ||
+        '';
+      const viewCount = parseYouTubeViewCount(viewText);
+      const isOfficial = isOfficialYouTubeUpload(v, rawTitle, channelName);
+
       seenIds.add(v.videoId);
       results.push({
         videoId: v.videoId,
@@ -155,11 +220,105 @@ export function extractYouTubeSearchResults(html: string): ParsedYouTubeVideo[] 
         artist,
         durationSeconds,
         thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+        viewCount,
+        isOfficial,
+        channelName,
       });
     }
   }
 
   return results;
+}
+
+export function rankYouTubeSearchResults(
+  results: ParsedYouTubeVideo[],
+  query: string
+): ParsedYouTubeVideo[] {
+  const cleanQuery = query.trim().toLowerCase();
+  const queryWantsDerivative = DERIVATIVE_UPLOAD_RE.test(cleanQuery) || /\b(cover|remix|live)\b/i.test(cleanQuery);
+  const queryTokens = cleanQuery.split(/\s+/).filter((t) => t.length >= 2);
+
+  // Drop obvious unofficial derivative uploads unless user specifically asked for them
+  const primaryPool = queryWantsDerivative
+    ? results
+    : results.filter((r) => !DERIVATIVE_UPLOAD_RE.test(`${r.title} ${r.artist} ${r.channelName || ''}`));
+
+  const pool = primaryPool.length > 0 ? primaryPool : results;
+
+  const scoreItem = (item: ParsedYouTubeVideo, index: number): number => {
+    const haystack = `${item.artist} ${item.title} ${item.channelName || ''}`.toLowerCase();
+    let score = 0;
+
+    // 1. Relevance match against user's search terms
+    if (queryTokens.length > 0) {
+      let matched = 0;
+      for (const tok of queryTokens) {
+        if (haystack.includes(tok)) matched++;
+      }
+      score += (matched / queryTokens.length) * 40;
+    }
+
+    // 2. Official Artist / VEVO / - Topic channel boost
+    if (item.isOfficial) score += 28;
+    if (/-\s*topic$/i.test(item.channelName || '')) score += 6;
+
+    // 3. Popularity boost from view counts (so 2B-view official hits beat unknown uploads)
+    if (item.viewCount && item.viewCount > 0) {
+      score += Math.log10(item.viewCount + 1) * 5;
+    }
+
+    // 4. Penalize unofficial "cover" / "remix" / "live" when user didn't search for them
+    if (!queryWantsDerivative && /\b(cover|karaoke|instrumental|tribute|parody)\b/i.test(haystack)) {
+      score -= 35;
+    }
+
+    // 5. Mild tie-breaker preserving YouTube's organic top ordering
+    score -= index * 0.4;
+    return score;
+  };
+
+  return [...pool]
+    .map((item, idx) => ({ item, score: scoreItem(item, idx) }))
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.item);
+}
+
+export function toYouTubeTracks(
+  items: ParsedYouTubeVideo[],
+  genre?: string,
+  options: { autoQueued?: boolean; albumLabel?: string } = {}
+): Track[] {
+  const { autoQueued = false, albumLabel = 'YouTube Music Stream' } = options;
+  return items.map((item) => ({
+    id: `yt-${item.videoId}`,
+    youtubeId: item.videoId,
+    streamProvider: 'youtube' as const,
+    title: item.title,
+    artist: item.artist,
+    album: albumLabel,
+    duration: item.durationSeconds,
+    source: 'stream' as const,
+    artworkUrl: item.thumbnailUrl,
+    genre: genre || 'YouTube',
+    addedAt: Date.now(),
+    viewCount: item.viewCount,
+    isOfficial: item.isOfficial,
+    ...(autoQueued ? { autoQueued: true } : {}),
+  }));
+}
+
+export function parseYouTubeSuggestResponse(rawText: string): string[] {
+  try {
+    const parsed = JSON.parse(rawText) as unknown;
+    if (Array.isArray(parsed) && Array.isArray(parsed[1])) {
+      return parsed[1]
+        .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+        .slice(0, 7);
+    }
+    return [];
+  } catch {
+    return [];
+  }
 }
 
 function collectCompactRenderers(node: unknown, out: YouTubeVideoRenderer[], depth = 0): void {
@@ -222,6 +381,9 @@ export function extractYouTubeRelatedResults(
     const { artist, title } = parseYouTubeArtistAndTitle(rawTitle, channelName);
     if (!isIndividualSong(title, artist, durationSeconds)) continue;
 
+    const viewText =
+      v.viewCountText?.simpleText || v.shortViewCountText?.simpleText || '';
+
     seenIds.add(v.videoId);
     results.push({
       videoId: v.videoId,
@@ -229,6 +391,9 @@ export function extractYouTubeRelatedResults(
       artist,
       durationSeconds,
       thumbnailUrl: `https://i.ytimg.com/vi/${v.videoId}/hqdefault.jpg`,
+      viewCount: parseYouTubeViewCount(viewText),
+      isOfficial: isOfficialYouTubeUpload(v, rawTitle, channelName),
+      channelName,
     });
   }
 

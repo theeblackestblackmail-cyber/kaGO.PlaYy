@@ -1,5 +1,6 @@
 import { DEFAULT_DSP_SETTINGS } from '../data/presetsAndStems';
 import type { DspSettings, Playlist, StoredLyrics, Track } from '../types/audio';
+import { looksLikeMojibake, repairCorruptedTrack } from '../utils/audioMetadata';
 
 const DB_NAME = 'kagoplay_offline_db';
 const DB_VERSION = 1;
@@ -118,7 +119,33 @@ async function deleteByKey(storeName: string, key: IDBValidKey): Promise<void> {
 
 export const localDb = {
   async loadTracks(): Promise<Track[]> {
-    return getAllFromStore<Track>(STORES.TRACKS);
+    const tracks = await getAllFromStore<Track>(STORES.TRACKS);
+    const fixedUpdates: Track[] = [];
+
+    const hydrated = await Promise.all(
+      tracks.map(async (track) => {
+        if (
+          track.source === 'local' &&
+          (looksLikeMojibake(track.title) ||
+            looksLikeMojibake(track.artist) ||
+            looksLikeMojibake(track.album))
+        ) {
+          const blob = await getByKey<Blob>(STORES.BLOBS, track.id);
+          const repaired = await repairCorruptedTrack(track, blob);
+          if (repaired) {
+            fixedUpdates.push(repaired);
+            return repaired;
+          }
+        }
+        return track;
+      })
+    );
+
+    if (fixedUpdates.length > 0) {
+      await this.saveTracksBatch(fixedUpdates);
+    }
+
+    return hydrated;
   },
 
   async saveTrack(track: Track, audioBlob?: Blob): Promise<void> {

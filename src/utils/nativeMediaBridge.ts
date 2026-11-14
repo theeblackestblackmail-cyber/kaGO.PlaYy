@@ -12,6 +12,7 @@ export interface NativeMediaBridgeApi {
   enterPipMode: () => void;
   setVideoModeActive: (active: boolean) => void;
   requestNotificationPermission: () => void;
+  fetchUrlAsync?: (requestId: string, urlString: string) => void;
 }
 
 export type NativeMediaActionDetail =
@@ -30,6 +31,81 @@ declare global {
 
 export function isNativeAndroidApp(): boolean {
   return typeof window !== 'undefined' && Boolean(window.KaGoNative);
+}
+
+export function hasNativeHttpBridge(): boolean {
+  return typeof window !== 'undefined' && typeof window.KaGoNative?.fetchUrlAsync === 'function';
+}
+
+function decodeBase64Utf8(base64: string): string {
+  if (!base64) return '';
+  try {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  } catch {
+    return '';
+  }
+}
+
+export function nativeFetchText(
+  url: string,
+  timeoutMs = 9500
+): Promise<{ ok: boolean; status: number; text: string } | null> {
+  if (typeof window === 'undefined' || typeof window.KaGoNative?.fetchUrlAsync !== 'function') {
+    return Promise.resolve(null);
+  }
+
+  const requestId = `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const cleanup = () => {
+      window.removeEventListener('kago-native-http', onHttpEvent);
+      window.clearTimeout(timer);
+    };
+
+    const onHttpEvent = (ev: Event) => {
+      const detail = (
+        ev as CustomEvent<{
+          requestId?: string;
+          ok?: boolean;
+          status?: number;
+          bodyBase64?: string;
+        }>
+      )?.detail;
+      if (!detail || detail.requestId !== requestId || settled) return;
+      settled = true;
+      cleanup();
+      resolve({
+        ok: Boolean(detail.ok),
+        status: detail.status ?? 0,
+        text: decodeBase64Utf8(detail.bodyBase64 || ''),
+      });
+    };
+
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('kago-native-http', onHttpEvent);
+      resolve(null);
+    }, timeoutMs);
+
+    window.addEventListener('kago-native-http', onHttpEvent);
+    try {
+      window.KaGoNative?.fetchUrlAsync?.(requestId, url);
+    } catch {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        resolve(null);
+      }
+    }
+  });
 }
 
 export function syncNativeNowPlaying(params: {

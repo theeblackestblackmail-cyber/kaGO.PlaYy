@@ -1,6 +1,14 @@
 import { CURATED_STREAM_BANK } from '../data/presetsAndStems';
 import type { Track } from '../types/audio';
-import { buildRadioSeedQuery, isIndividualSong } from './streamFilter';
+import { hasNativeHttpBridge, nativeFetchText } from './nativeMediaBridge';
+import {
+  buildRadioSeedQuery,
+  extractYouTubeRelatedResults,
+  extractYouTubeSearchResults,
+  isIndividualSong,
+  rankYouTubeSearchResults,
+  toYouTubeTracks,
+} from './streamFilter';
 
 export async function fetchRelatedRadioTracks(
   seedTrack: Track,
@@ -28,10 +36,59 @@ export async function fetchRelatedRadioTracks(
       }
     }
   } catch {
-    // Fall through to standalone CORS API (Android APK / offline fallback)
+    // Fall through to native Android YouTube bridge / Audius fallback
   }
 
-  // 2. Direct CORS-enabled Audius full-length related radio fallback (works inside Capacitor APK too)
+  // 2. Native Android APK YouTube Watch Next & Artist/Genre Radio
+  if (hasNativeHttpBridge()) {
+    const collected: Track[] = [];
+    const seenIds = new Set(excluded);
+
+    if (seedTrack.youtubeId) {
+      const watchRes = await nativeFetchText(
+        `https://www.youtube.com/watch?v=${encodeURIComponent(seedTrack.youtubeId)}`,
+        8500
+      );
+      if (watchRes?.ok && watchRes.text) {
+        const parsed = extractYouTubeRelatedResults(watchRes.text, seedTrack.youtubeId);
+        for (const t of toYouTubeTracks(parsed, seedTrack.genre, {
+          autoQueued: true,
+          albumLabel: 'YouTube Radio Up Next',
+        })) {
+          if (!seenIds.has(t.id)) {
+            seenIds.add(t.id);
+            collected.push(t);
+          }
+        }
+      }
+    }
+
+    if (collected.length < 6) {
+      const radioQuery = buildRadioSeedQuery(seedTrack);
+      const searchRes = await nativeFetchText(
+        `https://www.youtube.com/results?search_query=${encodeURIComponent(radioQuery)}&sp=EgIQAQ%3D%3D`,
+        8500
+      );
+      if (searchRes?.ok && searchRes.text) {
+        const extracted = extractYouTubeSearchResults(searchRes.text).filter(
+          (item) => item.videoId !== seedTrack.youtubeId
+        );
+        const ranked = rankYouTubeSearchResults(extracted, radioQuery);
+        for (const t of toYouTubeTracks(ranked, seedTrack.genre, { autoQueued: true })) {
+          if (!seenIds.has(t.id)) {
+            seenIds.add(t.id);
+            collected.push(t);
+          }
+        }
+      }
+    }
+
+    if (collected.length > 0) {
+      return collected.slice(0, 12);
+    }
+  }
+
+  // 3. Direct CORS-enabled Audius full-length related radio fallback
   try {
     const radioQuery = buildRadioSeedQuery(seedTrack);
     const aRes = await fetch(
@@ -79,7 +136,7 @@ export async function fetchRelatedRadioTracks(
     // Offline fallback below
   }
 
-  // 3. Offline curated bank fallback matching genre/energy
+  // 4. Offline curated bank fallback matching genre/energy
   const seedGenre = (seedTrack.genre || '').toLowerCase();
   const matched = CURATED_STREAM_BANK.filter(
     (t) => !excluded.has(t.id) && (!seedGenre || (t.genre || '').toLowerCase() === seedGenre)

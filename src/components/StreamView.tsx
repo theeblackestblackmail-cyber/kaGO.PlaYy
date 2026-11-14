@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  BadgeCheck,
   Disc3,
   ListPlus,
   Loader2,
@@ -7,13 +8,21 @@ import {
   Play,
   RefreshCw,
   Search,
+  Sparkles,
   Trash2,
 } from 'lucide-react';
 import { CURATED_STREAM_BANK, STREAM_GENRES } from '../data/presetsAndStems';
 import { localDb } from '../db/localDb';
 import type { AudioEngineSnapshot, Track } from '../types/audio';
 import { formatDuration } from '../utils/lrcParser';
-import { isIndividualSong } from '../utils/streamFilter';
+import { hasNativeHttpBridge, nativeFetchText } from '../utils/nativeMediaBridge';
+import {
+  extractYouTubeSearchResults,
+  isIndividualSong,
+  parseYouTubeSuggestResponse,
+  rankYouTubeSearchResults,
+  toYouTubeTracks,
+} from '../utils/streamFilter';
 
 interface StreamViewProps {
   engine: AudioEngineSnapshot;
@@ -21,6 +30,22 @@ interface StreamViewProps {
   onTogglePlay: () => void;
   onAddToQueue: (track: Track) => void;
   onSaveTrackToLibrary: (track: Track) => void;
+}
+
+const POPULAR_PICKS = [
+  'Drake Hotline Bling',
+  'The Weeknd Blinding Lights',
+  'Burna Boy Last Last',
+  'Kendrick Lamar Not Like Us',
+  'Rema Calm Down',
+];
+
+function formatCompactViews(views?: number): string {
+  if (!views || views <= 0) return '';
+  if (views >= 1_000_000_000) return `${(views / 1_000_000_000).toFixed(1)}B views`;
+  if (views >= 1_000_000) return `${(views / 1_000_000).toFixed(1)}M views`;
+  if (views >= 1_000) return `${Math.round(views / 1_000)}K views`;
+  return `${views} views`;
 }
 
 export const StreamView: React.FC<StreamViewProps> = ({
@@ -35,17 +60,91 @@ export const StreamView: React.FC<StreamViewProps> = ({
   const [recentSearches, setRecentSearches] = useState<string[]>(() =>
     localDb.loadRecentSearches()
   );
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
   const [results, setResults] = useState<Track[]>(CURATED_STREAM_BANK);
   const [isLoading, setIsLoading] = useState(false);
   const [recoveringId, setRecoveringId] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string>('');
+  const searchBoxRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     localDb.saveRecentSearches(recentSearches);
   }, [recentSearches]);
 
+  useEffect(() => {
+    const onDocClick = (ev: MouseEvent) => {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(ev.target as Node)) {
+        setShowSuggestions(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
+  // Debounced YouTube popular search suggestions (works both on server and natively inside Android APK)
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (trimmed.length < 2) {
+      setSuggestions([]);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/stream/suggest?q=${encodeURIComponent(trimmed)}`);
+        if (!cancelled && res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
+          const data = (await res.json()) as { suggestions?: string[] };
+          setSuggestions(data.suggestions || []);
+          return;
+        }
+      } catch {
+        // Fall through to native Android HTTP bridge
+      }
+
+      if (!cancelled && hasNativeHttpBridge()) {
+        const nativeRes = await nativeFetchText(
+          `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(
+            trimmed
+          )}`,
+          4500
+        );
+        if (!cancelled && nativeRes?.ok && nativeRes.text) {
+          setSuggestions(parseYouTubeSuggestResponse(nativeRes.text));
+        }
+      }
+    }, 220);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [query]);
+
+  const searchYouTubeNatively = async (
+    searchTerm: string,
+    genreFilter: string,
+    excludeId?: string
+  ): Promise<Track[]> => {
+    if (!hasNativeHttpBridge()) return [];
+    const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(
+      searchTerm
+    )}&sp=EgIQAQ%3D%3D`;
+    const nativeRes = await nativeFetchText(ytUrl, 9000);
+    if (!nativeRes?.ok || !nativeRes.text) return [];
+
+    const extracted = extractYouTubeSearchResults(nativeRes.text).filter(
+      (item) => !excludeId || item.videoId !== excludeId
+    );
+    const ranked = rankYouTubeSearchResults(extracted, searchTerm).slice(0, 12);
+    return toYouTubeTracks(ranked, genreFilter);
+  };
+
   const executeSearch = async (searchText: string, genreFilter = selectedGenre) => {
     const cleanQ = searchText.trim();
+    setShowSuggestions(false);
+
     if (cleanQ) {
       setRecentSearches((prev) =>
         [cleanQ, ...prev.filter((item) => item.toLowerCase() !== cleanQ.toLowerCase())].slice(0, 8)
@@ -54,23 +153,41 @@ export const StreamView: React.FC<StreamViewProps> = ({
 
     setIsLoading(true);
     setStatusNote('');
-    try {
-      const params = new URLSearchParams();
-      if (cleanQ) params.set('q', cleanQ);
-      if (genreFilter) params.set('genre', genreFilter);
+    const effectiveTerm =
+      [cleanQ, genreFilter ? `${genreFilter} music` : ''].filter(Boolean).join(' ') || 'top music hits';
 
-      const res = await fetch(`/api/stream/search?${params.toString()}`);
+    try {
       let liveSongs: Track[] = [];
       let sourceFlag = 'live';
 
-      if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
-        const data = (await res.json()) as { results?: Track[]; source?: string };
-        liveSongs = (data.results || []).filter((t) =>
-          isIndividualSong(t.title, t.album, t.duration)
-        );
-        sourceFlag = data.source || 'live';
-      } else {
-        // Standalone APK / static fallback via CORS-enabled Audius full-length API
+      // 1. Try server /api/stream/search (AI Studio / Web Node server)
+      try {
+        const params = new URLSearchParams();
+        if (cleanQ) params.set('q', cleanQ);
+        if (genreFilter) params.set('genre', genreFilter);
+
+        const res = await fetch(`/api/stream/search?${params.toString()}`);
+        if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
+          const data = (await res.json()) as { results?: Track[]; source?: string };
+          liveSongs = (data.results || []).filter((t) =>
+            isIndividualSong(t.title, t.album, t.duration)
+          );
+          sourceFlag = data.source || 'live';
+        }
+      } catch {
+        // Fall through to native APK / Audius search
+      }
+
+      // 2. Android APK native YouTube search bridge (fetches real YouTube directly without server/CORS)
+      if (liveSongs.length === 0 && hasNativeHttpBridge()) {
+        liveSongs = await searchYouTubeNatively(effectiveTerm, genreFilter);
+        if (liveSongs.length > 0) {
+          sourceFlag = 'live';
+        }
+      }
+
+      // 3. Last-resort CORS Audius fallback if YouTube wasn't reachable
+      if (liveSongs.length === 0) {
         const audiusQ = [cleanQ, genreFilter].filter(Boolean).join(' ') || 'synthwave';
         const aRes = await fetch(
           `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(audiusQ)}&limit=12`
@@ -87,7 +204,13 @@ export const StreamView: React.FC<StreamViewProps> = ({
             }>;
           };
           liveSongs = (aJson.data || [])
-            .filter((item) => item.id && item.title && item.duration && isIndividualSong(item.title, item.genre, item.duration))
+            .filter(
+              (item) =>
+                item.id &&
+                item.title &&
+                item.duration &&
+                isIndividualSong(item.title, item.genre, item.duration)
+            )
             .map((item) => ({
               id: `audius-${item.id}`,
               streamProvider: 'audius' as const,
@@ -104,7 +227,6 @@ export const StreamView: React.FC<StreamViewProps> = ({
         }
       }
 
-      // Filter local curated sound bank as complementary offline-ready results
       const localMatches = CURATED_STREAM_BANK.filter((item) => {
         const matchesGenre = !genreFilter || item.genre?.toLowerCase() === genreFilter.toLowerCase();
         const matchesQuery =
@@ -145,26 +267,27 @@ export const StreamView: React.FC<StreamViewProps> = ({
   const handleAutoRecover = async (track: Track) => {
     setRecoveringId(track.id);
     try {
-      const res = await fetch(
-        `/api/stream/recover?title=${encodeURIComponent(track.title)}&artist=${encodeURIComponent(
-          track.artist
-        )}&genre=${encodeURIComponent(track.genre || '')}&excludeId=${encodeURIComponent(
-          track.youtubeId || ''
-        )}`
-      );
-      const data = (await res.json()) as {
-        recovered?: boolean;
-        mode?: string;
-        youtubeId?: string;
-        streamUrl?: string;
-        duration?: number;
-        artworkUrl?: string;
-        recoveredFrom?: string;
-      };
+      let recoveredTrack: Track | null = null;
 
-      const recoveredTrack: Track =
-        data.mode === 'alternate-youtube' && data.youtubeId
-          ? {
+      try {
+        const res = await fetch(
+          `/api/stream/recover?title=${encodeURIComponent(track.title)}&artist=${encodeURIComponent(
+            track.artist
+          )}&genre=${encodeURIComponent(track.genre || '')}&excludeId=${encodeURIComponent(
+            track.youtubeId || ''
+          )}`
+        );
+        if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
+          const data = (await res.json()) as {
+            mode?: string;
+            youtubeId?: string;
+            streamUrl?: string;
+            duration?: number;
+            artworkUrl?: string;
+            recoveredFrom?: string;
+          };
+          if (data.mode === 'alternate-youtube' && data.youtubeId) {
+            recoveredTrack = {
               ...track,
               youtubeId: data.youtubeId,
               streamUrl: undefined,
@@ -172,9 +295,9 @@ export const StreamView: React.FC<StreamViewProps> = ({
               duration: data.duration || track.duration,
               artworkUrl: data.artworkUrl || track.artworkUrl,
               recoveredFrom: data.recoveredFrom || 'Alternate YouTube Audio',
-            }
-          : data.mode === 'alternate-stream' && data.streamUrl
-          ? {
+            };
+          } else if (data.mode === 'alternate-stream' && data.streamUrl) {
+            recoveredTrack = {
               ...track,
               youtubeId: undefined,
               streamUrl: data.streamUrl,
@@ -182,42 +305,52 @@ export const StreamView: React.FC<StreamViewProps> = ({
               duration: data.duration || track.duration,
               artworkUrl: data.artworkUrl || track.artworkUrl,
               recoveredFrom: data.recoveredFrom || 'Audius Full-Length Mirror',
-            }
-          : {
-              ...track,
-              youtubeId: undefined,
-              streamUrl: undefined,
-              streamProvider: 'synth',
-              recoveredFrom: 'Local Synth Engine Stem',
-              synthProfile: track.synthProfile || {
-                bpm: 118,
-                rootFreq: 55,
-                scale: [0, 3, 7, 10, 12],
-                patternStyle: 'neon',
-                description: 'Auto-recovered procedural synth stream',
-              },
             };
+          }
+        }
+      } catch {
+        // Fall through to native APK recovery
+      }
 
-      setResults((prev) => prev.map((t) => (t.id === track.id ? recoveredTrack : t)));
+      if (!recoveredTrack && hasNativeHttpBridge()) {
+        const altTracks = await searchYouTubeNatively(
+          `${track.artist} ${track.title} topic`,
+          track.genre || '',
+          track.youtubeId
+        );
+        if (altTracks[0]?.youtubeId) {
+          recoveredTrack = {
+            ...track,
+            youtubeId: altTracks[0].youtubeId,
+            streamUrl: undefined,
+            streamProvider: 'youtube',
+            duration: altTracks[0].duration || track.duration,
+            artworkUrl: altTracks[0].artworkUrl || track.artworkUrl,
+            recoveredFrom: `Alternate YouTube (${altTracks[0].youtubeId})`,
+          };
+        }
+      }
+
+      if (!recoveredTrack) {
+        recoveredTrack = {
+          ...track,
+          youtubeId: undefined,
+          streamUrl: undefined,
+          streamProvider: 'synth',
+          recoveredFrom: 'Local Synth Engine Stem',
+          synthProfile: track.synthProfile || {
+            bpm: 118,
+            rootFreq: 55,
+            scale: [0, 3, 7, 10, 12],
+            patternStyle: 'neon',
+            description: 'Auto-recovered procedural synth stream',
+          },
+        };
+      }
+
+      setResults((prev) => prev.map((t) => (t.id === track.id ? recoveredTrack! : t)));
       setStatusNote(`Auto-Recovery ready for "${track.title}" via ${recoveredTrack.recoveredFrom}.`);
       onPlayTrack(recoveredTrack);
-    } catch {
-      const fallbackTrack: Track = {
-        ...track,
-        youtubeId: undefined,
-        streamUrl: undefined,
-        streamProvider: 'synth',
-        recoveredFrom: 'Local Synth Stem Fallback',
-        synthProfile: track.synthProfile || {
-          bpm: 114,
-          rootFreq: 55,
-          scale: [0, 3, 7, 10, 12],
-          patternStyle: 'cyber',
-          description: 'Offline auto-recovered synth stem',
-        },
-      };
-      setResults((prev) => prev.map((t) => (t.id === track.id ? fallbackTrack : t)));
-      onPlayTrack(fallbackTrack);
     } finally {
       setRecoveringId(null);
     }
@@ -231,7 +364,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
           <div>
             <h1 className="font-display text-2xl font-bold text-[#F4F3F0]">Free Music Streamer</h1>
             <p className="text-xs text-[#8E929B]">
-              Zero-signup full-length YouTube & free music search strictly filtered for individual songs
+              Zero-signup full-length YouTube music &amp; video search ranked by official artist tracks
             </p>
           </div>
           {statusNote && (
@@ -239,18 +372,46 @@ export const StreamView: React.FC<StreamViewProps> = ({
           )}
         </div>
 
-        {/* Search Form */}
+        {/* Search Form + Live YouTube Autocomplete Suggestions */}
         <form onSubmit={handleSubmit} className="mt-4 flex flex-col sm:flex-row gap-2.5">
-          <div className="relative flex-1">
+          <div ref={searchBoxRef} className="relative flex-1">
             <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-[#8E929B]" />
             <input
               type="text"
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search artist, track title, or mood..."
+              onFocus={() => setShowSuggestions(true)}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setShowSuggestions(true);
+              }}
+              placeholder="Search artist, popular song, or mood..."
               aria-label="Search free music streams"
               className="w-full rounded-lg border border-[#262936] bg-[#07080B] py-2.5 pl-10 pr-4 text-sm text-[#F4F3F0] placeholder-[#6B7280] focus:border-[#E11D48] focus:outline-none"
             />
+
+            {showSuggestions && suggestions.length > 0 && (
+              <div
+                role="listbox"
+                aria-label="Popular search suggestions"
+                className="absolute left-0 right-0 top-full z-40 mt-1.5 overflow-hidden rounded-lg border border-[#282B36] bg-[#101219] shadow-2xl"
+              >
+                {suggestions.map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    onClick={() => {
+                      setQuery(item);
+                      setShowSuggestions(false);
+                      void executeSearch(item, selectedGenre);
+                    }}
+                    className="flex w-full items-center gap-2.5 border-b border-[#1A1C24] px-3.5 py-2.5 text-left text-xs text-[#E5E7EB] last:border-b-0 hover:bg-[#1A1D27] hover:text-white cursor-pointer"
+                  >
+                    <Search className="h-3.5 w-3.5 shrink-0 text-[#E11D48]" />
+                    <span className="truncate">{item}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
           <button
             type="submit"
@@ -262,9 +423,30 @@ export const StreamView: React.FC<StreamViewProps> = ({
           </button>
         </form>
 
+        {/* Popular Song Recommendations */}
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <span className="inline-flex items-center gap-1 text-xs text-[#8E929B]">
+            <Sparkles className="h-3 w-3 text-[#E11D48]" />
+            Popular:
+          </span>
+          {POPULAR_PICKS.map((term) => (
+            <button
+              key={term}
+              type="button"
+              onClick={() => {
+                setQuery(term);
+                void executeSearch(term, '');
+              }}
+              className="rounded-md border border-[#252834] bg-[#14161D] px-2.5 py-1 text-xs text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
+            >
+              {term}
+            </button>
+          ))}
+        </div>
+
         {/* Recent Searches */}
         {recentSearches.length > 0 && (
-          <div className="mt-4 flex flex-wrap items-center gap-2">
+          <div className="mt-2.5 flex flex-wrap items-center gap-2">
             <span className="text-xs text-[#8E929B]">Recent:</span>
             {recentSearches.map((term) => (
               <button
@@ -318,6 +500,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
           const isCurrent = engine.currentTrack?.id === track.id;
           const isTrackPlaying = isCurrent && engine.isPlaying;
           const isRecovering = recoveringId === track.id;
+          const viewsLabel = formatCompactViews(track.viewCount);
 
           return (
             <article
@@ -348,12 +531,26 @@ export const StreamView: React.FC<StreamViewProps> = ({
                 </div>
 
                 <div className="mt-3">
-                  <h2 className="font-display text-base font-bold text-[#F4F3F0] truncate">
-                    {track.title}
-                  </h2>
+                  <div className="flex items-center gap-1.5">
+                    <h2 className="font-display text-base font-bold text-[#F4F3F0] truncate">
+                      {track.title}
+                    </h2>
+                    {track.isOfficial && (
+                      <BadgeCheck
+                        className="h-4 w-4 shrink-0 text-[#E11D48]"
+                        aria-label="Official artist track"
+                      />
+                    )}
+                  </div>
                   <p className="mt-0.5 text-xs text-[#8E929B] truncate">{track.artist}</p>
                   <div className="mt-1.5 flex items-center gap-2 font-mono-tabular text-[11px] text-[#6B7280]">
                     <span className="truncate">ID: {track.id}</span>
+                    {viewsLabel && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className="text-[#9CA3AF] truncate">{viewsLabel}</span>
+                      </>
+                    )}
                     {track.recoveredFrom && (
                       <>
                         <span aria-hidden="true">·</span>
