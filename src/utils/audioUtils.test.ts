@@ -222,7 +222,7 @@ test('setup-android-native patches AndroidManifest, Gradle, and copies Java Medi
 
     fs.writeFileSync(
       path.join(tmpRoot, 'android', 'app', 'build.gradle'),
-      `dependencies {\n    implementation "androidx.appcompat:appcompat:1.6.1"\n}\n`,
+      `android {\n    namespace "com.kagoplay.workstation"\n}\ndependencies {\n    implementation "androidx.appcompat:appcompat:1.6.1"\n}\n`,
       'utf8'
     );
     fs.writeFileSync(
@@ -243,6 +243,7 @@ test('setup-android-native patches AndroidManifest, Gradle, and copies Java Medi
 
     const gradle = fs.readFileSync(path.join(tmpRoot, 'android', 'app', 'build.gradle'), 'utf8');
     assert.equal(gradle.match(/androidx\.media:media:1\.7\.0/g)?.length, 1);
+    assert.equal(gradle.match(/JavaVersion\.VERSION_17/g)?.length, 2);
 
     assert.ok(fs.existsSync(path.join(androidMain, 'java', 'com', 'kagoplay', 'workstation', 'MainActivity.java')));
     assert.ok(fs.existsSync(path.join(androidMain, 'java', 'com', 'kagoplay', 'workstation', 'KaGoMediaService.java')));

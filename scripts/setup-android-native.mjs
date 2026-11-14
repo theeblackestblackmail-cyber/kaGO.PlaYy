@@ -93,15 +93,26 @@ export function applyAndroidNativeOverrides(rootDir = process.cwd()) {
 
   fs.writeFileSync(manifestPath, manifest, 'utf8');
 
-  // Patch android/app/build.gradle to ensure androidx.media:media:1.7.0 is linked
+  // Patch android/app/build.gradle to ensure androidx.media:media:1.7.0 and Java 17 compileOptions
   const appGradlePath = path.join(rootDir, 'android', 'app', 'build.gradle');
   if (fs.existsSync(appGradlePath)) {
     let gradle = fs.readFileSync(appGradlePath, 'utf8');
+    let changed = false;
+    if (!gradle.includes('compileOptions')) {
+      gradle = gradle.replace(
+        /android\s*\{/,
+        'android {\n    compileOptions {\n        sourceCompatibility JavaVersion.VERSION_17\n        targetCompatibility JavaVersion.VERSION_17\n    }'
+      );
+      changed = true;
+    }
     if (!gradle.includes('androidx.media:media')) {
       gradle = gradle.replace(
         /dependencies\s*\{/,
         'dependencies {\n    implementation "androidx.media:media:1.7.0"'
       );
+      changed = true;
+    }
+    if (changed) {
       fs.writeFileSync(appGradlePath, gradle, 'utf8');
     }
   }
