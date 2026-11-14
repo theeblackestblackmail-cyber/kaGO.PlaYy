@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ChevronDown,
+  ArrowLeft,
   Heart,
   Minus,
   Pause,
@@ -106,21 +106,22 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
       className="fixed inset-0 z-50 flex flex-col bg-black text-[#F4F3F0] animate-[fadeIn_180ms_ease-out]"
     >
       {/* Top Bar */}
-      <div className="flex items-center justify-between gap-2 sm:gap-4 border-b border-[#1A1C24] bg-[#06070A] px-3 py-3 sm:px-6">
+      <div className="shrink-0 flex items-center justify-between gap-2 sm:gap-4 border-b border-[#1A1C24] bg-[#06070A] px-3 py-3 sm:px-6 pt-[max(0.75rem,env(safe-area-inset-top))] sm:pt-3">
         <button
           type="button"
           onClick={onClose}
-          aria-label="Collapse fullscreen player"
-          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#111319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
+          aria-label="Back from fullscreen player"
+          className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-[#242732] bg-[#111319] px-2.5 sm:px-3 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
         >
-          <ChevronDown className="h-5 w-5" />
+          <ArrowLeft className="h-4 w-4 text-[#E11D48]" />
+          <span className="hidden min-[420px]:inline">Back</span>
         </button>
 
         {/* 4-Tab Switcher (Turntable | Watch Video | Sync Lyrics | Queue) */}
         <div
           role="tablist"
           aria-label="Fullscreen player views"
-          className="flex items-center gap-1 overflow-x-auto rounded-lg border border-[#222530] bg-[#0D0E13] p-1"
+          className="flex min-w-0 flex-1 max-w-fit items-center gap-1 overflow-x-auto no-scrollbar rounded-lg border border-[#222530] bg-[#0D0E13] p-1"
         >
           {(
             [
@@ -138,7 +139,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                 role="tab"
                 aria-selected={active}
                 onClick={() => setSubTab(t.id)}
-                className={`rounded-md px-2.5 sm:px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+                className={`shrink-0 rounded-md px-2.5 sm:px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
                   active
                     ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
                     : 'text-[#8E929B] hover:text-white'
@@ -375,11 +376,11 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
       </div>
 
       {/* Bottom Transport Deck */}
-      <div className="border-t border-[#1F2129] bg-[#08090D] px-4 py-4 sm:px-8 pb-[max(1rem,env(safe-area-inset-bottom))]">
+      <div className="shrink-0 border-t border-[#1F2129] bg-[#08090D] px-3.5 py-3 sm:px-8 sm:py-4 pb-[max(0.85rem,env(safe-area-inset-bottom))]">
         <div className="mx-auto max-w-3xl">
-          <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center justify-between gap-3">
             <div className="min-w-0 flex-1">
-              <h2 className="truncate font-display text-lg font-bold text-[#F4F3F0]">
+              <h2 className="truncate font-display text-base sm:text-lg font-bold text-[#F4F3F0]">
                 {track.title}
               </h2>
               <p className="truncate text-xs text-[#8E929B]">
@@ -391,7 +392,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
               type="button"
               onClick={() => onToggleFavorite(track.id)}
               aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-              className={`flex h-11 w-11 items-center justify-center rounded-lg border border-[#242732] bg-[#121319] transition-colors cursor-pointer ${
+              className={`flex h-10 w-10 sm:h-11 sm:w-11 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#121319] transition-colors cursor-pointer ${
                 isFavorite ? 'text-[#FF4D6D]' : 'text-[#8E929B] hover:text-white'
               }`}
             >
@@ -399,33 +400,41 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
             </button>
           </div>
 
-          {/* Seek Bar */}
-          <div className="mt-4">
-            <input
-              type="range"
-              min={0}
-              max={Math.max(1, duration)}
-              step={0.5}
-              value={Math.min(currentTime, duration || 1)}
-              aria-label="Seek audio position"
-              onChange={(e) => onSeek(Number(e.target.value))}
-              className="hardware-slider w-full"
-            />
-            <div className="mt-1.5 flex items-center justify-between font-mono-tabular text-xs text-[#8E929B]">
+          {/* Seek Bar: Red for played portion, White for remaining */}
+          <div className="mt-3 sm:mt-4">
+            {(() => {
+              const safeMax = Math.max(1, duration);
+              const clampedPos = Math.min(Math.max(0, currentTime), safeMax);
+              const progressPct = duration > 0 ? Math.min(100, Math.max(0, (clampedPos / safeMax) * 100)) : 0;
+              return (
+                <input
+                  type="range"
+                  min={0}
+                  max={safeMax}
+                  step={0.5}
+                  value={clampedPos}
+                  aria-label="Seek audio position"
+                  onChange={(e) => onSeek(Number(e.target.value))}
+                  style={{ '--slider-progress': `${progressPct}%` } as React.CSSProperties}
+                  className="hardware-slider seek-progress-slider w-full"
+                />
+              );
+            })()}
+            <div className="mt-1 flex items-center justify-between font-mono-tabular text-xs text-[#8E929B]">
               <span>{formatDuration(currentTime)}</span>
               <span>{formatDuration(duration)}</span>
             </div>
           </div>
 
           {/* Touch-Friendly Transport Controls */}
-          <div className="mt-3 flex items-center justify-center gap-3 sm:gap-6">
+          <div className="mt-2.5 sm:mt-3 flex items-center justify-center gap-2.5 min-[380px]:gap-4 sm:gap-6">
             <button
               type="button"
               onClick={() => onSeekBy(-10)}
               aria-label="Rewind 10 seconds"
-              className="flex h-11 w-11 items-center justify-center rounded-full border border-[#242732] bg-[#121319] text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
+              className="flex h-10 w-10 sm:h-11 sm:w-11 items-center justify-center rounded-full border border-[#242732] bg-[#121319] text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
             >
-              <RotateCcw className="h-5 w-5" />
+              <RotateCcw className="h-4 w-4 sm:h-5 sm:w-5" />
             </button>
 
             <button

@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowLeft,
   Clock,
   Edit3,
   Eye,
@@ -25,6 +26,7 @@ interface SyncLyricsViewProps {
   onSaveLyrics: (entry: StoredLyrics) => Promise<void>;
   onSeek: (seconds: number) => void;
   onPlayTrack: (track: Track) => void;
+  onBack?: () => void;
 }
 
 export const SyncLyricsView: React.FC<SyncLyricsViewProps> = ({
@@ -34,6 +36,7 @@ export const SyncLyricsView: React.FC<SyncLyricsViewProps> = ({
   onSaveLyrics,
   onSeek,
   onPlayTrack,
+  onBack,
 }) => {
   const [selectedTrackId, setSelectedTrackId] = useState<string>(
     engine.currentTrack?.id || tracks[0]?.id || ''
@@ -157,6 +160,16 @@ export const SyncLyricsView: React.FC<SyncLyricsViewProps> = ({
       <section className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-5">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
           <div>
+            {onBack && (
+              <button
+                type="button"
+                onClick={onBack}
+                className="mb-3 inline-flex items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
+              >
+                <ArrowLeft className="h-3.5 w-3.5 text-[#E11D48]" />
+                <span>Back</span>
+              </button>
+            )}
             <h1 className="font-display text-2xl font-bold text-[#F4F3F0]">Sync Lyrics Studio</h1>
             <p className="mt-1 text-xs text-[#8E929B]">
               Drop or import .lrc files, calibrate sync timing in 0.1s steps, click any line to seek, or author timestamps live
@@ -168,7 +181,7 @@ export const SyncLyricsView: React.FC<SyncLyricsViewProps> = ({
               value={activeTrack?.id || ''}
               onChange={(e) => setSelectedTrackId(e.target.value)}
               aria-label="Select track for synced lyrics"
-              className="rounded-lg border border-[#262936] bg-[#07080B] px-3 py-2 text-xs text-[#F4F3F0] focus:border-[#E11D48] focus:outline-none max-w-[220px]"
+              className="w-full sm:w-auto sm:max-w-[240px] rounded-lg border border-[#262936] bg-[#07080B] px-3 py-2 text-xs text-[#F4F3F0] focus:border-[#E11D48] focus:outline-none"
             >
               {tracks.map((t) => (
                 <option key={t.id} value={t.id}>

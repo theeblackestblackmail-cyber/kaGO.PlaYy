@@ -8,6 +8,8 @@ import { FullscreenPlayer } from './components/FullscreenPlayer';
 import { LibraryView } from './components/LibraryView';
 import { MiniPlayer } from './components/MiniPlayer';
 import { MobileNav } from './components/MobileNav';
+import { SearchView } from './components/SearchView';
+import { SettingsView } from './components/SettingsView';
 import { SharedLiveStudioModal } from './components/SharedLiveStudioModal';
 import { StreamView } from './components/StreamView';
 import { SyncLyricsView } from './components/SyncLyricsView';
@@ -25,6 +27,11 @@ import type {
 } from './types/audio';
 import { readAudioFileTags } from './utils/audioMetadata';
 import {
+  buildTracksFromFilePairs,
+  importFromNativeFolderPicker,
+} from './utils/folderImporter';
+import {
+  hasNativeFolderPicker,
   requestNativeNotificationPermission,
   subscribeNativeMediaActions,
   subscribeNativePipState,
@@ -61,6 +68,7 @@ export default function App() {
   const [isFetchingRadio, setIsFetchingRadio] = useState(false);
 
   const songPickerRef = useRef<HTMLInputElement | null>(null);
+  const folderPickerRef = useRef<HTMLInputElement | null>(null);
   const nativePipStageRef = useRef<HTMLDivElement | null>(null);
   const requestedNotifPermRef = useRef(false);
   const radioSeedEpochRef = useRef(0);
@@ -241,6 +249,46 @@ export default function App() {
     };
   }, []);
 
+  // Close topmost overlay (Equalizer -> Shared Live Studio -> Fullscreen Player) on Escape or Android Back
+  const hasOpenOverlay = isDspOpen || isLiveStudioOpen || isFullscreenOpen;
+  useEffect(() => {
+    if (!hasOpenOverlay) return;
+    try {
+      if (window.history.state?.kagoOverlay !== true) {
+        window.history.pushState({ kagoOverlay: true }, '');
+      }
+    } catch {
+      // Ignore restricted history state in sandboxed frames
+    }
+
+    const closeTopmost = () => {
+      if (isDspOpen) {
+        setIsDspOpen(false);
+      } else if (isLiveStudioOpen) {
+        setIsLiveStudioOpen(false);
+      } else if (isFullscreenOpen) {
+        setIsFullscreenOpen(false);
+      }
+    };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        closeTopmost();
+      }
+    };
+
+    const onPopState = () => {
+      closeTopmost();
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('popstate', onPopState);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('popstate', onPopState);
+    };
+  }, [hasOpenOverlay, isDspOpen, isLiveStudioOpen, isFullscreenOpen]);
+
   // Dock YouTube iframe edge-to-edge when Android enters OS Picture-in-Picture
   useEffect(() => {
     if (!isNativePip || !engine.currentTrack?.youtubeId) return;
@@ -410,6 +458,105 @@ export default function App() {
     e.target.value = '';
   };
 
+  const [folderImportStatus, setFolderImportStatus] = useState<string>('');
+
+  const handlePickFolderInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+    setFolderImportStatus(`Scanning 0 / ${files.length} files...`);
+    try {
+      const pairs = files.map((file) => {
+        const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || '';
+        const folderPath = rel ? rel.split('/').slice(0, -1).join('/') : 'Picked Folder';
+        return { file, folderPath };
+      });
+      const imported = await buildTracksFromFilePairs(pairs, (p) => {
+        setFolderImportStatus(`Importing ${p.scanned} / ${p.found}: ${p.currentFile}`);
+      });
+      if (imported.length > 0) {
+        await handleImportTracks(imported);
+        setActiveTab('library');
+        if (!engine.currentTrack) {
+          playTrack(imported[0].track);
+        }
+      }
+    } finally {
+      setFolderImportStatus('');
+      e.target.value = '';
+    }
+  };
+
+  const handlePickFolder = useCallback(async () => {
+    if (hasNativeFolderPicker()) {
+      setFolderImportStatus('Opening Android folder picker...');
+      try {
+        const result = await importFromNativeFolderPicker((p) => {
+          setFolderImportStatus(`Importing ${p.scanned} / ${p.found}: ${p.currentFile}`);
+        });
+        if (!result.cancelled && !result.error && result.entries.length > 0) {
+          await handleImportTracks(result.entries);
+          setActiveTab('library');
+          if (!engine.currentTrack) {
+            playTrack(result.entries[0].track);
+          }
+        }
+      } finally {
+        setFolderImportStatus('');
+      }
+      return;
+    }
+
+    const inIframe = typeof window !== 'undefined' && window.self !== window.top;
+    const picker = !inIframe
+      ? (
+          window as unknown as {
+            showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>;
+          }
+        ).showDirectoryPicker
+      : undefined;
+
+    if (typeof picker === 'function') {
+      try {
+        const rootHandle = await picker();
+        setFolderImportStatus(`Scanning ${rootHandle.name}...`);
+        const collected: Array<{ file: File; folderPath: string }> = [];
+        const walk = async (dirHandle: FileSystemDirectoryHandle, prefix: string) => {
+          const entries = (
+            dirHandle as unknown as {
+              values: () => AsyncIterable<FileSystemHandle>;
+            }
+          ).values();
+          for await (const entry of entries) {
+            if (entry.kind === 'file') {
+              const file = await (entry as FileSystemFileHandle).getFile();
+              collected.push({ file, folderPath: prefix || rootHandle.name });
+            } else if (entry.kind === 'directory') {
+              await walk(entry as FileSystemDirectoryHandle, `${prefix}/${entry.name}`);
+            }
+          }
+        };
+        await walk(rootHandle, rootHandle.name);
+        const imported = await buildTracksFromFilePairs(collected, (p) => {
+          setFolderImportStatus(`Importing ${p.scanned} / ${p.found}: ${p.currentFile}`);
+        });
+        if (imported.length > 0) {
+          await handleImportTracks(imported);
+          setActiveTab('library');
+          if (!engine.currentTrack) {
+            playTrack(imported[0].track);
+          }
+        }
+        setFolderImportStatus('');
+        return;
+      } catch (err) {
+        setFolderImportStatus('');
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+      }
+    }
+
+    folderPickerRef.current?.click();
+  }, [engine.currentTrack, playTrack]);
+
   const handleCreatePlaylist = async (name: string, description: string) => {
     const pl: Playlist = {
       id: `pl-${Date.now().toString(36)}`,
@@ -486,8 +633,23 @@ export default function App() {
         onChange={handlePickSongFiles}
         className="hidden"
       />
+      <input
+        ref={folderPickerRef}
+        type="file"
+        multiple
+        // @ts-expect-error webkitdirectory is standard in Chromium/WebKit
+        webkitdirectory="true"
+        accept="audio/*"
+        onChange={handlePickFolderInput}
+        className="hidden"
+      />
 
-      <main className="mx-auto max-w-[1440px] px-4 py-6 sm:px-6 lg:px-8 pb-40 md:pb-28">
+      <main className="mx-auto max-w-[1440px] px-3.5 py-4 sm:px-6 sm:py-6 lg:px-8 pb-[calc(9.5rem+env(safe-area-inset-bottom))] md:pb-28">
+        {folderImportStatus && (
+          <div className="mb-4 rounded-xl border border-[#E11D48]/50 bg-[#15090E] px-4 py-2.5 font-mono-tabular text-xs text-[#FDA4AF]">
+            {folderImportStatus}
+          </div>
+        )}
         {activeTab === 'dashboard' && (
           <DashboardView
             engine={engine}
@@ -500,6 +662,7 @@ export default function App() {
             onPlayTrack={playTrack}
             onOpenDsp={() => setIsDspOpen(true)}
             onPickSong={() => songPickerRef.current?.click()}
+            onPickFolder={() => void handlePickFolder()}
             onNavigate={setActiveTab}
           />
         )}
@@ -529,7 +692,7 @@ export default function App() {
             }
             onToggleFavorite={handleToggleFavorite}
             onPickSong={() => songPickerRef.current?.click()}
-            onPickFolder={() => setActiveTab('scanner')}
+            onPickFolder={() => void handlePickFolder()}
             onOpenLiveStudio={() => setIsLiveStudioOpen(true)}
             onCreatePlaylist={(name, desc) => void handleCreatePlaylist(name, desc)}
             onDeletePlaylist={(id) => void handleDeletePlaylist(id)}
@@ -538,8 +701,42 @@ export default function App() {
           />
         )}
 
+        {activeTab === 'settings' && (
+          <SettingsView
+            dsp={dsp}
+            storedTrackCount={allLibraryTracks.length}
+            isOnline={isOnline}
+            autoplayRadioEnabled={autoplayRadioEnabled}
+            onToggleAutoplayRadio={handleToggleAutoplayRadio}
+            onOpenDsp={() => setIsDspOpen(true)}
+            onUpdateDsp={handleUpdateDsp}
+            onPickSong={() => songPickerRef.current?.click()}
+            onPickFolder={() => void handlePickFolder()}
+            onNavigate={setActiveTab}
+          />
+        )}
+
+        {activeTab === 'search' && (
+          <SearchView
+            libraryTracks={allLibraryTracks}
+            engine={engine}
+            onPlayTrack={playTrack}
+            onTogglePlay={() => void audioEngine.togglePlay()}
+            onAddToQueue={(t) =>
+              setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]))
+            }
+            onSaveTrackToLibrary={(t) => void handleSaveTrackToLibrary(t)}
+            onPickSong={() => songPickerRef.current?.click()}
+            onPickFolder={() => void handlePickFolder()}
+          />
+        )}
+
         {activeTab === 'scanner' && (
-          <FolderScannerView onImportTracks={handleImportTracks} />
+          <FolderScannerView
+            onImportTracks={handleImportTracks}
+            onPickSong={() => songPickerRef.current?.click()}
+            onBack={() => setActiveTab('settings')}
+          />
         )}
 
         {activeTab === 'lyrics' && (
@@ -550,6 +747,7 @@ export default function App() {
             onSaveLyrics={handleSaveLyrics}
             onSeek={(sec) => audioEngine.seek(sec)}
             onPlayTrack={playTrack}
+            onBack={() => setActiveTab('settings')}
           />
         )}
       </main>
@@ -568,14 +766,6 @@ export default function App() {
       />
 
       <MobileNav activeTab={activeTab} onSelectTab={setActiveTab} />
-
-      <DspStudioModal
-        isOpen={isDspOpen}
-        onClose={() => setIsDspOpen(false)}
-        dsp={dsp}
-        onUpdateDsp={handleUpdateDsp}
-        onResetFlat={handleResetFlat}
-      />
 
       <FullscreenPlayer
         isOpen={isFullscreenOpen}
@@ -604,6 +794,14 @@ export default function App() {
         autoplayRadioEnabled={autoplayRadioEnabled}
         isFetchingRadio={isFetchingRadio}
         onToggleAutoplayRadio={handleToggleAutoplayRadio}
+      />
+
+      <DspStudioModal
+        isOpen={isDspOpen}
+        onClose={() => setIsDspOpen(false)}
+        dsp={dsp}
+        onUpdateDsp={handleUpdateDsp}
+        onResetFlat={handleResetFlat}
       />
 
       <FloatingPipWindow

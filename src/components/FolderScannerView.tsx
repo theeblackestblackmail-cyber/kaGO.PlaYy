@@ -1,16 +1,24 @@
 import React, { useMemo, useRef, useState } from 'react';
-import { CheckCircle2, FileAudio, FolderSearch, Loader2, Sparkles, Upload } from 'lucide-react';
+import { ArrowLeft, CheckCircle2, FileAudio, FolderSearch, Loader2, Music, Sparkles } from 'lucide-react';
 import type { Track } from '../types/audio';
-import { readAudioFileTags } from '../utils/audioMetadata';
 import { SAMPLE_FILENAMES, sanitizeFilename } from '../utils/filenameSanitizer';
+import {
+  buildTracksFromFilePairs,
+  importFromNativeFolderPicker,
+} from '../utils/folderImporter';
+import { hasNativeFolderPicker } from '../utils/nativeMediaBridge';
 
 interface FolderScannerViewProps {
   onImportTracks: (entries: Array<{ track: Track; file: File }>) => Promise<void>;
+  onPickSong?: () => void;
+  onBack?: () => void;
 }
 
-const AUDIO_FILE_RE = /\.(mp3|flac|wav|ogg|m4a|aac|opus|webm)$/i;
-
-export const FolderScannerView: React.FC<FolderScannerViewProps> = ({ onImportTracks }) => {
+export const FolderScannerView: React.FC<FolderScannerViewProps> = ({
+  onImportTracks,
+  onPickSong,
+  onBack,
+}) => {
   const [isScanning, setIsScanning] = useState(false);
   const [scanStats, setScanStats] = useState<{
     scanned: number;
@@ -42,38 +50,14 @@ export const FolderScannerView: React.FC<FolderScannerViewProps> = ({ onImportTr
       error: '',
     });
 
-    const audioPairs = filePairs.filter(
-      ({ file }) => AUDIO_FILE_RE.test(file.name) || file.type.startsWith('audio/')
-    );
-
-    const importedEntries: Array<{ track: Track; file: File }> = [];
-
-    for (let i = 0; i < audioPairs.length; i++) {
-      const { file, folderPath } = audioPairs[i];
+    const importedEntries = await buildTracksFromFilePairs(filePairs, (progress) => {
       setScanStats((prev) => ({
         ...prev,
-        scanned: i + 1,
-        found: audioPairs.length,
-        currentFile: file.name,
+        scanned: progress.scanned,
+        found: progress.found,
+        currentFile: progress.currentFile,
       }));
-
-      const folderLabel = folderPath.split('/').filter(Boolean).pop() || 'Local Import';
-      const meta = await readAudioFileTags(file, folderLabel);
-
-      const track: Track = {
-        id: `local-${file.name}-${file.size}-${file.lastModified}`.replace(/[^a-zA-Z0-9_-]/g, '_'),
-        title: meta.title,
-        artist: meta.artist,
-        album: meta.album,
-        trackNumber: meta.trackNumber,
-        duration: 180,
-        source: 'local',
-        folderPath: folderPath || 'Local Files',
-        addedAt: Date.now(),
-      };
-
-      importedEntries.push({ track, file });
-    }
+    });
 
     if (importedEntries.length > 0) {
       await onImportTracks(importedEntries);
@@ -84,12 +68,69 @@ export const FolderScannerView: React.FC<FolderScannerViewProps> = ({ onImportTr
       found: importedEntries.length,
       currentFile: importedEntries.length > 0 ? 'Scan complete' : 'No supported audio files found',
       lastImported: importedEntries.map((e) => e.track),
-      error: '',
+      error:
+        importedEntries.length === 0
+          ? 'No audio files (.mp3, .flac, .wav, .m4a, .ogg) were found in that selection.'
+          : '',
     });
     setIsScanning(false);
   };
 
   const handleSelectDirectory = async () => {
+    if (hasNativeFolderPicker()) {
+      setIsScanning(true);
+      setScanStats({
+        scanned: 0,
+        found: 0,
+        currentFile: 'Opening Android folder picker...',
+        lastImported: [],
+        error: '',
+      });
+
+      const result = await importFromNativeFolderPicker((progress) => {
+        setScanStats((prev) => ({
+          ...prev,
+          scanned: progress.scanned,
+          found: progress.found,
+          currentFile: progress.currentFile,
+        }));
+      });
+
+      if (result.cancelled) {
+        setIsScanning(false);
+        setScanStats((prev) => ({ ...prev, currentFile: 'Folder selection cancelled' }));
+        return;
+      }
+
+      if (result.error) {
+        setIsScanning(false);
+        setScanStats((prev) => ({
+          ...prev,
+          currentFile: 'Scan failed',
+          error: result.error || 'Unable to scan folder.',
+        }));
+        return;
+      }
+
+      if (result.entries.length > 0) {
+        await onImportTracks(result.entries);
+      }
+
+      setScanStats({
+        scanned: result.entries.length,
+        found: result.entries.length,
+        currentFile:
+          result.entries.length > 0 ? 'Folder scan complete' : 'No supported audio files found',
+        lastImported: result.entries.map((e) => e.track),
+        error:
+          result.entries.length === 0
+            ? 'No audio files (.mp3, .flac, .wav, .m4a, .ogg) were found inside that folder.'
+            : '',
+      });
+      setIsScanning(false);
+      return;
+    }
+
     const picker = (
       window as unknown as {
         showDirectoryPicker?: () => Promise<FileSystemDirectoryHandle>;
@@ -144,7 +185,7 @@ export const FolderScannerView: React.FC<FolderScannerViewProps> = ({ onImportTr
     if (files.length === 0) return;
     const pairs = files.map((file) => {
       const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || '';
-      const folderPath = rel ? rel.split('/').slice(0, -1).join('/') : 'Local Import';
+      const folderPath = rel ? rel.split('/').slice(0, -1).join('/') : 'Picked Songs';
       return { file, folderPath };
     });
     await processFiles(pairs);
@@ -157,11 +198,21 @@ export const FolderScannerView: React.FC<FolderScannerViewProps> = ({ onImportTr
       <section className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-5 sm:p-6">
         <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <div>
+            {onBack && (
+              <button
+                type="button"
+                onClick={onBack}
+                className="mb-3 inline-flex items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
+              >
+                <ArrowLeft className="h-3.5 w-3.5 text-[#E11D48]" />
+                <span>Back</span>
+              </button>
+            )}
             <h1 className="font-display text-2xl font-bold text-[#F4F3F0]">
-              Recursive Folder Scanner
+              Recursive Folder &amp; Song Picker
             </h1>
             <p className="mt-1 text-xs text-[#8E929B]">
-              Scans folders and subfolders, extracts ID3v2 / ID3v1 / FLAC tags via byte-slice headers without loading entire files into RAM, and cleans filenames automatically.
+              Pick an entire music folder (including subfolders) or pick individual songs — extracts ID3v2 / ID3v1 / FLAC tags automatically.
             </p>
           </div>
 
@@ -177,17 +228,17 @@ export const FolderScannerView: React.FC<FolderScannerViewProps> = ({ onImportTr
               ) : (
                 <FolderSearch className="h-4 w-4" />
               )}
-              <span>Select Music Folder</span>
+              <span>Pick Music Folder</span>
             </button>
 
             <button
               type="button"
-              onClick={() => filesInputRef.current?.click()}
+              onClick={() => (onPickSong ? onPickSong() : filesInputRef.current?.click())}
               disabled={isScanning}
               className="inline-flex items-center gap-2 rounded-lg border border-[#282B36] bg-[#14161D] px-4 py-2.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
             >
-              <Upload className="h-4 w-4 text-[#E11D48]" />
-              <span>File Picker Fallback</span>
+              <Music className="h-4 w-4 text-[#E11D48]" />
+              <span>Pick Song(s)</span>
             </button>
           </div>
         </div>
@@ -233,6 +284,12 @@ export const FolderScannerView: React.FC<FolderScannerViewProps> = ({ onImportTr
             </div>
           </div>
         </div>
+
+        {scanStats.error && (
+          <p className="mt-3 rounded-lg border border-[#E11D48]/40 bg-[#180A0F] px-3.5 py-2 text-xs text-[#FDA4AF]">
+            {scanStats.error}
+          </p>
+        )}
 
         {scanStats.lastImported.length > 0 && (
           <div className="mt-4 rounded-xl border border-[#1E2028] bg-[#090A0E] p-4">

@@ -14,8 +14,8 @@ const NAV_ITEMS: Array<{ id: ActiveTab; label: string }> = [
   { id: 'dashboard', label: 'Dashboard' },
   { id: 'stream', label: 'Stream' },
   { id: 'library', label: 'Library' },
-  { id: 'scanner', label: 'Folder Scanner' },
-  { id: 'lyrics', label: 'Sync Lyrics' },
+  { id: 'settings', label: 'Settings' },
+  { id: 'search', label: 'Search' },
 ];
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -26,19 +26,19 @@ export const TopBar: React.FC<TopBarProps> = ({
   isPlaying,
 }) => {
   return (
-    <div className="sticky top-0 z-40">
+    <div className="sticky top-0 z-40 bg-black/85 backdrop-blur-md pt-[env(safe-area-inset-top)]">
       {!isOnline && (
         <div
           role="status"
-          className="flex items-center justify-center gap-2 border-b border-[#E11D48]/30 bg-[#1A080D] px-4 py-1.5 text-xs font-medium text-[#FDA4AF]"
+          className="flex items-center justify-center gap-2 border-b border-[#E11D48]/30 bg-[#1A080D] px-3 py-1.5 text-center text-xs font-medium text-[#FDA4AF]"
         >
           <WifiOff className="h-3.5 w-3.5 shrink-0 text-[#E11D48]" />
-          <span>Offline Mode — Local Audio Engine &amp; Built-In Synthesizer Stems Active</span>
+          <span className="truncate">Offline Mode — Local Audio Engine &amp; Built-In Stems Active</span>
         </div>
       )}
 
-      <header className="border-b border-[#1F2129] bg-black/85 backdrop-blur-md">
-        <div className="mx-auto flex h-14 max-w-[1440px] items-center justify-between gap-4 px-4 sm:px-6 lg:px-8">
+      <header className="border-b border-[#1F2129]">
+        <div className="mx-auto flex h-14 max-w-[1440px] items-center justify-between gap-3 sm:gap-4 px-3.5 sm:px-6 lg:px-8">
           {/* Left: Brand Logo */}
           <button
             type="button"

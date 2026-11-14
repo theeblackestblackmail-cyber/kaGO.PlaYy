@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowBigUp,
+  ArrowLeft,
   MessageSquare,
   Play,
   Plus,
@@ -154,23 +155,38 @@ export const SharedLiveStudioModal: React.FC<SharedLiveStudioModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-3 sm:p-6 overflow-y-auto"
+      className="fixed inset-0 z-[70] flex flex-col sm:items-center sm:justify-center bg-black/90 backdrop-blur-sm sm:p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="shared-studio-title"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
     >
-      <div className="flex w-full max-w-5xl flex-col rounded-xl border border-[#242732] bg-[#0D0E12] overflow-hidden max-h-[90vh]">
+      <div className="flex h-[100dvh] w-full flex-col bg-[#0D0E12] sm:h-auto sm:max-h-[90dvh] sm:max-w-5xl sm:rounded-xl sm:border sm:border-[#242732] overflow-hidden">
         {/* Modal Header */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1E2028] bg-[#090A0E] px-5 py-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-[#E11D48]/40 bg-[#E11D48]/15 text-[#FF4D6D]">
-              <Radio className="h-5 w-5" />
+        <div className="shrink-0 flex flex-wrap items-center justify-between gap-2.5 border-b border-[#1E2028] bg-[#090A0E] px-3.5 py-3 sm:px-5 sm:py-4 pt-[max(0.75rem,env(safe-area-inset-top))] sm:pt-4">
+          <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Back from Shared Live Studio"
+              className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-[#262936] bg-[#14161D] px-3 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
+            >
+              <ArrowLeft className="h-4 w-4 text-[#E11D48]" />
+              <span>Back</span>
+            </button>
+            <div className="hidden min-[420px]:flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[#E11D48]/40 bg-[#E11D48]/15 text-[#FF4D6D]">
+              <Radio className="h-4 w-4" />
             </div>
-            <div>
-              <h2 id="shared-studio-title" className="font-display text-lg font-bold text-[#F4F3F0]">
+            <div className="min-w-0">
+              <h2
+                id="shared-studio-title"
+                className="truncate font-display text-base sm:text-lg font-bold text-[#F4F3F0]"
+              >
                 Shared Live Studio
               </h2>
-              <div className="flex items-center gap-3 text-xs text-[#8E929B]">
+              <div className="flex items-center gap-2 text-xs text-[#8E929B]">
                 <span className="inline-flex items-center gap-1.5 font-mono-tabular text-[#FF4D6D]">
                   <Users className="h-3.5 w-3.5" />
                   <span>
@@ -178,14 +194,14 @@ export const SharedLiveStudioModal: React.FC<SharedLiveStudioModalProps> = ({
                     {roomState.userCount === 1 ? 'listener' : 'listeners'}
                   </span>
                 </span>
-                <span aria-hidden="true">·</span>
-                <span>{connected ? 'WebSocket Synced' : 'Connecting...'}</span>
+                <span className="hidden sm:inline" aria-hidden="true">·</span>
+                <span className="hidden sm:inline">{connected ? 'WebSocket Synced' : 'Connecting...'}</span>
               </div>
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <form onSubmit={handleUpdateName} className="hidden sm:flex items-center gap-1.5">
+          <div className="flex items-center gap-2 shrink-0">
+            <form onSubmit={handleUpdateName} className="hidden md:flex items-center gap-1.5">
               <input
                 type="text"
                 value={userName}
@@ -204,7 +220,7 @@ export const SharedLiveStudioModal: React.FC<SharedLiveStudioModalProps> = ({
               type="button"
               onClick={onClose}
               aria-label="Close Shared Live Studio"
-              className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#262936] bg-[#14161D] text-[#8E929B] hover:text-white cursor-pointer"
+              className="hidden sm:flex h-9 w-9 items-center justify-center rounded-lg border border-[#262936] bg-[#14161D] text-[#8E929B] hover:text-white cursor-pointer"
             >
               <X className="h-4 w-4" />
             </button>

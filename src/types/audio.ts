@@ -1,4 +1,11 @@
-export type ActiveTab = 'dashboard' | 'stream' | 'library' | 'scanner' | 'lyrics';
+export type ActiveTab =
+  | 'dashboard'
+  | 'stream'
+  | 'library'
+  | 'settings'
+  | 'search'
+  | 'scanner'
+  | 'lyrics';
 
 export type LibrarySubTab = 'all' | 'folders' | 'playlists' | 'albums' | 'artists' | 'favorites';
 

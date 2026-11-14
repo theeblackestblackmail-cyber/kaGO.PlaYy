@@ -13,8 +13,17 @@
     background-color: #000000;
     color: #f4f3f0;
     font-family: var(--font-sans);
-    overflow-x: hidden;
+    min-height: 100dvh;
+    overflow-x: clip;
   }
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
 
 .font-display {
@@ -60,6 +69,7 @@
 input[type='range'].hardware-slider {
   -webkit-appearance: none;
   appearance: none;
+  height: 24px;
   background: transparent;
   cursor: pointer;
 }
@@ -73,12 +83,12 @@ input[type='range'].hardware-slider::-webkit-slider-runnable-track {
 input[type='range'].hardware-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   border-radius: 9999px;
   background: #e11d48;
   border: 2px solid #f4f3f0;
-  margin-top: -5px;
+  margin-top: -6px;
   box-shadow: 0 0 10px rgba(225, 29, 72, 0.55);
 }
 
@@ -89,12 +99,37 @@ input[type='range'].hardware-slider::-moz-range-track {
 }
 
 input[type='range'].hardware-slider::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   border-radius: 9999px;
   background: #e11d48;
   border: 2px solid #f4f3f0;
   box-shadow: 0 0 10px rgba(225, 29, 72, 0.55);
+}
+
+/* Playback Seek Progress Bar: Red (already played) -> White (unplayed) */
+input[type='range'].seek-progress-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to right,
+    #e11d48 0%,
+    #e11d48 var(--slider-progress, 0%),
+    rgba(255, 255, 255, 0.9) var(--slider-progress, 0%),
+    rgba(255, 255, 255, 0.9) 100%
+  );
+}
+
+input[type='range'].seek-progress-slider::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    to right,
+    #e11d48 0%,
+    #e11d48 var(--slider-progress, 0%),
+    rgba(255, 255, 255, 0.9) var(--slider-progress, 0%),
+    rgba(255, 255, 255, 0.9) 100%
+  );
 }
 
 /* Vertical EQ Faders */
@@ -103,8 +138,9 @@ input[type='range'].eq-vertical-fader {
   direction: rtl;
   -webkit-appearance: none;
   appearance: none;
-  width: 32px;
-  height: 144px;
+  width: 36px;
+  height: 100%;
+  touch-action: none;
   background: transparent;
   cursor: ns-resize;
 }
@@ -119,12 +155,12 @@ input[type='range'].eq-vertical-fader::-webkit-slider-runnable-track {
 input[type='range'].eq-vertical-fader::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
-  width: 24px;
-  height: 12px;
-  border-radius: 3px;
+  width: 26px;
+  height: 14px;
+  border-radius: 4px;
   background: #e11d48;
   border: 1px solid #f4f3f0;
-  margin-left: -10px;
+  margin-left: -11px;
   box-shadow: 0 0 8px rgba(225, 29, 72, 0.5);
 }
 

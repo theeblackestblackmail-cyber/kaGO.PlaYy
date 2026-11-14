@@ -434,3 +434,30 @@ test('buildRadioSeedQuery and mergeAutoplayQueue preserve manual queue tracks an
   assert.equal(merged[1].autoQueued, undefined);
   assert.equal(merged[2].autoQueued, true);
 });
+
+test('folderImporter filters supported audio files and builds local tracks cleanly', async () => {
+  const { buildTracksFromFilePairs, isSupportedAudioFile } = await import('./folderImporter');
+
+  assert.equal(isSupportedAudioFile({ name: 'song.mp3', type: 'audio/mpeg' }), true);
+  assert.equal(isSupportedAudioFile({ name: 'lossless.flac', type: '' }), true);
+  assert.equal(isSupportedAudioFile({ name: 'cover.jpg', type: 'image/jpeg' }), false);
+
+  const mp3File = new File([new Uint8Array([0x49, 0x44, 0x33])], 'Kavinsky_-_Nightcall.mp3', {
+    type: 'audio/mpeg',
+    lastModified: 1700000000000,
+  });
+  const jpgFile = new File([new Uint8Array([0xff, 0xd8])], 'album_cover.jpg', {
+    type: 'image/jpeg',
+  });
+
+  const built = await buildTracksFromFilePairs([
+    { file: jpgFile, folderPath: 'Music/Synth' },
+    { file: mp3File, folderPath: 'Music/Synth' },
+  ]);
+
+  assert.equal(built.length, 1);
+  assert.equal(built[0].track.source, 'local');
+  assert.equal(built[0].track.folderPath, 'Music/Synth');
+  assert.equal(built[0].track.artist, 'Kavinsky');
+  assert.equal(built[0].track.title, 'Nightcall');
+});

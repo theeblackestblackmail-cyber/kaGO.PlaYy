@@ -28,6 +28,7 @@ interface DashboardViewProps {
   onPlayTrack: (track: Track) => void;
   onOpenDsp: () => void;
   onPickSong: () => void;
+  onPickFolder: () => void;
   onNavigate: (tab: ActiveTab) => void;
 }
 
@@ -42,6 +43,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onPlayTrack,
   onOpenDsp,
   onPickSong,
+  onPickFolder,
   onNavigate,
 }) => {
   const activeIsRunning = engine.isPlaying;
@@ -50,9 +52,9 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   return (
     <div className="space-y-6">
       {/* Hero Workstation Card */}
-      <section className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-5 sm:p-6">
+      <section className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-4 sm:p-6">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div>
+          <div className="min-w-0">
             <div className="flex items-center gap-2 font-mono-tabular text-xs text-[#8E929B]">
               <span
                 className={`h-2 w-2 rounded-full ${
@@ -108,7 +110,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
 
         {/* 4 Quick-Action Cards Row */}
-        <div className="mt-5 grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="mt-5 grid grid-cols-1 min-[340px]:grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-3">
           <button
             type="button"
             onClick={onPickSong}
@@ -123,7 +125,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <button
             type="button"
-            onClick={() => onNavigate('scanner')}
+            onClick={onPickFolder}
             className="flex items-center gap-3 rounded-lg border border-[#222530] bg-[#13151C] px-3.5 py-3 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
           >
             <FolderOpen className="h-5 w-5 shrink-0 text-[#E11D48]" />
@@ -162,7 +164,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       {/* Turntable / Watch Video and Telemetry Split */}
       <section className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
         {/* Left (wider): Turntable + Watch Video Tab */}
-        <div className="lg:col-span-7 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-5 flex flex-col justify-between gap-4">
+        <div className="lg:col-span-7 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-4 sm:p-5 flex flex-col justify-between gap-4">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#1E2028] pb-3">
             <div
               role="tablist"

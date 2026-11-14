@@ -16,7 +16,10 @@ export const VinylTurntable: React.FC<VinylTurntableProps> = ({
   size = 'md',
 }) => {
   const [rpm, setRpm] = useState<'33' | '45'>('33');
-  const platterSize = size === 'lg' ? 'h-64 w-64 sm:h-76 sm:w-76' : 'h-56 w-56 sm:h-64 sm:w-64';
+  const platterSize =
+    size === 'lg'
+      ? 'h-[min(62vw,18rem)] w-[min(62vw,18rem)] sm:h-76 sm:w-76'
+      : 'h-[min(56vw,15rem)] w-[min(56vw,15rem)] sm:h-64 sm:w-64';
 
   return (
     <div className="flex flex-col items-center">
@@ -92,17 +95,17 @@ export const VinylTurntable: React.FC<VinylTurntableProps> = ({
         {/* Metallic Tonearm with Glowing Crimson Stylus */}
         <div
           aria-hidden="true"
-          className="pointer-events-none absolute right-4 top-4 sm:right-8 sm:top-5 origin-[22px_22px] transition-transform duration-500 ease-out"
+          className="pointer-events-none absolute right-2.5 top-3 sm:right-8 sm:top-5 origin-[22px_22px] transition-transform duration-500 ease-out"
           style={{
             transform: isPlaying ? 'rotate(24deg)' : 'rotate(-6deg)',
           }}
         >
           {/* Pivot Gimbal Base */}
-          <div className="relative h-11 w-11 rounded-full border border-[#3B3F4E] bg-[#1A1C24] shadow-md">
+          <div className="relative h-10 w-10 sm:h-11 sm:w-11 rounded-full border border-[#3B3F4E] bg-[#1A1C24] shadow-md">
             <div className="absolute inset-2 rounded-full border border-[#52576B] bg-[#282B36]" />
             {/* Metallic Arm Tube */}
             <div
-              className="absolute left-[19px] top-[22px] h-32 sm:h-36 w-1.5 rounded-full bg-gradient-to-b from-[#9CA3AF] via-[#D1D5DB] to-[#6B7280] shadow-md"
+              className="absolute left-[17px] top-[20px] sm:left-[19px] sm:top-[22px] h-24 min-[400px]:h-28 sm:h-36 w-1.5 rounded-full bg-gradient-to-b from-[#9CA3AF] via-[#D1D5DB] to-[#6B7280] shadow-md"
               style={{ transform: 'rotate(8deg)', transformOrigin: 'top center' }}
             >
               {/* Headshell + Stylus */}

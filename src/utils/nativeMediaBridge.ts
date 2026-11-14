@@ -1,3 +1,20 @@
+export interface NativeFolderFileEntry {
+  uri: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  lastModified: number;
+  folderPath: string;
+}
+
+export interface NativeFolderPickResult {
+  ok: boolean;
+  cancelled: boolean;
+  rootFolder: string;
+  files: NativeFolderFileEntry[];
+  error?: string;
+}
+
 export interface NativeMediaBridgeApi {
   updateNowPlaying: (
     title: string,
@@ -13,6 +30,8 @@ export interface NativeMediaBridgeApi {
   setVideoModeActive: (active: boolean) => void;
   requestNotificationPermission: () => void;
   fetchUrlAsync?: (requestId: string, urlString: string) => void;
+  pickFolderNative?: (requestId: string) => void;
+  readDocumentChunkBase64?: (uriString: string, offset: number, length: number) => string;
 }
 
 export type NativeMediaActionDetail =
@@ -37,14 +56,32 @@ export function hasNativeHttpBridge(): boolean {
   return typeof window !== 'undefined' && typeof window.KaGoNative?.fetchUrlAsync === 'function';
 }
 
-function decodeBase64Utf8(base64: string): string {
-  if (!base64) return '';
+export function hasNativeFolderPicker(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.KaGoNative?.pickFolderNative === 'function' &&
+    typeof window.KaGoNative?.readDocumentChunkBase64 === 'function'
+  );
+}
+
+export function decodeBase64ToBytes(base64: string): Uint8Array {
+  if (!base64) return new Uint8Array(0);
   try {
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) {
       bytes[i] = binary.charCodeAt(i);
     }
+    return bytes;
+  } catch {
+    return new Uint8Array(0);
+  }
+}
+
+function decodeBase64Utf8(base64: string): string {
+  const bytes = decodeBase64ToBytes(base64);
+  if (bytes.length === 0) return '';
+  try {
     return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
   } catch {
     return '';
@@ -106,6 +143,95 @@ export function nativeFetchText(
       }
     }
   });
+}
+
+export function pickNativeFolder(timeoutMs = 180000): Promise<NativeFolderPickResult | null> {
+  if (!hasNativeFolderPicker()) {
+    return Promise.resolve(null);
+  }
+
+  const requestId = `folder-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const cleanup = () => {
+      window.removeEventListener('kago-native-folder', onFolderEvent);
+      window.clearTimeout(timer);
+    };
+
+    const onFolderEvent = (ev: Event) => {
+      const detail = (ev as CustomEvent<NativeFolderPickResult & { requestId?: string }>)?.detail;
+      if (!detail || detail.requestId !== requestId || settled) return;
+      settled = true;
+      cleanup();
+      resolve({
+        ok: Boolean(detail.ok),
+        cancelled: Boolean(detail.cancelled),
+        rootFolder: detail.rootFolder || 'Picked Folder',
+        files: Array.isArray(detail.files) ? detail.files : [],
+        error: detail.error || undefined,
+      });
+    };
+
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('kago-native-folder', onFolderEvent);
+      resolve({
+        ok: false,
+        cancelled: false,
+        rootFolder: '',
+        files: [],
+        error: 'Folder scan timed out.',
+      });
+    }, timeoutMs);
+
+    window.addEventListener('kago-native-folder', onFolderEvent);
+    try {
+      window.KaGoNative?.pickFolderNative?.(requestId);
+    } catch {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        resolve(null);
+      }
+    }
+  });
+}
+
+export function readNativeDocumentBytes(uri: string, expectedSize = 0): Uint8Array | null {
+  const reader = typeof window !== 'undefined' ? window.KaGoNative?.readDocumentChunkBase64 : undefined;
+  if (typeof reader !== 'function') return null;
+
+  const MAX_IMPORT_BYTES = 35 * 1024 * 1024;
+  const CHUNK_SIZE = 512 * 1024;
+  const limit = expectedSize > 0 ? Math.min(expectedSize, MAX_IMPORT_BYTES) : MAX_IMPORT_BYTES;
+
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let offset = 0;
+
+  while (offset < limit) {
+    const reqLen = Math.min(CHUNK_SIZE, limit - offset);
+    const b64 = reader(uri, offset, reqLen);
+    if (!b64) break;
+    const part = decodeBase64ToBytes(b64);
+    if (part.length === 0) break;
+    chunks.push(part);
+    total += part.length;
+    offset += part.length;
+    if (part.length < reqLen) break;
+  }
+
+  if (total === 0) return null;
+  const combined = new Uint8Array(total);
+  let pos = 0;
+  for (const part of chunks) {
+    combined.set(part, pos);
+    pos += part.length;
+  }
+  return combined;
 }
 
 export function syncNativeNowPlaying(params: {

@@ -1,11 +1,15 @@
 package com.kagoplay.workstation;
 
+import android.app.Activity;
 import android.app.PictureInPictureParams;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.database.Cursor;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.DocumentsContract;
 import android.util.Base64;
 import android.util.Rational;
 import android.webkit.JavascriptInterface;
@@ -17,22 +21,42 @@ import androidx.core.content.ContextCompat;
 
 import com.getcapacitor.BridgeActivity;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.regex.Pattern;
 
 public class MainActivity extends BridgeActivity {
     private static final int REQ_POST_NOTIFICATIONS = 8801;
+    private static final int REQ_PICK_FOLDER = 8802;
+    private static final int MAX_FOLDER_SCAN_DEPTH = 10;
+    private static final int MAX_FOLDER_AUDIO_FILES = 500;
+    private static final Pattern AUDIO_EXT_PATTERN =
+        Pattern.compile("\\.(mp3|flac|wav|ogg|m4a|aac|opus|webm|wma|aiff)$", Pattern.CASE_INSENSITIVE);
+
     private static WeakReference<MainActivity> activeInstance = new WeakReference<>(null);
 
     private volatile boolean isVideoModeActive = false;
     private boolean bridgeAttached = false;
+    private volatile String pendingFolderRequestId = null;
     private final ExecutorService networkExecutor = Executors.newFixedThreadPool(4);
+    private final Set<String> allowedDocumentUris =
+        Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
@@ -70,6 +94,158 @@ public class MainActivity extends BridgeActivity {
         }
         webView.addJavascriptInterface(new KaGoNativeBridge(), "KaGoNative");
         bridgeAttached = true;
+    }
+
+    @Override
+    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQ_PICK_FOLDER) {
+            final String reqId = pendingFolderRequestId;
+            pendingFolderRequestId = null;
+            if (reqId == null) return;
+
+            if (resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
+                emitFolderEvent(reqId, false, true, "", new JSONArray(), "");
+                return;
+            }
+
+            final Uri treeUri = data.getData();
+            try {
+                getContentResolver().takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                );
+            } catch (Exception ignored) {
+            }
+
+            networkExecutor.execute(() -> scanDocumentTreeAndEmit(reqId, treeUri));
+            return;
+        }
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    private void scanDocumentTreeAndEmit(String requestId, Uri treeUri) {
+        try {
+            String treeDocId = DocumentsContract.getTreeDocumentId(treeUri);
+            String rootFolder = "Picked Folder";
+            if (treeDocId != null) {
+                int colon = treeDocId.lastIndexOf(':');
+                String rel = colon >= 0 ? treeDocId.substring(colon + 1) : treeDocId;
+                if (!rel.isEmpty()) {
+                    String[] segs = rel.split("/");
+                    if (segs.length > 0 && !segs[segs.length - 1].isEmpty()) {
+                        rootFolder = segs[segs.length - 1];
+                    }
+                }
+            }
+
+            String[] projection = new String[]{
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_LAST_MODIFIED
+            };
+
+            JSONArray filesArray = new JSONArray();
+            Set<String> visitedDocs = new HashSet<>();
+            Deque<String[]> queue = new ArrayDeque<>();
+            queue.add(new String[]{treeDocId, rootFolder, "0"});
+
+            while (!queue.isEmpty() && filesArray.length() < MAX_FOLDER_AUDIO_FILES) {
+                String[] node = queue.poll();
+                if (node == null) continue;
+                String currentDocId = node[0];
+                String currentPath = node[1];
+                int depth = Integer.parseInt(node[2]);
+
+                if (currentDocId == null || !visitedDocs.add(currentDocId)) continue;
+
+                Uri childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, currentDocId);
+                try (Cursor cursor = getContentResolver().query(childrenUri, projection, null, null, null)) {
+                    if (cursor == null) continue;
+                    int idxId = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID);
+                    int idxName = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME);
+                    int idxMime = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE);
+                    int idxSize = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE);
+                    int idxMod = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED);
+
+                    while (cursor.moveToNext() && filesArray.length() < MAX_FOLDER_AUDIO_FILES) {
+                        String childId = idxId >= 0 ? cursor.getString(idxId) : null;
+                        String name = idxName >= 0 ? cursor.getString(idxName) : null;
+                        String mime = idxMime >= 0 ? cursor.getString(idxMime) : null;
+                        long size = (idxSize >= 0 && !cursor.isNull(idxSize)) ? cursor.getLong(idxSize) : 0L;
+                        long lastMod = (idxMod >= 0 && !cursor.isNull(idxMod)) ? cursor.getLong(idxMod) : System.currentTimeMillis();
+
+                        if (childId == null || name == null || name.startsWith(".")) continue;
+
+                        if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) {
+                            if (depth < MAX_FOLDER_SCAN_DEPTH) {
+                                queue.add(new String[]{
+                                    childId,
+                                    currentPath + "/" + name,
+                                    String.valueOf(depth + 1)
+                                });
+                            }
+                            continue;
+                        }
+
+                        String lowerMime = mime != null ? mime.toLowerCase(Locale.US) : "";
+                        boolean isAudio =
+                            lowerMime.startsWith("audio/") ||
+                            "application/ogg".equals(lowerMime) ||
+                            AUDIO_EXT_PATTERN.matcher(name).find();
+
+                        if (!isAudio) continue;
+
+                        Uri childUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId);
+                        String uriString = childUri.toString();
+                        allowedDocumentUris.add(uriString);
+
+                        JSONObject fileObj = new JSONObject();
+                        fileObj.put("uri", uriString);
+                        fileObj.put("name", name);
+                        fileObj.put("mimeType", lowerMime.isEmpty() ? "audio/mpeg" : lowerMime);
+                        fileObj.put("size", size);
+                        fileObj.put("lastModified", lastMod);
+                        fileObj.put("folderPath", currentPath);
+                        filesArray.put(fileObj);
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+
+            emitFolderEvent(requestId, true, false, rootFolder, filesArray, "");
+        } catch (Exception ex) {
+            emitFolderEvent(
+                requestId,
+                false,
+                false,
+                "",
+                new JSONArray(),
+                ex.getMessage() != null ? ex.getMessage() : "Unable to read folder contents."
+            );
+        }
+    }
+
+    private void emitFolderEvent(
+        String requestId,
+        boolean ok,
+        boolean cancelled,
+        String rootFolder,
+        JSONArray files,
+        String error
+    ) {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("requestId", requestId);
+            payload.put("ok", ok);
+            payload.put("cancelled", cancelled);
+            payload.put("rootFolder", rootFolder);
+            payload.put("files", files);
+            payload.put("error", error);
+            dispatchJsEvent("kago-native-folder", payload.toString());
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
@@ -121,15 +297,6 @@ public class MainActivity extends BridgeActivity {
             String js = "window.dispatchEvent(new CustomEvent('" + eventName + "',{detail:" + detailJson + "}));";
             webView.evaluateJavascript(js, null);
         });
-    }
-
-    private static String escapeJsonString(String input) {
-        if (input == null) return "";
-        return input
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "")
-            .replace("\r", "");
     }
 
     private static boolean isAllowedFetchUrl(String urlString) {
@@ -246,11 +413,84 @@ public class MainActivity extends BridgeActivity {
         }
 
         @JavascriptInterface
+        public void pickFolderNative(final String requestId) {
+            pendingFolderRequestId = requestId;
+            runOnUiThread(() -> {
+                try {
+                    Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                    intent.addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                            | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+                    );
+                    intent.putExtra("android.provider.extra.SHOW_ADVANCED", true);
+                    startActivityForResult(intent, REQ_PICK_FOLDER);
+                } catch (Exception ex) {
+                    pendingFolderRequestId = null;
+                    emitFolderEvent(
+                        requestId,
+                        false,
+                        false,
+                        "",
+                        new JSONArray(),
+                        "Native folder picker unavailable."
+                    );
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public String readDocumentChunkBase64(
+            final String uriString,
+            final long offset,
+            final int length
+        ) {
+            if (uriString == null || !allowedDocumentUris.contains(uriString) || length <= 0) {
+                return "";
+            }
+            int safeLength = Math.min(length, 2 * 1024 * 1024);
+            try (InputStream stream = getContentResolver().openInputStream(Uri.parse(uriString))) {
+                if (stream == null) return "";
+
+                long remaining = Math.max(0L, offset);
+                byte[] drain = new byte[8192];
+                while (remaining > 0) {
+                    long skipped = stream.skip(remaining);
+                    if (skipped > 0) {
+                        remaining -= skipped;
+                    } else {
+                        int read = stream.read(drain, 0, (int) Math.min(drain.length, remaining));
+                        if (read <= 0) break;
+                        remaining -= read;
+                    }
+                }
+
+                byte[] chunk = new byte[safeLength];
+                int totalRead = 0;
+                while (totalRead < safeLength) {
+                    int n = stream.read(chunk, totalRead, safeLength - totalRead);
+                    if (n <= 0) break;
+                    totalRead += n;
+                }
+                if (totalRead <= 0) return "";
+                return Base64.encodeToString(chunk, 0, totalRead, Base64.NO_WRAP);
+            } catch (Exception ex) {
+                return "";
+            }
+        }
+
+        @JavascriptInterface
         public void fetchUrlAsync(final String requestId, final String urlString) {
             if (!isAllowedFetchUrl(urlString)) {
-                String errJson = "{\"requestId\":\"" + escapeJsonString(requestId)
-                    + "\",\"ok\":false,\"status\":403,\"bodyBase64\":\"\"}";
-                dispatchJsEvent("kago-native-http", errJson);
+                try {
+                    JSONObject err = new JSONObject();
+                    err.put("requestId", requestId);
+                    err.put("ok", false);
+                    err.put("status", 403);
+                    err.put("bodyBase64", "");
+                    dispatchJsEvent("kago-native-http", err.toString());
+                } catch (Exception ignored) {
+                }
                 return;
             }
 
@@ -292,17 +532,26 @@ public class MainActivity extends BridgeActivity {
                     byte[] rawBytes = buffer.toByteArray();
                     String b64 = Base64.encodeToString(rawBytes, Base64.NO_WRAP);
                     boolean ok = status >= 200 && status < 300;
-                    String detail = "{\"requestId\":\"" + escapeJsonString(requestId)
-                        + "\",\"ok\":" + ok
-                        + ",\"status\":" + status
-                        + ",\"bodyBase64\":\"" + b64 + "\"}";
-                    dispatchJsEvent("kago-native-http", detail);
+                    JSONObject detail = new JSONObject();
+                    detail.put("requestId", requestId);
+                    detail.put("ok", ok);
+                    detail.put("status", status);
+                    detail.put("bodyBase64", b64);
+                    dispatchJsEvent("kago-native-http", detail.toString());
                 } catch (Exception ex) {
-                    String emptyB64 = Base64.encodeToString("".getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
-                    String detail = "{\"requestId\":\"" + escapeJsonString(requestId)
-                        + "\",\"ok\":false,\"status\":" + status
-                        + ",\"bodyBase64\":\"" + emptyB64 + "\"}";
-                    dispatchJsEvent("kago-native-http", detail);
+                    try {
+                        String emptyB64 = Base64.encodeToString(
+                            "".getBytes(StandardCharsets.UTF_8),
+                            Base64.NO_WRAP
+                        );
+                        JSONObject detail = new JSONObject();
+                        detail.put("requestId", requestId);
+                        detail.put("ok", false);
+                        detail.put("status", status);
+                        detail.put("bodyBase64", emptyB64);
+                        dispatchJsEvent("kago-native-http", detail.toString());
+                    } catch (Exception ignored) {
+                    }
                 } finally {
                     if (conn != null) {
                         conn.disconnect();

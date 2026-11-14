@@ -44,17 +44,17 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
   return (
     <div
       data-testid="floating-mini-player"
-      className="fixed inset-x-3 bottom-[64px] md:bottom-4 md:inset-x-auto md:left-1/2 md:-translate-x-1/2 md:w-full md:max-w-4xl z-30 overflow-hidden rounded-xl border border-[#262936] bg-[#0C0D12]/95 backdrop-blur-md shadow-[0_16px_48px_rgba(0,0,0,0.8)]"
+      className="fixed inset-x-2.5 sm:inset-x-3 bottom-[calc(58px+env(safe-area-inset-bottom))] md:bottom-4 md:inset-x-auto md:left-1/2 md:-translate-x-1/2 md:w-full md:max-w-4xl z-30 overflow-hidden rounded-xl border border-[#262936] bg-[#0C0D12]/95 backdrop-blur-md shadow-[0_16px_48px_rgba(0,0,0,0.8)]"
     >
-      {/* Top Crimson Progress Line */}
-      <div className="h-0.5 w-full bg-[#1C1E26]">
+      {/* Top Crimson (played) / White (unplayed) Progress Line */}
+      <div className="h-0.5 w-full bg-white/85">
         <div
-          className="h-full bg-gradient-to-r from-[#E11D48] to-[#FF5A5F] shadow-[0_0_8px_#E11D48] transition-[width] duration-150"
+          className="h-full bg-[#E11D48] shadow-[0_0_8px_#E11D48] transition-[width] duration-150"
           style={{ width: `${progressPct}%` }}
         />
       </div>
 
-      <div className="flex items-center justify-between gap-3 px-3 py-2.5 sm:px-4">
+      <div className="flex items-center justify-between gap-2 sm:gap-3 px-2.5 py-2 sm:px-4 sm:py-2.5">
         {/* Track Info Trigger -> Opens Fullscreen Player */}
         <button
           type="button"

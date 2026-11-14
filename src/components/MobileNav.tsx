@@ -1,5 +1,5 @@
 import React from 'react';
-import { FolderSearch, LayoutDashboard, Library, Mic2, Radio } from 'lucide-react';
+import { LayoutDashboard, Library, Radio, Search, Settings } from 'lucide-react';
 import type { ActiveTab } from '../types/audio';
 
 interface MobileNavProps {
@@ -15,8 +15,8 @@ const MOBILE_ITEMS: Array<{
   { id: 'dashboard', label: 'Dashboard', Icon: LayoutDashboard },
   { id: 'stream', label: 'Stream', Icon: Radio },
   { id: 'library', label: 'Library', Icon: Library },
-  { id: 'scanner', label: 'Scanner', Icon: FolderSearch },
-  { id: 'lyrics', label: 'Lyrics', Icon: Mic2 },
+  { id: 'settings', label: 'Settings', Icon: Settings },
+  { id: 'search', label: 'Search', Icon: Search },
 ];
 
 export const MobileNav: React.FC<MobileNavProps> = ({ activeTab, onSelectTab }) => {
