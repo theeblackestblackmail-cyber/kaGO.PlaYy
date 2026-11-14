@@ -284,6 +284,7 @@ public class MainActivity extends BridgeActivity {
     }
 
     private void keepWebViewAwakeNow() {
+        if (isFinishing() || isDestroyed()) return;
         if (!KaGoMediaService.isCurrentlyPlaying || getBridge() == null || getBridge().getWebView() == null) {
             return;
         }
@@ -302,14 +303,16 @@ public class MainActivity extends BridgeActivity {
     }
 
     private void scheduleBackgroundKeepalive(final String phase) {
-        if (!KaGoMediaService.isCurrentlyPlaying) return;
+        if (isFinishing() || isChangingConfigurations() || !KaGoMediaService.isCurrentlyPlaying) {
+            return;
+        }
         keepWebViewAwakeNow();
         dispatchJsEvent("kago-native-keepalive", "{\"phase\":\"" + phase + "\"}");
 
         final long[] delays = new long[]{160L, 520L, 1200L, 2400L};
         for (final long delay : delays) {
             mainHandler.postDelayed(() -> {
-                if (!KaGoMediaService.isCurrentlyPlaying) return;
+                if (isFinishing() || isDestroyed() || !KaGoMediaService.isCurrentlyPlaying) return;
                 keepWebViewAwakeNow();
                 dispatchJsEvent("kago-native-keepalive", "{\"phase\":\"" + phase + "_retry\"}");
             }, delay);
@@ -327,14 +330,6 @@ public class MainActivity extends BridgeActivity {
     public void onStop() {
         super.onStop();
         scheduleBackgroundKeepalive("stop");
-    }
-
-    @Override
-    public void onWindowFocusChanged(boolean hasFocus) {
-        super.onWindowFocusChanged(hasFocus);
-        if (!hasFocus && KaGoMediaService.isCurrentlyPlaying) {
-            scheduleBackgroundKeepalive("blur");
-        }
     }
 
     @Override

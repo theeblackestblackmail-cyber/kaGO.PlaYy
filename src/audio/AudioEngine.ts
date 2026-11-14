@@ -420,9 +420,8 @@ class DualChannelAudioEngine {
     if (this.ytActive && this.ytPlayer && this.ytReady) {
       try {
         const state = this.ytPlayer.getPlayerState();
-        const statePlaying = window.YT?.PlayerState?.PLAYING ?? 1;
-        const stateBuffering = window.YT?.PlayerState?.BUFFERING ?? 3;
-        if (state !== statePlaying && state !== stateBuffering) {
+        const statePaused = window.YT?.PlayerState?.PAUSED ?? 2;
+        if (state === statePaused) {
           this.ytPlayer.playVideo();
         }
       } catch {
@@ -1249,7 +1248,6 @@ class DualChannelAudioEngine {
         if (alreadyMounted) {
           try {
             player.loadVideoById(track.youtubeId, 0);
-            player.playVideo();
           } catch {
             void this.recoverActiveYouTubeTrack(track, seq);
             return;
