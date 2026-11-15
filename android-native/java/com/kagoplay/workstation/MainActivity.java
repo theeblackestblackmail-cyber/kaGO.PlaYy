@@ -360,6 +360,16 @@ public class MainActivity extends BridgeActivity {
         activity.dispatchJsEvent("kago-native-media", detail);
     }
 
+    public static void pingBackgroundKeepalive() {
+        MainActivity activity = activeInstance.get();
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
+        activity.mainHandler.post(() -> {
+            if (!KaGoMediaService.isCurrentlyPlaying) return;
+            activity.keepWebViewAwakeNow();
+            activity.dispatchJsEvent("kago-native-keepalive", "{\"phase\":\"service_heartbeat\"}");
+        });
+    }
+
     private void dispatchJsEvent(final String eventName, final String detailJson) {
         if (getBridge() == null || getBridge().getWebView() == null) return;
         final WebView webView = getBridge().getWebView();

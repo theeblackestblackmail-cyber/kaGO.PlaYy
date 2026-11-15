@@ -1,6 +1,8 @@
 import express from 'express';
 import http from 'node:http';
 import path from 'node:path';
+import { Readable } from 'node:stream';
+import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
@@ -687,22 +689,59 @@ async function startServer() {
         return res.status(403).send('Host not permitted');
       }
 
-      const upstream = await fetch(parsed.toString(), {
-        signal: AbortSignal.timeout(10000),
-        redirect: 'follow',
-      });
-      if (!upstream.ok || !upstream.body) {
-        return res.status(502).send('Upstream error');
+      const connectCtrl = new AbortController();
+      const connectTimer = setTimeout(() => connectCtrl.abort(), 12000);
+      const forwardHeaders: Record<string, string> = {};
+      if (typeof req.headers.range === 'string' && req.headers.range) {
+        forwardHeaders.Range = req.headers.range;
       }
+
+      let upstream: Response;
+      try {
+        upstream = await fetch(parsed.toString(), {
+          signal: connectCtrl.signal,
+          redirect: 'follow',
+          headers: forwardHeaders,
+        });
+      } finally {
+        clearTimeout(connectTimer);
+      }
+
+      if ((!upstream.ok && upstream.status !== 206) || !upstream.body) {
+        return res.status(upstream.status === 416 ? 416 : 502).send('Upstream error');
+      }
+
       const contentType = upstream.headers.get('content-type') || 'audio/mpeg';
+      const contentLength = upstream.headers.get('content-length');
+      const contentRange = upstream.headers.get('content-range');
+      const acceptRanges = upstream.headers.get('accept-ranges') || 'bytes';
+
+      res.status(upstream.status);
       res.setHeader('Content-Type', contentType);
+      res.setHeader('Accept-Ranges', acceptRanges);
+      if (contentLength) res.setHeader('Content-Length', contentLength);
+      if (contentRange) res.setHeader('Content-Range', contentRange);
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Cache-Control', 'public, max-age=3600');
 
-      const arrayBuffer = await upstream.arrayBuffer();
-      return res.send(Buffer.from(arrayBuffer));
+      const nodeStream = Readable.fromWeb(upstream.body as unknown as NodeReadableStream);
+      const abortUpstream = () => {
+        nodeStream.destroy();
+      };
+      req.on('close', abortUpstream);
+      nodeStream.on('error', () => {
+        if (!res.headersSent) {
+          res.status(502).end('Stream interrupted');
+        } else {
+          res.end();
+        }
+      });
+      return nodeStream.pipe(res);
     } catch {
-      return res.status(502).send('Proxy failed');
+      if (!res.headersSent) {
+        return res.status(502).send('Proxy failed');
+      }
+      return res.end();
     }
   });
 

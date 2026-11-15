@@ -302,4 +302,48 @@ export const localDb = {
     }
     return updated;
   },
+
+  loadPlayCounts(): Record<string, number> {
+    try {
+      const raw = localStorage.getItem('kagoplay_play_counts');
+      if (!raw) return {};
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const clean: Record<string, number> = {};
+      for (const [key, val] of Object.entries(parsed)) {
+        if (typeof val === 'number' && Number.isFinite(val) && val > 0) {
+          clean[key] = Math.floor(val);
+        }
+      }
+      return clean;
+    } catch {
+      return {};
+    }
+  },
+
+  incrementPlayCount(trackId: string): Record<string, number> {
+    const counts = this.loadPlayCounts();
+    counts[trackId] = (counts[trackId] || 0) + 1;
+    try {
+      localStorage.setItem('kagoplay_play_counts', JSON.stringify(counts));
+    } catch {
+      // Ignore
+    }
+    return counts;
+  },
+
+  loadSmartShuffle(): boolean {
+    try {
+      return localStorage.getItem('kagoplay_smart_shuffle') === 'true';
+    } catch {
+      return false;
+    }
+  },
+
+  saveSmartShuffle(enabled: boolean): void {
+    try {
+      localStorage.setItem('kagoplay_smart_shuffle', String(enabled));
+    } catch {
+      // Ignore
+    }
+  },
 };

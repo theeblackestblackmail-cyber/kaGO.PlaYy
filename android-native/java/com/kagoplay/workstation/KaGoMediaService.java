@@ -12,7 +12,9 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.wifi.WifiManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.session.MediaSessionCompat;
@@ -42,6 +44,15 @@ public class KaGoMediaService extends Service {
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
+    private final Handler keepaliveHandler = new Handler(Looper.getMainLooper());
+    private final Runnable keepaliveRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isCurrentlyPlaying || !isServiceRunning) return;
+            MainActivity.pingBackgroundKeepalive();
+            keepaliveHandler.postDelayed(this, 12000L);
+        }
+    };
 
     private String currentTitle = "kaGO.PIaY";
     private String currentArtist = "Offline Audio Engine";
@@ -138,7 +149,9 @@ public class KaGoMediaService extends Service {
 
                 if (currentIsPlaying) {
                     acquireWakeAndWifiLocks();
+                    startKeepaliveHeartbeat();
                 } else {
+                    stopKeepaliveHeartbeat();
                     releaseWakeAndWifiLocks();
                 }
 
@@ -165,6 +178,7 @@ public class KaGoMediaService extends Service {
     public void onDestroy() {
         isServiceRunning = false;
         isCurrentlyPlaying = false;
+        stopKeepaliveHeartbeat();
         releaseWakeAndWifiLocks();
         artworkExecutor.shutdownNow();
         if (mediaSession != null) {
@@ -172,6 +186,15 @@ public class KaGoMediaService extends Service {
             mediaSession.release();
         }
         super.onDestroy();
+    }
+
+    private void startKeepaliveHeartbeat() {
+        keepaliveHandler.removeCallbacks(keepaliveRunnable);
+        keepaliveHandler.postDelayed(keepaliveRunnable, 12000L);
+    }
+
+    private void stopKeepaliveHeartbeat() {
+        keepaliveHandler.removeCallbacks(keepaliveRunnable);
     }
 
     @Override

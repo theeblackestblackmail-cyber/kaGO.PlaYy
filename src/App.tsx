@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Radio, WifiOff, X } from 'lucide-react';
 import { audioEngine } from './audio/AudioEngine';
 import { DashboardView } from './components/DashboardView';
 import { DspStudioModal } from './components/DspStudioModal';
@@ -43,6 +44,14 @@ import {
   mergeAutoplayQueue,
   reorderQueueItems,
 } from './utils/streamFilter';
+import {
+  evaluatePoorConnectionState,
+  POOR_CONNECTION_THRESHOLD_MS,
+  reorderMultipleQueueItems,
+  restoreQueueOrder,
+  selectSmartLibraryTracks,
+  shuffleQueuePreservingCurrent,
+} from './utils/queueUtils';
 import { fetchSyncedLyricsForTrack } from './utils/lyricsFetcher';
 import { triggerHaptic } from './utils/haptics';
 import { fetchRelatedRadioTracks } from './utils/streamRadio';
@@ -80,6 +89,12 @@ export default function App() {
       return true;
     }
   });
+  const [shuffleEnabled, setShuffleEnabled] = useState(false);
+  const [preShuffleOrderIds, setPreShuffleOrderIds] = useState<string[] | null>(null);
+  const [smartShuffleEnabled, setSmartShuffleEnabled] = useState<boolean>(() =>
+    localDb.loadSmartShuffle()
+  );
+  const [showOfflineSwitchPrompt, setShowOfflineSwitchPrompt] = useState(false);
   const [isFetchingRadio, setIsFetchingRadio] = useState(false);
   const [isFetchingLyrics, setIsFetchingLyrics] = useState(false);
   const [lyricsHydrated, setLyricsHydrated] = useState(false);
@@ -98,6 +113,13 @@ export default function App() {
   const playedHistoryIdsRef = useRef<Set<string>>(new Set());
   const fetchingLyricsIdsRef = useRef<Set<string>>(new Set());
   const attemptedLyricsIdsRef = useRef<Set<string>>(new Set());
+  const lastStreamProgressRef = useRef<{ trackId: string | null; time: number; atMs: number }>({
+    trackId: null,
+    time: 0,
+    atMs: 0,
+  });
+  const badConnSinceRef = useRef<number | null>(null);
+  const dismissedBadSinceRef = useRef<number | null>(null);
 
   // Hydrate offline DB on startup
   useEffect(() => {
@@ -146,6 +168,20 @@ export default function App() {
     return [cur, ...allLibraryTracks];
   }, [allLibraryTracks, engine.currentTrack]);
 
+  const appendSmartLibraryQueue = useCallback(
+    (baseQueue: Track[], extraExcludeIds: string[] = [], limit = 6): Track[] => {
+      const counts = localDb.loadPlayCounts();
+      const exclude = new Set<string>([
+        ...baseQueue.map((t) => t.id),
+        ...extraExcludeIds,
+      ]);
+      const picks = selectSmartLibraryTracks(allLibraryTracks, counts, exclude, limit);
+      if (picks.length === 0) return baseQueue;
+      return [...baseQueue, ...picks];
+    },
+    [allLibraryTracks]
+  );
+
   const populateRelatedRadio = useCallback(
     async (seedTrack: Track, replaceExistingAuto: boolean) => {
       if (!autoplayRadioEnabled || seedTrack.source !== 'stream') return;
@@ -154,20 +190,31 @@ export default function App() {
       try {
         const excludeIds = Array.from(playedHistoryIdsRef.current);
         const related = await fetchRelatedRadioTracks(seedTrack, excludeIds);
-        if (epoch !== radioSeedEpochRef.current || related.length === 0) return;
-        setQueue((prev) =>
-          mergeAutoplayQueue(prev, seedTrack, related, {
-            replaceExistingAuto,
-            maxAutoTracks: 10,
-          })
-        );
+        if (epoch !== radioSeedEpochRef.current) return;
+        const counts = localDb.loadPlayCounts();
+        setQueue((prev) => {
+          const withRelated =
+            related.length > 0
+              ? mergeAutoplayQueue(prev, seedTrack, related, {
+                  replaceExistingAuto,
+                  maxAutoTracks: smartShuffleEnabled ? 6 : 10,
+                })
+              : prev;
+          if (!smartShuffleEnabled) return withRelated;
+          const exclude = new Set<string>([
+            ...withRelated.map((t) => t.id),
+            ...excludeIds,
+          ]);
+          const smartPicks = selectSmartLibraryTracks(allLibraryTracks, counts, exclude, 4);
+          return smartPicks.length > 0 ? [...withRelated, ...smartPicks] : withRelated;
+        });
       } finally {
         if (epoch === radioSeedEpochRef.current) {
           setIsFetchingRadio(false);
         }
       }
     },
-    [autoplayRadioEnabled]
+    [autoplayRadioEnabled, smartShuffleEnabled, allLibraryTracks]
   );
 
   const playTrack = useCallback(
@@ -188,27 +235,43 @@ export default function App() {
           });
         } else {
           // User explicitly picked a new song to stream -> seed Spotify-style related queue
+          setShuffleEnabled(false);
+          setPreShuffleOrderIds(null);
           setQueue((prev) => {
             const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
             const preserved = prev.filter(
               (t) => t.id !== track.id && !t.autoQueued && !stemIds.has(t.id)
             );
-            return [track, ...preserved];
+            const seeded = [track, ...preserved];
+            if (smartShuffleEnabled && !autoplayRadioEnabled) {
+              return appendSmartLibraryQueue(seeded, [track.id], 6);
+            }
+            return seeded;
           });
           void populateRelatedRadio(track, true);
         }
       } else {
         setQueue((prev) => {
           const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
+          let next: Track[];
           if (track.source === 'local' && prev.every((t) => stemIds.has(t.id))) {
-            return [track];
+            next = [track];
+          } else {
+            next = prev.some((t) => t.id === track.id) ? prev : [...prev, track];
           }
-          return prev.some((t) => t.id === track.id) ? prev : [...prev, track];
+          if (smartShuffleEnabled) {
+            const idx = next.findIndex((t) => t.id === track.id);
+            const remaining = idx >= 0 ? next.length - 1 - idx : 0;
+            if (remaining <= 2) {
+              return appendSmartLibraryQueue(next, [track.id], 6);
+            }
+          }
+          return next;
         });
       }
       void audioEngine.playTrack(track);
     },
-    [populateRelatedRadio]
+    [populateRelatedRadio, smartShuffleEnabled, autoplayRadioEnabled, appendSmartLibraryQueue]
   );
 
   const playCollection = useCallback((tracks: Track[], startIndex = 0) => {
@@ -216,6 +279,8 @@ export default function App() {
     if (!startTrack) return;
     triggerHaptic('selection');
     playedHistoryIdsRef.current.add(startTrack.id);
+    setShuffleEnabled(false);
+    setPreShuffleOrderIds(null);
     setQueue(nextQueue);
     void audioEngine.playTrack(startTrack);
   }, []);
@@ -233,6 +298,64 @@ export default function App() {
       return reordered;
     });
   }, []);
+
+  const handleReorderMultipleQueue = useCallback(
+    (selectedIndices: number[], targetIndex: number, draggedAnchorIndex?: number) => {
+      triggerHaptic('medium', 12);
+      setQueue((prev) => {
+        const reordered = reorderMultipleQueueItems(
+          prev,
+          selectedIndices,
+          targetIndex,
+          draggedAnchorIndex
+        );
+        const movedIds = new Set(selectedIndices.map((idx) => prev[idx]?.id).filter(Boolean));
+        return reordered.map((item) =>
+          item.autoQueued && movedIds.has(item.id) ? { ...item, autoQueued: false } : item
+        );
+      });
+    },
+    []
+  );
+
+  const handleToggleShuffle = useCallback(() => {
+    setShuffleEnabled((prevEnabled) => {
+      if (!prevEnabled) {
+        triggerHaptic('selection');
+        setQueue((currentQueue) => {
+          const { shuffledQueue, originalOrderIds } = shuffleQueuePreservingCurrent(
+            currentQueue,
+            engine.currentTrack?.id
+          );
+          setPreShuffleOrderIds(originalOrderIds);
+          return shuffledQueue;
+        });
+        return true;
+      }
+      triggerHaptic('light');
+      setQueue((currentQueue) => restoreQueueOrder(currentQueue, preShuffleOrderIds));
+      setPreShuffleOrderIds(null);
+      return false;
+    });
+  }, [engine.currentTrack?.id, preShuffleOrderIds]);
+
+  const handleToggleSmartShuffle = useCallback(() => {
+    setSmartShuffleEnabled((prev) => {
+      const next = !prev;
+      triggerHaptic(next ? 'selection' : 'light');
+      localDb.saveSmartShuffle(next);
+      if (next) {
+        setQueue((currentQueue) => {
+          const curId = engine.currentTrack?.id;
+          const curIdx = curId ? currentQueue.findIndex((t) => t.id === curId) : -1;
+          const remainingCount = curIdx >= 0 ? currentQueue.length - 1 - curIdx : currentQueue.length;
+          if (remainingCount >= 5) return currentQueue;
+          return appendSmartLibraryQueue(currentQueue, curId ? [curId] : [], 6);
+        });
+      }
+      return next;
+    });
+  }, [engine.currentTrack?.id, appendSmartLibraryQueue]);
 
   const handleToggleAutoplayRadio = useCallback(() => {
     setAutoplayRadioEnabled((prev) => {
@@ -257,12 +380,23 @@ export default function App() {
     playedHistoryIdsRef.current.add(nextTrack.id);
 
     const remainingAfterNext = queue.length - 1 - nextIdx;
-    if (autoplayRadioEnabled && nextTrack.source === 'stream' && remainingAfterNext <= 2) {
-      void populateRelatedRadio(nextTrack, false);
+    if (remainingAfterNext <= 2) {
+      if (autoplayRadioEnabled && nextTrack.source === 'stream') {
+        void populateRelatedRadio(nextTrack, false);
+      } else if (smartShuffleEnabled) {
+        setQueue((prev) => appendSmartLibraryQueue(prev, [nextTrack.id], 6));
+      }
     }
 
     void audioEngine.playTrack(nextTrack);
-  }, [queue, engine.currentTrack?.id, autoplayRadioEnabled, populateRelatedRadio]);
+  }, [
+    queue,
+    engine.currentTrack?.id,
+    autoplayRadioEnabled,
+    smartShuffleEnabled,
+    populateRelatedRadio,
+    appendSmartLibraryQueue,
+  ]);
 
   const handlePrev = useCallback(() => {
     if (queue.length === 0) return;
@@ -289,20 +423,109 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [activeTab]);
 
+  // Track real streaming playback progress so stalled/bad connections are detected cleanly
   useEffect(() => {
-    const unsubEnd = audioEngine.onTrackEnd(() => {
-      handleNext();
-    });
-    return () => {
-      unsubEnd();
+    const cur = engine.currentTrack;
+    const now = Date.now();
+    if (!cur || cur.source !== 'stream') {
+      lastStreamProgressRef.current = { trackId: null, time: 0, atMs: 0 };
+      badConnSinceRef.current = null;
+      dismissedBadSinceRef.current = null;
+      setShowOfflineSwitchPrompt(false);
+      return;
+    }
+
+    const prev = lastStreamProgressRef.current;
+    if (prev.trackId !== cur.id) {
+      lastStreamProgressRef.current = { trackId: cur.id, time: engine.currentTime, atMs: now };
+      badConnSinceRef.current = null;
+      dismissedBadSinceRef.current = null;
+      setShowOfflineSwitchPrompt(false);
+    } else if (Math.abs(engine.currentTime - prev.time) >= 0.35 && engine.isPlaying && isOnline) {
+      lastStreamProgressRef.current = { trackId: cur.id, time: engine.currentTime, atMs: now };
+    }
+  }, [engine.currentTrack?.id, engine.currentTrack?.source, engine.currentTime, engine.isPlaying, isOnline]);
+
+  // Prompt user to switch to offline listening after 30s of poor/stalled connection while streaming
+  useEffect(() => {
+    if (engine.currentTrack?.source !== 'stream') return;
+
+    const evaluate = () => {
+      const result = evaluatePoorConnectionState({
+        isStreamingTrack: engine.currentTrack?.source === 'stream',
+        isPlaying: engine.isPlaying,
+        isOnline,
+        isBuffering: engine.isBuffering || engine.streamErrorCount > 0,
+        lastProgressAtMs: lastStreamProgressRef.current.atMs,
+        badSinceMs: badConnSinceRef.current,
+        nowMs: Date.now(),
+        dismissedSinceMs: dismissedBadSinceRef.current,
+        thresholdMs: POOR_CONNECTION_THRESHOLD_MS,
+      });
+      badConnSinceRef.current = result.nextBadSinceMs;
+      setShowOfflineSwitchPrompt(result.shouldPromptOffline);
     };
-  }, [handleNext]);
+
+    evaluate();
+    const timer = window.setInterval(evaluate, 1000);
+    return () => window.clearInterval(timer);
+  }, [
+    engine.currentTrack?.id,
+    engine.currentTrack?.source,
+    engine.isPlaying,
+    engine.isBuffering,
+    engine.streamErrorCount,
+    isOnline,
+  ]);
+
+  const offlineFallbackCount = useMemo(() => {
+    const localCount = savedTracks.filter((t) => t.source === 'local').length;
+    return localCount > 0 ? localCount : PROCEDURAL_STEMS.length;
+  }, [savedTracks]);
+
+  const handleSwitchToOfflineListening = useCallback(() => {
+    triggerHaptic('success');
+    dismissedBadSinceRef.current = badConnSinceRef.current ?? Date.now();
+    setShowOfflineSwitchPrompt(false);
+
+    const localSongs = savedTracks.filter((t) => t.source === 'local');
+    const sourcePool = localSongs.length > 0 ? localSongs : PROCEDURAL_STEMS;
+    const orderedPool = smartShuffleEnabled
+      ? selectSmartLibraryTracks(sourcePool, localDb.loadPlayCounts(), new Set(), sourcePool.length).map(
+          (t) => ({ ...t, autoQueued: false })
+        )
+      : sourcePool;
+
+    const { queue: offlineQueue, startTrack } = buildCollectionQueue(orderedPool, 0);
+    if (!startTrack) return;
+
+    playedHistoryIdsRef.current.add(startTrack.id);
+    setShuffleEnabled(false);
+    setPreShuffleOrderIds(null);
+    setQueue(offlineQueue);
+    void audioEngine.playTrack(startTrack);
+  }, [savedTracks, smartShuffleEnabled]);
+
+  const handleDismissOfflinePrompt = useCallback(() => {
+    triggerHaptic('light');
+    dismissedBadSinceRef.current = badConnSinceRef.current ?? Date.now();
+    setShowOfflineSwitchPrompt(false);
+  }, []);
 
   const handleNextRef = useRef(handleNext);
   const handlePrevRef = useRef(handlePrev);
   handleNextRef.current = handleNext;
   handlePrevRef.current = handlePrev;
   const lastPositionSyncRef = useRef<number>(0);
+
+  useEffect(() => {
+    const unsubEnd = audioEngine.onTrackEnd(() => {
+      handleNextRef.current();
+    });
+    return () => {
+      unsubEnd();
+    };
+  }, []);
 
   // Subscribe to Android native MediaSession (Samsung Now Bar / Lockscreen) & native PiP
   useEffect(() => {
@@ -931,6 +1154,11 @@ export default function App() {
         onPlayTrack={playTrack}
         onRemoveFromQueue={(id) => setQueue((prev) => prev.filter((t) => t.id !== id))}
         onReorderQueue={handleReorderQueue}
+        onReorderMultipleQueue={handleReorderMultipleQueue}
+        shuffleEnabled={shuffleEnabled}
+        onToggleShuffle={handleToggleShuffle}
+        smartShuffleEnabled={smartShuffleEnabled}
+        onToggleSmartShuffle={handleToggleSmartShuffle}
         onToggleFavorite={handleToggleFavorite}
         onOpenDsp={() => setIsDspOpen(true)}
         onUpdateLyricsOffset={(id, offset) => void handleUpdateLyricsOffset(id, offset)}
@@ -942,6 +1170,63 @@ export default function App() {
         onFetchTrackLyrics={(tr, customQ) => void handleFetchTrackLyrics(tr, customQ)}
         onToggleAutoplayRadio={handleToggleAutoplayRadio}
       />
+
+      {showOfflineSwitchPrompt && (
+        <div
+          role="alertdialog"
+          aria-live="assertive"
+          aria-labelledby="poor-conn-title"
+          data-testid="poor-connection-offline-prompt"
+          className="kago-sheet-slide fixed bottom-[calc(8.75rem+env(safe-area-inset-bottom))] md:bottom-24 left-3 right-3 sm:left-auto sm:right-6 sm:w-[24rem] z-[85] rounded-xl border border-[#E11D48]/60 bg-[#0D0F15]/95 p-4 shadow-[0_20px_50px_rgba(0,0,0,0.9)] backdrop-blur-md"
+        >
+          <div className="flex items-start gap-3">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[#E11D48]/40 bg-[#E11D48]/15 text-[#FF4D6D]">
+              <WifiOff className="h-4 w-4" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-start justify-between gap-2">
+                <h3 id="poor-conn-title" className="font-display text-sm font-bold text-[#F4F3F0]">
+                  Poor Internet Connection
+                </h3>
+                <button
+                  type="button"
+                  onClick={handleDismissOfflinePrompt}
+                  aria-label="Dismiss poor connection notification"
+                  className="text-[#8E929B] hover:text-white cursor-pointer"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <p className="mt-1 text-xs leading-relaxed text-[#9CA3AF]">
+                Streaming has been interrupted for 30s. Switch to your offline library (
+                <span className="font-mono-tabular text-[#F4F3F0]">
+                  {offlineFallbackCount}{' '}
+                  {savedTracks.some((t) => t.source === 'local') ? 'offline songs' : 'offline stems'}
+                </span>
+                ) instead?
+              </p>
+
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleSwitchToOfflineListening}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-1.5 text-xs font-semibold text-white shadow-[0_0_16px_rgba(225,29,72,0.45)] hover:bg-[#BE123C] cursor-pointer"
+                >
+                  <Radio className="h-3.5 w-3.5" />
+                  <span>Switch to Offline</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDismissOfflinePrompt}
+                  className="rounded-lg border border-[#262936] bg-[#14161D] px-3 py-1.5 text-xs font-semibold text-[#C7C9D1] hover:border-[#3A3F50] hover:text-white cursor-pointer"
+                >
+                  Keep Trying
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <DspStudioModal
         isOpen={isDspOpen}

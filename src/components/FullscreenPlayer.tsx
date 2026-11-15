@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  Check,
   ChevronDown,
   ChevronUp,
   Disc3,
@@ -17,9 +18,11 @@ import {
   RotateCcw,
   RotateCw,
   Search,
+  Shuffle,
   SkipBack,
   SkipForward,
   Sliders,
+  Sparkles,
   Trash2,
 } from 'lucide-react';
 import type { DspSettings, StoredLyrics, Track } from '../types/audio';
@@ -54,6 +57,15 @@ interface FullscreenPlayerProps {
   onPlayTrack: (track: Track) => void;
   onRemoveFromQueue: (trackId: string) => void;
   onReorderQueue?: (fromIndex: number, toIndex: number) => void;
+  onReorderMultipleQueue?: (
+    selectedIndices: number[],
+    targetIndex: number,
+    draggedAnchorIndex?: number
+  ) => void;
+  shuffleEnabled?: boolean;
+  onToggleShuffle?: () => void;
+  smartShuffleEnabled?: boolean;
+  onToggleSmartShuffle?: () => void;
   onToggleFavorite: (trackId: string) => void;
   onOpenDsp: () => void;
   onUpdateLyricsOffset: (trackId: string, offset: number) => void;
@@ -87,6 +99,11 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   onPlayTrack,
   onRemoveFromQueue,
   onReorderQueue,
+  onReorderMultipleQueue,
+  shuffleEnabled = false,
+  onToggleShuffle,
+  smartShuffleEnabled = false,
+  onToggleSmartShuffle,
   onToggleFavorite,
   onOpenDsp,
   onUpdateLyricsOffset,
@@ -102,9 +119,14 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   const [fallbackRelated, setFallbackRelated] = useState<Track[]>([]);
   const [loadingWatchRelated, setLoadingWatchRelated] = useState(false);
   const [lyricSearchQuery, setLyricSearchQuery] = useState('');
+  const [selectedQueueIds, setSelectedQueueIds] = useState<Set<string>>(() => new Set());
   const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [dragGroupIndices, setDragGroupIndices] = useState<number[]>([]);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
-  const pointerDragFromRef = useRef<number | null>(null);
+  const dragOverIdxRef = useRef<number | null>(null);
+  const pointerDragGroupRef = useRef<{ indices: number[]; anchorIdx: number } | null>(null);
+  const htmlDragGroupRef = useRef<{ indices: number[]; anchorIdx: number } | null>(null);
+  const queueScrollRef = useRef<HTMLDivElement | null>(null);
   const activeLineRef = useRef<HTMLButtonElement | null>(null);
 
   const rawLrc = storedLyrics?.rawLrc ?? track?.lrcLyrics ?? '';
@@ -178,6 +200,75 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
     }
     return merged.slice(0, 12);
   }, [queueRelated, fallbackRelated, track?.id]);
+
+  // Prune any selected queue IDs that are no longer in the active queue
+  useEffect(() => {
+    const liveIds = new Set(queue.map((q) => q.id));
+    setSelectedQueueIds((prev) => {
+      if (prev.size === 0) return prev;
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (liveIds.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [queue]);
+
+  const selectedIndices = useMemo(
+    () =>
+      queue.reduce<number[]>((acc, item, index) => {
+        if (selectedQueueIds.has(item.id)) acc.push(index);
+        return acc;
+      }, []),
+    [queue, selectedQueueIds]
+  );
+
+  const toggleSelectQueueTrack = (trackId: string) => {
+    triggerHaptic('selection', 20);
+    setSelectedQueueIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(trackId)) next.delete(trackId);
+      else next.add(trackId);
+      return next;
+    });
+  };
+
+  const clearQueueSelection = () => {
+    triggerHaptic('light');
+    setSelectedQueueIds(new Set());
+  };
+
+  const commitQueueDrag = (
+    group: { indices: number[]; anchorIdx: number },
+    toIdx: number
+  ) => {
+    if (group.indices.length > 1 && onReorderMultipleQueue) {
+      onReorderMultipleQueue(group.indices, toIdx, group.anchorIdx);
+    } else if (onReorderQueue && group.anchorIdx !== toIdx) {
+      onReorderQueue(group.anchorIdx, toIdx);
+    }
+  };
+
+  const moveSelectedQueueGroup = (delta: -1 | 1) => {
+    if (selectedIndices.length === 0) return;
+    if (selectedIndices.length > 1 && onReorderMultipleQueue) {
+      if (delta === -1) {
+        const minIdx = Math.min(...selectedIndices);
+        if (minIdx > 0) onReorderMultipleQueue(selectedIndices, minIdx - 1);
+      } else {
+        const maxIdx = Math.max(...selectedIndices);
+        if (maxIdx < queue.length - 1) onReorderMultipleQueue(selectedIndices, maxIdx + 1);
+      }
+    } else if (selectedIndices.length === 1 && onReorderQueue) {
+      const onlyIdx = selectedIndices[0];
+      const nextIdx = onlyIdx + delta;
+      if (nextIdx >= 0 && nextIdx < queue.length) {
+        onReorderQueue(onlyIdx, nextIdx);
+      }
+    }
+  };
 
   if (!isOpen || !track) return null;
 
@@ -254,7 +345,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
       </div>
 
       {/* Main Content Stage */}
-      <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-8">
+      <div ref={queueScrollRef} className="flex-1 overflow-y-auto px-4 py-6 sm:px-8">
         <div className="mx-auto max-w-3xl">
           {subTab === 'turntable' && (
             <div className="kago-panel-enter space-y-6">
@@ -557,7 +648,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                   {queue.length > 1 && onReorderQueue && (
                     <>
                       <span aria-hidden="true">·</span>
-                      <span>Drag or use arrows to reorder</span>
+                      <span>Drag or select multiple to reorder</span>
                     </>
                   )}
                   {isFetchingRadio && (
@@ -568,24 +659,115 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                   )}
                 </div>
 
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={autoplayRadioEnabled}
-                  onClick={() => {
-                    triggerHaptic('light');
-                    onToggleAutoplayRadio();
-                  }}
-                  className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors cursor-pointer ${
-                    autoplayRadioEnabled
-                      ? 'border-[#E11D48] bg-[#E11D48]/15 text-[#FF4D6D]'
-                      : 'border-[#252834] bg-[#14161D] text-[#8E929B] hover:text-white'
-                  }`}
-                >
-                  <Radio className="h-3.5 w-3.5" />
-                  <span>Auto Radio: {autoplayRadioEnabled ? 'ON' : 'OFF'}</span>
-                </button>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {onToggleShuffle && (
+                    <button
+                      type="button"
+                      data-testid="queue-shuffle-btn"
+                      aria-pressed={shuffleEnabled}
+                      disabled={queue.length < 2 && !shuffleEnabled}
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        onToggleShuffle();
+                      }}
+                      title={
+                        shuffleEnabled
+                          ? 'Turn off shuffle and restore original order'
+                          : 'Shuffle queue order'
+                      }
+                      className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors disabled:opacity-40 cursor-pointer ${
+                        shuffleEnabled
+                          ? 'border-[#E11D48] bg-[#E11D48]/15 text-[#FF4D6D]'
+                          : 'border-[#252834] bg-[#14161D] text-[#8E929B] hover:text-white'
+                      }`}
+                    >
+                      <Shuffle className="h-3.5 w-3.5" />
+                      <span>Shuffle{shuffleEnabled ? ': ON' : ''}</span>
+                    </button>
+                  )}
+
+                  {onToggleSmartShuffle && (
+                    <button
+                      type="button"
+                      role="switch"
+                      data-testid="queue-smart-shuffle-btn"
+                      aria-checked={smartShuffleEnabled}
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        onToggleSmartShuffle();
+                      }}
+                      title="Prioritize less frequently played tracks from your library when auto-queuing"
+                      className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors cursor-pointer ${
+                        smartShuffleEnabled
+                          ? 'border-[#E11D48] bg-[#E11D48]/15 text-[#FF4D6D]'
+                          : 'border-[#252834] bg-[#14161D] text-[#8E929B] hover:text-white'
+                      }`}
+                    >
+                      <Sparkles className="h-3.5 w-3.5" />
+                      <span>Smart Shuffle: {smartShuffleEnabled ? 'ON' : 'OFF'}</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={autoplayRadioEnabled}
+                    onClick={() => {
+                      triggerHaptic('light');
+                      onToggleAutoplayRadio();
+                    }}
+                    className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors cursor-pointer ${
+                      autoplayRadioEnabled
+                        ? 'border-[#E11D48] bg-[#E11D48]/15 text-[#FF4D6D]'
+                        : 'border-[#252834] bg-[#14161D] text-[#8E929B] hover:text-white'
+                    }`}
+                  >
+                    <Radio className="h-3.5 w-3.5" />
+                    <span>Auto Radio: {autoplayRadioEnabled ? 'ON' : 'OFF'}</span>
+                  </button>
+                </div>
               </div>
+
+              {selectedIndices.length > 0 && (
+                <div
+                  data-testid="queue-multiselect-bar"
+                  className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#E11D48]/50 bg-[#E11D48]/10 px-3.5 py-2"
+                >
+                  <span className="font-mono-tabular text-xs font-semibold text-[#F4F3F0]">
+                    {selectedIndices.length} selected · Drag any selected handle to move together
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={Math.min(...selectedIndices) === 0}
+                      onClick={() => moveSelectedQueueGroup(-1)}
+                      aria-label="Move selected tracks up"
+                      className="inline-flex h-7 items-center gap-1 rounded-md border border-[#2C303E] bg-[#111319] px-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] disabled:opacity-35 cursor-pointer"
+                    >
+                      <ChevronUp className="h-3.5 w-3.5" />
+                      <span>Up</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={Math.max(...selectedIndices) === queue.length - 1}
+                      onClick={() => moveSelectedQueueGroup(1)}
+                      aria-label="Move selected tracks down"
+                      className="inline-flex h-7 items-center gap-1 rounded-md border border-[#2C303E] bg-[#111319] px-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] disabled:opacity-35 cursor-pointer"
+                    >
+                      <ChevronDown className="h-3.5 w-3.5" />
+                      <span>Down</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={clearQueueSelection}
+                      className="h-7 rounded-md border border-[#2C303E] bg-[#111319] px-2.5 text-xs font-semibold text-[#8E929B] hover:text-white cursor-pointer"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {queue.length === 0 ? (
                 <div className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-8 text-center text-sm text-[#8E929B]">
                   Queue is empty. Add songs from Stream or Library.
@@ -593,18 +775,39 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
               ) : (
                 queue.map((qTrack, idx) => {
                   const active = qTrack.id === track.id;
-                  const isDragging = dragIdx === idx;
-                  const isDropTarget = dragOverIdx === idx && dragIdx !== null && dragIdx !== idx;
+                  const isSelected = selectedQueueIds.has(qTrack.id);
+                  const isDragging =
+                    dragIdx === idx || (dragIdx !== null && dragGroupIndices.includes(idx));
+                  const isDropTarget =
+                    dragOverIdx === idx &&
+                    dragIdx !== null &&
+                    !dragGroupIndices.includes(idx) &&
+                    dragIdx !== idx;
+                  const useGroupArrows =
+                    isSelected && selectedIndices.length > 1 && Boolean(onReorderMultipleQueue);
+                  const canMoveUp = useGroupArrows
+                    ? Math.min(...selectedIndices) > 0
+                    : idx > 0;
+                  const canMoveDown = useGroupArrows
+                    ? Math.max(...selectedIndices) < queue.length - 1
+                    : idx < queue.length - 1;
+
                   return (
                     <div
                       key={`${qTrack.id}-${idx}`}
                       data-queue-index={idx}
+                      data-queue-track-id={qTrack.id}
                       draggable={Boolean(onReorderQueue) && queue.length > 1}
                       onDragStart={(e) => {
                         if (!onReorderQueue) return;
                         triggerHaptic('reorder', 10);
+                        const groupIndices =
+                          isSelected && selectedIndices.length > 1 ? selectedIndices : [idx];
+                        htmlDragGroupRef.current = { indices: groupIndices, anchorIdx: idx };
                         setDragIdx(idx);
+                        setDragGroupIndices(groupIndices);
                         setDragOverIdx(idx);
+                        dragOverIdxRef.current = idx;
                         e.dataTransfer.effectAllowed = 'move';
                         e.dataTransfer.setData('text/plain', String(idx));
                       }}
@@ -612,42 +815,79 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                         if (!onReorderQueue || dragIdx === null) return;
                         e.preventDefault();
                         e.dataTransfer.dropEffect = 'move';
-                        if (dragOverIdx !== idx) {
+                        if (dragOverIdxRef.current !== idx) {
                           triggerHaptic('selection', 35);
+                          dragOverIdxRef.current = idx;
                           setDragOverIdx(idx);
                         }
                       }}
                       onDrop={(e) => {
                         e.preventDefault();
-                        if (onReorderQueue && dragIdx !== null && dragIdx !== idx) {
+                        const group = htmlDragGroupRef.current;
+                        if (group) {
+                          commitQueueDrag(group, idx);
+                        } else if (onReorderQueue && dragIdx !== null && dragIdx !== idx) {
                           onReorderQueue(dragIdx, idx);
                         }
+                        htmlDragGroupRef.current = null;
+                        dragOverIdxRef.current = null;
                         setDragIdx(null);
+                        setDragGroupIndices([]);
                         setDragOverIdx(null);
                       }}
                       onDragEnd={() => {
+                        htmlDragGroupRef.current = null;
+                        dragOverIdxRef.current = null;
                         setDragIdx(null);
+                        setDragGroupIndices([]);
                         setDragOverIdx(null);
                       }}
                       className={`flex items-center justify-between gap-2 rounded-lg border px-2.5 sm:px-3.5 py-2.5 transition-[transform,background-color,border-color,opacity] duration-150 ${
                         isDropTarget
                           ? 'scale-[1.01] border-[#E11D48] bg-[#E11D48]/20'
+                          : isSelected
+                          ? 'border-[#E11D48]/80 bg-[#E11D48]/12'
                           : active
                           ? 'border-[#E11D48] bg-[#E11D48]/10'
                           : 'border-[#1F2129] bg-[#0D0E12]'
                       } ${isDragging ? 'scale-[0.985] opacity-55' : ''}`}
                     >
+                      {queue.length > 1 && (onReorderQueue || onReorderMultipleQueue) && (
+                        <button
+                          type="button"
+                          onClick={() => toggleSelectQueueTrack(qTrack.id)}
+                          aria-label={`Select ${qTrack.title}`}
+                          aria-pressed={isSelected}
+                          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded border transition-colors cursor-pointer ${
+                            isSelected
+                              ? 'border-[#E11D48] bg-[#E11D48] text-white'
+                              : 'border-[#323646] bg-[#14161E] text-transparent hover:border-[#8E929B]'
+                          }`}
+                        >
+                          <Check className="h-3.5 w-3.5 stroke-[2.5]" />
+                        </button>
+                      )}
+
                       {onReorderQueue && queue.length > 1 && (
                         <button
                           type="button"
+                          draggable={false}
                           aria-label={`Drag to reorder ${qTrack.title}`}
-                          title="Drag to reorder"
+                          title={
+                            isSelected && selectedIndices.length > 1
+                              ? `Drag to move ${selectedIndices.length} selected tracks`
+                              : 'Drag to reorder'
+                          }
                           onPointerDown={(e) => {
-                            if (e.pointerType === 'mouse') return;
                             e.preventDefault();
+                            e.stopPropagation();
                             triggerHaptic('reorder', 10);
-                            pointerDragFromRef.current = idx;
+                            const groupIndices =
+                              isSelected && selectedIndices.length > 1 ? selectedIndices : [idx];
+                            pointerDragGroupRef.current = { indices: groupIndices, anchorIdx: idx };
+                            dragOverIdxRef.current = idx;
                             setDragIdx(idx);
+                            setDragGroupIndices(groupIndices);
                             setDragOverIdx(idx);
                             try {
                               e.currentTarget.setPointerCapture(e.pointerId);
@@ -656,35 +896,49 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                             }
                           }}
                           onPointerMove={(e) => {
-                            if (pointerDragFromRef.current === null) return;
+                            if (!pointerDragGroupRef.current) return;
+                            const scroller = queueScrollRef.current;
+                            if (scroller) {
+                              const rect = scroller.getBoundingClientRect();
+                              if (e.clientY < rect.top + 56) {
+                                scroller.scrollBy({ top: -18 });
+                              } else if (e.clientY > rect.bottom - 56) {
+                                scroller.scrollBy({ top: 18 });
+                              }
+                            }
                             const hit = document
                               .elementFromPoint(e.clientX, e.clientY)
                               ?.closest('[data-queue-index]');
                             const rawIdx = hit?.getAttribute('data-queue-index');
                             if (rawIdx !== null && rawIdx !== undefined) {
                               const parsed = Number(rawIdx);
-                              if (Number.isInteger(parsed) && parsed !== dragOverIdx) {
+                              if (Number.isInteger(parsed) && parsed !== dragOverIdxRef.current) {
                                 triggerHaptic('selection', 35);
+                                dragOverIdxRef.current = parsed;
                                 setDragOverIdx(parsed);
                               }
                             }
                           }}
                           onPointerUp={() => {
-                            const from = pointerDragFromRef.current;
-                            const to = dragOverIdx;
-                            pointerDragFromRef.current = null;
-                            if (from !== null && to !== null && from !== to) {
-                              onReorderQueue(from, to);
+                            const group = pointerDragGroupRef.current;
+                            const to = dragOverIdxRef.current;
+                            pointerDragGroupRef.current = null;
+                            dragOverIdxRef.current = null;
+                            if (group && to !== null) {
+                              commitQueueDrag(group, to);
                             }
                             setDragIdx(null);
+                            setDragGroupIndices([]);
                             setDragOverIdx(null);
                           }}
                           onPointerCancel={() => {
-                            pointerDragFromRef.current = null;
+                            pointerDragGroupRef.current = null;
+                            dragOverIdxRef.current = null;
                             setDragIdx(null);
+                            setDragGroupIndices([]);
                             setDragOverIdx(null);
                           }}
-                          className="touch-none flex h-8 w-6 shrink-0 items-center justify-center rounded text-[#8E929B] hover:text-white cursor-grab active:cursor-grabbing"
+                          className="touch-none select-none flex h-8 w-6 shrink-0 items-center justify-center rounded text-[#8E929B] hover:text-white cursor-grab active:cursor-grabbing"
                         >
                           <GripVertical className="h-4 w-4" />
                         </button>
@@ -713,7 +967,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                             </p>
                             {qTrack.autoQueued && !active && (
                               <span className="shrink-0 rounded border border-[#2C303E] bg-[#14161E] px-1.5 py-0.5 font-mono-tabular text-[10px] font-semibold uppercase tracking-wide text-[#9CA3AF]">
-                                Auto Radio
+                                {qTrack.source === 'stream' ? 'Auto Radio' : 'Smart Pick'}
                               </span>
                             )}
                           </div>
@@ -729,20 +983,40 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                           <>
                             <button
                               type="button"
-                              disabled={idx === 0}
-                              onClick={() => onReorderQueue(idx, idx - 1)}
-                              aria-label={`Move ${qTrack.title} up`}
-                              title="Move up"
+                              disabled={!canMoveUp}
+                              onClick={() => {
+                                if (useGroupArrows) {
+                                  moveSelectedQueueGroup(-1);
+                                } else {
+                                  onReorderQueue(idx, idx - 1);
+                                }
+                              }}
+                              aria-label={
+                                useGroupArrows
+                                  ? 'Move selected tracks up'
+                                  : `Move ${qTrack.title} up`
+                              }
+                              title={useGroupArrows ? 'Move selected up' : 'Move up'}
                               className="flex h-8 w-7 items-center justify-center rounded text-[#8E929B] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
                             >
                               <ChevronUp className="h-4 w-4" />
                             </button>
                             <button
                               type="button"
-                              disabled={idx === queue.length - 1}
-                              onClick={() => onReorderQueue(idx, idx + 1)}
-                              aria-label={`Move ${qTrack.title} down`}
-                              title="Move down"
+                              disabled={!canMoveDown}
+                              onClick={() => {
+                                if (useGroupArrows) {
+                                  moveSelectedQueueGroup(1);
+                                } else {
+                                  onReorderQueue(idx, idx + 1);
+                                }
+                              }}
+                              aria-label={
+                                useGroupArrows
+                                  ? 'Move selected tracks down'
+                                  : `Move ${qTrack.title} down`
+                              }
+                              title={useGroupArrows ? 'Move selected down' : 'Move down'}
                               className="flex h-8 w-7 items-center justify-center rounded text-[#8E929B] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
                             >
                               <ChevronDown className="h-4 w-4" />

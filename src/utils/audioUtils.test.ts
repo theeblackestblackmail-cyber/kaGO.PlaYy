@@ -42,6 +42,21 @@ import {
   pickBestLrclibCandidate,
   sanitizeTrackForLyrics,
 } from './lyricsFetcher';
+import {
+  POOR_CONNECTION_THRESHOLD_MS,
+  evaluatePoorConnectionState,
+  reorderMultipleQueueItems,
+  restoreQueueOrder,
+  selectSmartLibraryTracks,
+  shuffleQueuePreservingCurrent,
+} from './queueUtils';
+import {
+  STALL_NUDGE_MS,
+  STALL_RECOVER_MS,
+  evaluatePlaybackWatchdog,
+  isPrematureStreamEnded,
+  shouldAutoResumePlaybackPause,
+} from './playbackStability';
 import type { StudioQueueItem, Track } from '../types/audio';
 
 test('sanitizeFilename cleans noisy YouTube rip filenames and separates artist and title', () => {
@@ -1070,3 +1085,400 @@ test('haptics engine resolves patterns for all styles and throttles rapid trigge
   assert.equal(shouldThrottleHaptic(1035, 1000, 35), false);
   assert.equal(shouldThrottleHaptic(10, 0, 35), false);
 });
+
+test('shuffleQueuePreservingCurrent and restoreQueueOrder pin current track and restore exact arrangement on toggle off', () => {
+  const mk = (id: string): Track => ({
+    id,
+    title: `Song ${id}`,
+    artist: 'Artist',
+    album: 'Album',
+    duration: 180,
+    source: 'local',
+    addedAt: 1,
+  });
+
+  const original = [mk('t1'), mk('t2'), mk('t3'), mk('t4'), mk('t5')];
+  const { shuffledQueue, originalOrderIds } = shuffleQueuePreservingCurrent(
+    original,
+    't3',
+    () => 0.15
+  );
+
+  // Current track pinned first, all tracks preserved without loss
+  assert.equal(shuffledQueue[0].id, 't3');
+  assert.equal(shuffledQueue.length, original.length);
+  assert.deepEqual(originalOrderIds, ['t1', 't2', 't3', 't4', 't5']);
+
+  // Simulate adding a new track while shuffled and removing t2, then turning shuffle off
+  const modifiedWhileShuffled = [...shuffledQueue.filter((t) => t.id !== 't2'), mk('t6')];
+  const restored = restoreQueueOrder(modifiedWhileShuffled, originalOrderIds);
+  assert.deepEqual(
+    restored.map((t) => t.id),
+    ['t1', 't3', 't4', 't5', 't6']
+  );
+
+  // Exact restoration when unmodified
+  assert.deepEqual(
+    restoreQueueOrder(shuffledQueue, originalOrderIds).map((t) => t.id),
+    ['t1', 't2', 't3', 't4', 't5']
+  );
+});
+
+test('reorderMultipleQueueItems moves multiple contiguous or non-contiguous selected tracks together cleanly', () => {
+  const items = ['a', 'b', 'c', 'd', 'e', 'f'];
+
+  // Move non-contiguous [1 ('b'), 3 ('d')] down onto 4 ('e') -> lands right after 'e'
+  assert.deepEqual(reorderMultipleQueueItems(items, [1, 3], 4, 1), ['a', 'c', 'e', 'b', 'd', 'f']);
+
+  // Move non-contiguous [2 ('c'), 5 ('f')] up onto 0 ('a') -> lands right before 'a'
+  assert.deepEqual(reorderMultipleQueueItems(items, [2, 5], 0, 5), ['c', 'f', 'a', 'b', 'd', 'e']);
+
+  // Single selected item delegates cleanly
+  assert.deepEqual(reorderMultipleQueueItems(items, [4], 1, 4), ['a', 'e', 'b', 'c', 'd', 'f']);
+
+  // Dropping onto one of the selected indices itself is a safe no-op
+  assert.deepEqual(reorderMultipleQueueItems(items, [1, 3], 3, 1), items);
+});
+
+test('selectSmartLibraryTracks prioritizes least-played user tracks over frequently played and synth stems', () => {
+  const mk = (id: string, source: 'local' | 'synth'): Track => ({
+    id,
+    title: `Track ${id}`,
+    artist: 'Artist',
+    album: 'Library',
+    duration: 200,
+    source,
+    addedAt: 1,
+  });
+
+  const library = [
+    mk('heavy', 'local'),
+    mk('fresh-1', 'local'),
+    mk('light', 'local'),
+    mk('fresh-2', 'local'),
+    mk('queued-already', 'local'),
+    mk('stem-1', 'synth'),
+  ];
+  const counts: Record<string, number> = {
+    heavy: 12,
+    light: 2,
+    'fresh-1': 0,
+    'fresh-2': 0,
+    'queued-already': 0,
+  };
+
+  const picked = selectSmartLibraryTracks(
+    library,
+    counts,
+    new Set(['queued-already']),
+    4,
+    () => 0.4
+  );
+
+  // Zero-play tracks appear before 2-play track, which appears before 12-play track; excluded ID skipped; synth skipped while local tracks exist
+  assert.equal(picked.length, 4);
+  assert.equal(picked.some((t) => t.id === 'queued-already' || t.id === 'stem-1'), false);
+  assert.ok(picked.slice(0, 2).every((t) => t.id === 'fresh-1' || t.id === 'fresh-2'));
+  assert.equal(picked[2].id, 'light');
+  assert.equal(picked[3].id, 'heavy');
+  assert.equal(picked[0].autoQueued, true);
+
+  // Falls back to synth stems only when no user library tracks exist
+  const synthOnly = selectSmartLibraryTracks([mk('stem-a', 'synth')], {}, new Set(), 3, () => 0.1);
+  assert.deepEqual(
+    synthOnly.map((t) => t.id),
+    ['stem-a']
+  );
+});
+
+test('evaluatePoorConnectionState requires continuous 30s outage while streaming and respects dismissal & recovery', () => {
+  const t0 = 100_000;
+
+  // Below 30,000ms threshold: should not prompt yet
+  const at29s = evaluatePoorConnectionState({
+    isStreamingTrack: true,
+    isPlaying: true,
+    isOnline: false,
+    isBuffering: true,
+    lastProgressAtMs: t0,
+    badSinceMs: t0,
+    nowMs: t0 + (POOR_CONNECTION_THRESHOLD_MS - 1),
+    dismissedSinceMs: null,
+  });
+  assert.equal(at29s.shouldPromptOffline, false);
+  assert.equal(at29s.nextBadSinceMs, t0);
+
+  // At 30,000ms threshold while offline or stalled: triggers prompt
+  const at30s = evaluatePoorConnectionState({
+    isStreamingTrack: true,
+    isPlaying: true,
+    isOnline: true,
+    isBuffering: false,
+    lastProgressAtMs: t0,
+    badSinceMs: t0,
+    nowMs: t0 + POOR_CONNECTION_THRESHOLD_MS,
+    dismissedSinceMs: null,
+  });
+  assert.equal(at30s.shouldPromptOffline, true);
+
+  // Dismissed for current outage stays suppressed
+  const afterDismiss = evaluatePoorConnectionState({
+    isStreamingTrack: true,
+    isPlaying: true,
+    isOnline: false,
+    isBuffering: true,
+    lastProgressAtMs: t0,
+    badSinceMs: t0,
+    nowMs: t0 + 45_000,
+    dismissedSinceMs: t0 + 31_000,
+  });
+  assert.equal(afterDismiss.shouldPromptOffline, false);
+
+  // Recovery clears outage timer completely
+  const recovered = evaluatePoorConnectionState({
+    isStreamingTrack: true,
+    isPlaying: true,
+    isOnline: true,
+    isBuffering: false,
+    lastProgressAtMs: t0 + 49_000,
+    badSinceMs: t0,
+    nowMs: t0 + 50_000,
+    dismissedSinceMs: null,
+  });
+  assert.equal(recovered.nextBadSinceMs, null);
+  assert.equal(recovered.shouldPromptOffline, false);
+
+  // Local offline tracks never trigger streaming poor-connection prompts
+  const localPlayback = evaluatePoorConnectionState({
+    isStreamingTrack: false,
+    isPlaying: true,
+    isOnline: false,
+    isBuffering: false,
+    lastProgressAtMs: t0,
+    badSinceMs: t0,
+    nowMs: t0 + 60_000,
+    dismissedSinceMs: null,
+  });
+  assert.equal(localPlayback.shouldPromptOffline, false);
+});
+
+test('shouldAutoResumePlaybackPause heals spurious pauses while respecting genuine user pauses', () => {
+  const now = 200_000;
+
+  // Backgrounded pause without user pressing Pause -> auto-resume
+  assert.equal(
+    shouldAutoResumePlaybackPause({
+      isPlaying: true,
+      userPausedAt: 0,
+      nowMs: now,
+      visibilityState: 'hidden',
+      backgroundTransitionUntil: 0,
+      isIframeFocused: false,
+    }),
+    true
+  );
+
+  // Foreground spurious pause (e.g. "Continue watching?" / notification focus duck) -> auto-resume
+  assert.equal(
+    shouldAutoResumePlaybackPause({
+      isPlaying: true,
+      userPausedAt: 0,
+      nowMs: now,
+      visibilityState: 'visible',
+      backgroundTransitionUntil: 0,
+      isIframeFocused: false,
+    }),
+    true
+  );
+
+  // Foreground user click directly inside YouTube iframe -> stay paused
+  assert.equal(
+    shouldAutoResumePlaybackPause({
+      isPlaying: true,
+      userPausedAt: 0,
+      nowMs: now,
+      visibilityState: 'visible',
+      backgroundTransitionUntil: 0,
+      isIframeFocused: true,
+    }),
+    false
+  );
+
+  // Explicit user pause via player UI -> stay paused
+  assert.equal(
+    shouldAutoResumePlaybackPause({
+      isPlaying: true,
+      userPausedAt: now - 500,
+      nowMs: now,
+      visibilityState: 'hidden',
+      backgroundTransitionUntil: now + 5000,
+      isIframeFocused: false,
+    }),
+    false
+  );
+});
+
+test('isPrematureStreamEnded catches truncated HTTP stream cutoffs and honors normal track completion', () => {
+  // Stream cuts off at 75s out of 220s while online -> recover at 75s
+  assert.equal(
+    isPrematureStreamEnded({
+      source: 'stream',
+      currentTime: 75,
+      expectedDuration: 220,
+      isOnline: true,
+      retriesUsed: 0,
+    }),
+    true
+  );
+
+  // Normal ending near song duration -> allow advance to next song
+  assert.equal(
+    isPrematureStreamEnded({
+      source: 'stream',
+      currentTime: 215,
+      expectedDuration: 220,
+      isOnline: true,
+      retriesUsed: 0,
+    }),
+    false
+  );
+
+  // Local offline file or exhausted retries -> do not loop
+  assert.equal(
+    isPrematureStreamEnded({
+      source: 'local',
+      currentTime: 75,
+      expectedDuration: 220,
+      isOnline: true,
+      retriesUsed: 0,
+    }),
+    false
+  );
+  assert.equal(
+    isPrematureStreamEnded({
+      source: 'stream',
+      currentTime: 75,
+      expectedDuration: 220,
+      isOnline: true,
+      retriesUsed: 2,
+    }),
+    false
+  );
+});
+
+test('evaluatePlaybackWatchdog heals suspended AudioContext, spurious pauses, and mid-song stalls', () => {
+  const now = 500_000;
+
+  // Suspended Web Audio Context mid-song -> resume_context immediately
+  assert.equal(
+    evaluatePlaybackWatchdog({
+      isPlaying: true,
+      isCrossfading: false,
+      userPausedAt: 0,
+      nowMs: now,
+      audioContextState: 'suspended',
+      source: 'local',
+      isYouTube: false,
+      audioPaused: false,
+      audioEnded: false,
+      currentTime: 42,
+      lastProgressAtMs: now - 500,
+      isOnline: true,
+      nudgeCount: 0,
+      recoverCount: 0,
+      lastNudgeAtMs: 0,
+      lastRecoverAtMs: 0,
+    }),
+    'resume_context'
+  );
+
+  // YouTube unexpectedly enters PAUSED(2) without user click -> nudge_resume
+  assert.equal(
+    evaluatePlaybackWatchdog({
+      isPlaying: true,
+      isCrossfading: false,
+      userPausedAt: 0,
+      nowMs: now,
+      source: 'stream',
+      isYouTube: true,
+      ytPlayerState: 2,
+      isIframeFocused: false,
+      currentTime: 65,
+      lastProgressAtMs: now - 1000,
+      isOnline: true,
+      nudgeCount: 0,
+      recoverCount: 0,
+      lastNudgeAtMs: 0,
+      lastRecoverAtMs: 0,
+    }),
+    'nudge_resume'
+  );
+
+  // Moderate 7s YouTube freeze while online -> nudge_resume
+  assert.equal(
+    evaluatePlaybackWatchdog({
+      isPlaying: true,
+      isCrossfading: false,
+      userPausedAt: 0,
+      nowMs: now,
+      source: 'stream',
+      isYouTube: true,
+      ytPlayerState: 3,
+      currentTime: 90,
+      lastProgressAtMs: now - STALL_NUDGE_MS,
+      isOnline: true,
+      nudgeCount: 0,
+      recoverCount: 0,
+      lastNudgeAtMs: 0,
+      lastRecoverAtMs: 0,
+    }),
+    'nudge_resume'
+  );
+
+  // Severe 15s stream stall after nudges -> recover_stream
+  assert.equal(
+    evaluatePlaybackWatchdog({
+      isPlaying: true,
+      isCrossfading: false,
+      userPausedAt: 0,
+      nowMs: now,
+      source: 'stream',
+      isYouTube: true,
+      ytPlayerState: 3,
+      currentTime: 90,
+      lastProgressAtMs: now - STALL_RECOVER_MS,
+      isOnline: true,
+      nudgeCount: 2,
+      recoverCount: 0,
+      lastNudgeAtMs: now - 6000,
+      lastRecoverAtMs: 0,
+    }),
+    'recover_stream'
+  );
+
+  // Severe 15s local audio stall -> reload_audio_at_position
+  assert.equal(
+    evaluatePlaybackWatchdog({
+      isPlaying: true,
+      isCrossfading: false,
+      userPausedAt: 0,
+      nowMs: now,
+      audioContextState: 'running',
+      source: 'local',
+      isYouTube: false,
+      audioPaused: false,
+      audioEnded: false,
+      audioReadyState: 1,
+      currentTime: 112,
+      lastProgressAtMs: now - STALL_RECOVER_MS,
+      isOnline: false,
+      nudgeCount: 1,
+      recoverCount: 0,
+      lastNudgeAtMs: now - 6000,
+      lastRecoverAtMs: 0,
+    }),
+    'reload_audio_at_position'
+  );
+});
+
+

@@ -13,8 +13,12 @@ import {
   extractYouTubeSearchResults,
   rankYouTubeSearchResults,
   selectActiveYouTubeViewport,
-  shouldAutoResumeBackgroundPause,
 } from '../utils/streamFilter';
+import {
+  evaluatePlaybackWatchdog,
+  isPrematureStreamEnded,
+  shouldAutoResumePlaybackPause,
+} from '../utils/playbackStability';
 
 type Listener = (snapshot: AudioEngineSnapshot) => void;
 type TrackEndListener = () => void;
@@ -353,6 +357,8 @@ class DualChannelAudioEngine {
   private activeChannel: 'A' | 'B' = 'A';
   private isPlaying = false;
   private isCrossfading = false;
+  private isBuffering = false;
+  private streamErrorCount = 0;
   private currentTrack: Track | null = null;
   private currentTime = 0;
   private duration = 0;
@@ -383,6 +389,16 @@ class DualChannelAudioEngine {
   private userPausedAt = 0;
   private bgKeepaliveTimer: number | null = null;
   private bgListenersBound = false;
+  private watchdogTrackId: string | null = null;
+  private watchdogPos = 0;
+  private watchdogLastMovedAt = 0;
+  private watchdogNudgeCount = 0;
+  private watchdogRecoverCount = 0;
+  private watchdogLastNudgeAt = 0;
+  private watchdogLastRecoverAt = 0;
+  private prematureEndRetries = 0;
+  private audioReloadInFlight = false;
+  private lastCompositorNudgeAt = 0;
 
   private listeners = new Set<Listener>();
   private endListeners = new Set<TrackEndListener>();
@@ -414,12 +430,59 @@ class DualChannelAudioEngine {
     });
     window.addEventListener('pagehide', triggerKeepalive);
     window.addEventListener('blur', triggerKeepalive);
+    window.addEventListener('online', () => {
+      if (!this.isPlaying || !this.currentTrack) return;
+      if (this.currentTrack.source === 'stream') {
+        this.watchdogNudgeCount = 0;
+        this.watchdogLastNudgeAt = 0;
+        this.watchdogLastRecoverAt = 0;
+        this.ensurePlaybackAliveNow();
+        window.setTimeout(() => this.runPlaybackWatchdogTick(), 600);
+      }
+    });
     subscribeNativeKeepalive(() => triggerKeepalive());
+  }
+
+  private isRecentlyUserPaused(): boolean {
+    return this.userPausedAt > 0 && Date.now() - this.userPausedAt < 3000;
+  }
+
+  private isYtIframeFocused(): boolean {
+    if (typeof document === 'undefined') return false;
+    if (document.visibilityState !== 'visible') return false;
+    if (Date.now() - this.lastCompositorNudgeAt < 1200) return false;
+    return document.activeElement?.id === 'kago-yt-frame';
+  }
+
+  private resetWatchdog(trackId: string | null) {
+    const now = Date.now();
+    this.watchdogTrackId = trackId;
+    this.watchdogPos = 0;
+    this.watchdogLastMovedAt = now;
+    this.watchdogNudgeCount = 0;
+    this.watchdogRecoverCount = 0;
+    this.watchdogLastNudgeAt = 0;
+    this.watchdogLastRecoverAt = 0;
+    this.prematureEndRetries = 0;
+    this.audioReloadInFlight = false;
+  }
+
+  private noteProgress(pos: number, force = false) {
+    if (!Number.isFinite(pos) || pos < 0) return;
+    const curId = this.currentTrack?.id ?? null;
+    if (curId !== this.watchdogTrackId) {
+      this.resetWatchdog(curId);
+    }
+    if (force || Math.abs(pos - this.watchdogPos) >= 0.25) {
+      this.watchdogPos = pos;
+      this.watchdogLastMovedAt = Date.now();
+      this.watchdogNudgeCount = 0;
+    }
   }
 
   private handleBackgroundTransition() {
     if (!this.isPlaying) return;
-    if (this.userPausedAt > 0 && Date.now() - this.userPausedAt < 2000) return;
+    if (this.isRecentlyUserPaused()) return;
 
     this.backgroundTransitionUntil = Date.now() + 6500;
     this.ensurePlaybackAliveNow();
@@ -430,9 +493,9 @@ class DualChannelAudioEngine {
 
   private ensurePlaybackAliveNow() {
     if (!this.isPlaying || !this.currentTrack) return;
-    if (this.userPausedAt > 0 && Date.now() - this.userPausedAt < 2000) return;
+    if (this.isRecentlyUserPaused()) return;
 
-    if (this.ctx && this.ctx.state === 'suspended') {
+    if (this.ctx && this.ctx.state !== 'running') {
       void this.ctx.resume().catch(() => {});
     }
 
@@ -440,7 +503,7 @@ class DualChannelAudioEngine {
       try {
         const state = this.ytPlayer.getPlayerState();
         const statePaused = window.YT?.PlayerState?.PAUSED ?? 2;
-        if (state === statePaused) {
+        if ((state === statePaused || state === 5 || state === -1) && !this.isYtIframeFocused()) {
           this.ytPlayer.playVideo();
         }
       } catch {
@@ -456,6 +519,194 @@ class DualChannelAudioEngine {
     }
   }
 
+  private async reloadActiveAudioAtPosition(resumeSeconds: number) {
+    if (this.audioReloadInFlight) return;
+    const track = this.currentTrack;
+    const seq = this.playSeq;
+    const active = this.activeChannel === 'A' ? this.channelA : this.channelB;
+    if (!track || !active || this.ytActive || !this.isPlaying || this.isRecentlyUserPaused()) {
+      return;
+    }
+
+    this.audioReloadInFlight = true;
+    const safeSeek = Math.max(0, Math.floor(resumeSeconds));
+    try {
+      const ctx = this.ensureContext();
+      if (ctx.state !== 'running') {
+        await ctx.resume().catch(() => {});
+      }
+
+      const attachAndResume = async (srcUrl: string): Promise<boolean> => {
+        if (seq !== this.playSeq || !this.isPlaying) return false;
+        return new Promise<boolean>((resolve) => {
+          let settled = false;
+          const finish = (ok: boolean) => {
+            if (settled) return;
+            settled = true;
+            active.audioEl.removeEventListener('loadedmetadata', onMeta);
+            active.audioEl.removeEventListener('error', onErr);
+            window.clearTimeout(timer);
+            resolve(ok);
+          };
+          const onMeta = () => {
+            if (safeSeek > 0 && Number.isFinite(active.audioEl.duration) && safeSeek < active.audioEl.duration - 1) {
+              try {
+                active.audioEl.currentTime = safeSeek;
+              } catch {
+                // Ignore seek bounds error
+              }
+            }
+            active.audioEl.volume = 1.0;
+            active.audioEl.muted = false;
+            void active.audioEl
+              .play()
+              .then(() => finish(true))
+              .catch(() => finish(false));
+          };
+          const onErr = () => finish(false);
+          const timer = window.setTimeout(() => finish(false), 7500);
+
+          active.audioEl.addEventListener('loadedmetadata', onMeta, { once: true });
+          active.audioEl.addEventListener('error', onErr, { once: true });
+          active.audioEl.src = srcUrl;
+          active.audioEl.load();
+        });
+      };
+
+      if (track.source === 'local') {
+        const blob = await localDb.getAudioBlob(track.id);
+        if (seq !== this.playSeq || !this.isPlaying) return;
+        if (blob) {
+          if (active.objectUrl) {
+            URL.revokeObjectURL(active.objectUrl);
+          }
+          const url = URL.createObjectURL(blob);
+          active.objectUrl = url;
+          const ok = await attachAndResume(url);
+          if (ok) {
+            this.isBuffering = false;
+            this.noteProgress(safeSeek, true);
+            this.emit();
+            return;
+          }
+        }
+      }
+
+      if (track.streamUrl) {
+        const isCurrentlyProxied = active.audioEl.src.includes('/api/stream/proxy');
+        const directUrl = track.streamUrl;
+        const proxiedUrl =
+          track.streamUrl.startsWith('http') && !track.streamUrl.startsWith(window.location.origin)
+            ? `/api/stream/proxy?url=${encodeURIComponent(track.streamUrl)}`
+            : track.streamUrl;
+
+        const candidates = isCurrentlyProxied ? [proxiedUrl, directUrl] : [directUrl, proxiedUrl];
+        for (const candidate of candidates) {
+          const ok = await attachAndResume(candidate);
+          if (ok) {
+            this.isBuffering = false;
+            this.noteProgress(safeSeek, true);
+            this.emit();
+            return;
+          }
+        }
+      }
+
+      if (seq === this.playSeq && track.source === 'stream') {
+        await this.recoverActiveYouTubeTrack(track, seq, safeSeek, true);
+      }
+    } finally {
+      this.audioReloadInFlight = false;
+    }
+  }
+
+  private runPlaybackWatchdogTick() {
+    if (!this.isPlaying || !this.currentTrack) return;
+    const nowMs = Date.now();
+    const active = this.activeChannel === 'A' ? this.channelA : this.channelB;
+
+    let ytState: number | undefined;
+    if (this.ytActive && this.ytPlayer && this.ytReady) {
+      try {
+        ytState = this.ytPlayer.getPlayerState();
+      } catch {
+        ytState = undefined;
+      }
+    }
+
+    const action = evaluatePlaybackWatchdog({
+      isPlaying: this.isPlaying,
+      isCrossfading: this.isCrossfading,
+      userPausedAt: this.userPausedAt,
+      nowMs,
+      audioContextState: this.ctx?.state,
+      source: this.currentTrack.source,
+      isYouTube: this.ytActive,
+      ytPlayerState: ytState,
+      isIframeFocused: this.isYtIframeFocused(),
+      audioPaused: active?.audioEl.paused,
+      audioEnded: active?.audioEl.ended,
+      audioReadyState: active?.audioEl.readyState,
+      currentTime: this.currentTime,
+      lastProgressAtMs: this.watchdogLastMovedAt,
+      isOnline: typeof navigator === 'undefined' ? true : navigator.onLine,
+      nudgeCount: this.watchdogNudgeCount,
+      recoverCount: this.watchdogRecoverCount,
+      lastNudgeAtMs: this.watchdogLastNudgeAt,
+      lastRecoverAtMs: this.watchdogLastRecoverAt,
+    });
+
+    if (action === 'none') return;
+
+    if (action === 'resume_context') {
+      if (this.ctx && this.ctx.state !== 'running') {
+        void this.ctx.resume().catch(() => {});
+      }
+      return;
+    }
+
+    if (action === 'nudge_resume') {
+      this.watchdogNudgeCount += 1;
+      this.watchdogLastNudgeAt = nowMs;
+      if (this.ytActive && this.ytPlayer && this.ytReady) {
+        try {
+          if (nowMs - this.watchdogLastMovedAt >= 6500 && this.currentTime > 1) {
+            this.ytPlayer.seekTo(Math.max(0, this.currentTime), true);
+          }
+          this.ytPlayer.unMute?.();
+          this.ytPlayer.playVideo();
+        } catch {
+          // Ignore transient YouTube API errors
+        }
+      } else if (active && !active.synthDriver && active.audioEl.src && !active.audioEl.ended) {
+        void active.audioEl.play().catch(() => {});
+      }
+      return;
+    }
+
+    if (action === 'reload_audio_at_position') {
+      this.watchdogRecoverCount += 1;
+      this.watchdogLastRecoverAt = nowMs;
+      void this.reloadActiveAudioAtPosition(this.currentTime);
+      return;
+    }
+
+    if (action === 'recover_stream') {
+      this.watchdogRecoverCount += 1;
+      this.watchdogLastRecoverAt = nowMs;
+      if (this.ytActive) {
+        void this.recoverActiveYouTubeTrack(
+          this.currentTrack,
+          this.playSeq,
+          Math.max(0, Math.floor(this.currentTime)),
+          this.watchdogRecoverCount > 1
+        );
+      } else {
+        void this.reloadActiveAudioAtPosition(this.currentTime);
+      }
+    }
+  }
+
   private startBgKeepalive() {
     if (this.bgKeepaliveTimer !== null || typeof window === 'undefined') return;
     this.bgKeepaliveTimer = window.setInterval(() => {
@@ -463,13 +714,14 @@ class DualChannelAudioEngine {
         this.stopBgKeepalive();
         return;
       }
+      this.runPlaybackWatchdogTick();
       const inBackground =
         (typeof document !== 'undefined' && document.visibilityState !== 'visible') ||
         isNativeAndroidApp();
       if (inBackground) {
         this.ensurePlaybackAliveNow();
       }
-    }, 1200);
+    }, 1800);
   }
 
   private stopBgKeepalive() {
@@ -500,6 +752,8 @@ class DualChannelAudioEngine {
       syncedChannels: 2,
       isPlaying: this.isPlaying,
       isCrossfading: this.isCrossfading,
+      isBuffering: this.isBuffering,
+      streamErrorCount: this.streamErrorCount,
       currentTime: this.currentTime,
       duration: this.duration,
       sampleRate: this.ctx?.sampleRate || 48000,
@@ -591,6 +845,18 @@ class DualChannelAudioEngine {
     this.channelA.gainNode.gain.value = 1;
     this.channelB.gainNode.gain.value = 0;
 
+    // Auto-heal AudioContext suspensions / OS audio-focus interruptions mid-song
+    ctx.addEventListener('statechange', () => {
+      if (
+        this.isPlaying &&
+        !this.isRecentlyUserPaused() &&
+        !this.ytActive &&
+        ctx.state !== 'running'
+      ) {
+        void ctx.resume().catch(() => {});
+      }
+    });
+
     return ctx;
   }
 
@@ -628,7 +894,9 @@ class DualChannelAudioEngine {
 
     audioEl.addEventListener('timeupdate', () => {
       if (this.activeChannel === id && !this.ytActive && this.currentTrack?.source !== 'synth') {
+        this.isBuffering = false;
         this.currentTime = audioEl.currentTime || 0;
+        this.noteProgress(this.currentTime);
         if (Number.isFinite(audioEl.duration) && audioEl.duration > 0) {
           this.duration = audioEl.duration;
         }
@@ -636,8 +904,85 @@ class DualChannelAudioEngine {
       }
     });
 
+    audioEl.addEventListener('waiting', () => {
+      if (this.activeChannel === id && !this.ytActive && this.currentTrack?.source === 'stream') {
+        this.isBuffering = true;
+        this.emit();
+      }
+    });
+
+    audioEl.addEventListener('stalled', () => {
+      if (this.activeChannel === id && !this.ytActive && this.currentTrack?.source === 'stream') {
+        this.isBuffering = true;
+        this.emit();
+      }
+    });
+
+    audioEl.addEventListener('playing', () => {
+      if (this.activeChannel === id && !this.ytActive) {
+        this.isBuffering = false;
+        this.noteProgress(audioEl.currentTime || this.currentTime, true);
+        this.emit();
+      }
+    });
+
+    audioEl.addEventListener('pause', () => {
+      if (
+        this.activeChannel === id &&
+        !this.ytActive &&
+        this.isPlaying &&
+        !audioEl.ended &&
+        !this.audioReloadInFlight &&
+        !this.isRecentlyUserPaused()
+      ) {
+        // Recover swiftly from transient OS/Bluetooth focus ducks
+        window.setTimeout(() => this.ensurePlaybackAliveNow(), 140);
+        window.setTimeout(() => this.ensurePlaybackAliveNow(), 520);
+      }
+    });
+
+    audioEl.addEventListener('error', () => {
+      if (this.activeChannel === id && !this.ytActive && this.currentTrack) {
+        if (this.currentTrack.source === 'stream') {
+          this.isBuffering = true;
+          this.streamErrorCount += 1;
+          this.emit();
+        }
+        if (
+          this.isPlaying &&
+          !this.isRecentlyUserPaused() &&
+          this.watchdogRecoverCount < 2
+        ) {
+          this.watchdogRecoverCount += 1;
+          this.watchdogLastRecoverAt = Date.now();
+          const resumePos = Math.max(0, audioEl.currentTime || this.currentTime);
+          window.setTimeout(() => {
+            void this.reloadActiveAudioAtPosition(resumePos);
+          }, 700);
+        }
+      }
+    });
+
     audioEl.addEventListener('ended', () => {
       if (this.activeChannel === id && !this.ytActive) {
+        const online = typeof navigator === 'undefined' ? true : navigator.onLine;
+        const curPos = audioEl.currentTime || this.currentTime;
+        if (
+          isPrematureStreamEnded({
+            source: this.currentTrack?.source,
+            currentTime: curPos,
+            expectedDuration: this.duration,
+            isOnline: online,
+            retriesUsed: this.prematureEndRetries,
+          })
+        ) {
+          this.prematureEndRetries += 1;
+          this.isBuffering = true;
+          this.emit();
+          void this.reloadActiveAudioAtPosition(curPos);
+          return;
+        }
+        this.isBuffering = false;
         this.isPlaying = false;
         this.emit();
         for (const fn of this.endListeners) fn();
@@ -716,6 +1061,7 @@ class DualChannelAudioEngine {
         const dur = this.ytPlayer.getDuration();
         if (Number.isFinite(cur) && cur >= 0) {
           this.currentTime = cur;
+          this.noteProgress(cur);
         }
         if (Number.isFinite(dur) && dur > 0) {
           this.duration = dur;
@@ -737,6 +1083,7 @@ class DualChannelAudioEngine {
   private rampYtVolume(from: number, to: number, seconds: number, onComplete?: () => void) {
     this.clearYtVolumeFade();
     if (!this.ytPlayer || !this.ytReady) {
+      if (to > 0) this.isCrossfading = false;
       onComplete?.();
       return;
     }
@@ -746,6 +1093,7 @@ class DualChannelAudioEngine {
       } catch {
         // Ignore
       }
+      if (to > 0) this.isCrossfading = false;
       onComplete?.();
       return;
     }
@@ -768,6 +1116,9 @@ class DualChannelAudioEngine {
       }
       if (ratio >= 1) {
         this.clearYtVolumeFade();
+        if (to > 0) {
+          this.isCrossfading = false;
+        }
         onComplete?.();
       }
     }, 50);
@@ -865,6 +1216,7 @@ class DualChannelAudioEngine {
    */
   private refreshYouTubeCompositorSurface() {
     if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    this.lastCompositorNudgeAt = Date.now();
     this.cancelCompositorNudge();
     const frame = document.getElementById('kago-yt-frame');
     if (!frame) return;
@@ -1163,9 +1515,24 @@ class DualChannelAudioEngine {
                 const stateEnded = window.YT?.PlayerState?.ENDED ?? 0;
                 const statePlaying = window.YT?.PlayerState?.PLAYING ?? 1;
                 const statePaused = window.YT?.PlayerState?.PAUSED ?? 2;
-                if (ev.data === statePlaying) {
+                const stateBuffering = window.YT?.PlayerState?.BUFFERING ?? 3;
+                if (ev.data === stateBuffering || ev.data === -1) {
+                  this.isBuffering = true;
+                  this.emit();
+                } else if (ev.data === 5) {
+                  // CUED mid-song / post-switch -> keep playback flowing unless paused by user
+                  if (this.isPlaying && !this.isRecentlyUserPaused()) {
+                    try {
+                      ev.target.playVideo();
+                    } catch {
+                      // Ignore
+                    }
+                  }
+                } else if (ev.data === statePlaying) {
                   this.clearYtStartupWatchdog();
+                  this.isBuffering = false;
                   this.isPlaying = true;
+                  this.noteProgress(ev.target.getCurrentTime() || this.currentTime, true);
                   try {
                     ev.target.unMute?.();
                     if (!this.isCrossfading) {
@@ -1183,14 +1550,17 @@ class DualChannelAudioEngine {
                   this.syncYouTubeHostGeometry();
                   this.emit();
                 } else if (ev.data === statePaused) {
+                  this.isBuffering = false;
                   const vis = typeof document !== 'undefined' ? document.visibilityState : 'visible';
+                  const iframeFocused = this.isYtIframeFocused();
                   if (
-                    shouldAutoResumeBackgroundPause({
+                    shouldAutoResumePlaybackPause({
                       isPlaying: this.isPlaying,
-                      visibilityState: vis,
-                      now: Date.now(),
-                      backgroundTransitionUntil: this.backgroundTransitionUntil,
                       userPausedAt: this.userPausedAt,
+                      nowMs: Date.now(),
+                      visibilityState: vis,
+                      backgroundTransitionUntil: this.backgroundTransitionUntil,
+                      isIframeFocused: iframeFocused,
                     })
                   ) {
                     try {
@@ -1202,13 +1572,17 @@ class DualChannelAudioEngine {
                     window.setTimeout(() => this.ensurePlaybackAliveNow(), 600);
                     return;
                   }
-                  if (vis === 'visible' || (this.userPausedAt > 0 && Date.now() - this.userPausedAt < 2000)) {
+                  if (iframeFocused) {
+                    this.userPausedAt = Date.now();
+                  }
+                  if (vis === 'visible' || this.isRecentlyUserPaused()) {
                     this.isPlaying = false;
                     this.stopYtTicker();
                     this.stopBgKeepalive();
                     this.emit();
                   }
                 } else if (ev.data === stateEnded) {
+                  this.isBuffering = false;
                   this.isPlaying = false;
                   this.stopYtTicker();
                   this.stopBgKeepalive();
@@ -1218,7 +1592,15 @@ class DualChannelAudioEngine {
               },
               onError: () => {
                 if (!this.ytActive || !this.currentTrack) return;
-                void this.recoverActiveYouTubeTrack(this.currentTrack, this.playSeq);
+                this.isBuffering = true;
+                this.streamErrorCount += 1;
+                this.emit();
+                void this.recoverActiveYouTubeTrack(
+                  this.currentTrack,
+                  this.playSeq,
+                  Math.max(0, Math.floor(this.currentTime)),
+                  true
+                );
               },
             },
           });
@@ -1256,10 +1638,36 @@ class DualChannelAudioEngine {
     return this.ytLoadPromise;
   }
 
-  private async recoverActiveYouTubeTrack(track: Track, seq: number) {
+  private async recoverActiveYouTubeTrack(
+    track: Track,
+    seq: number,
+    resumeSeconds = 0,
+    preferAlternate = false
+  ) {
     if (seq !== this.playSeq) return;
     const activeStrip = this.activeChannel === 'A' ? this.channelA : this.channelB;
     if (!activeStrip) return;
+
+    // If stalled mid-song on a playable YouTube video, first reload the exact same stream at saved position
+    if (
+      !preferAlternate &&
+      resumeSeconds > 2 &&
+      track.youtubeId &&
+      this.ytPlayer &&
+      this.ytReady &&
+      this.ytRecoveryAttempts === 0
+    ) {
+      this.ytRecoveryAttempts += 1;
+      try {
+        this.ytPlayer.loadVideoById(track.youtubeId, resumeSeconds);
+        this.ytPlayer.playVideo();
+        this.noteProgress(resumeSeconds, true);
+        this.emit();
+        return;
+      } catch {
+        // Fall through to alternate stream search
+      }
+    }
 
     if (this.ytRecoveryAttempts < 2) {
       this.ytRecoveryAttempts += 1;
@@ -1292,8 +1700,13 @@ class DualChannelAudioEngine {
             };
             this.currentTrack = updated;
             this.duration = updated.duration;
-            this.currentTime = 0;
-            this.ytPlayer.loadVideoById(data.youtubeId, 0);
+            const targetStart =
+              resumeSeconds > 2 && (!updated.duration || resumeSeconds < updated.duration - 8)
+                ? resumeSeconds
+                : 0;
+            this.currentTime = targetStart;
+            this.noteProgress(targetStart, true);
+            this.ytPlayer.loadVideoById(data.youtubeId, targetStart);
             this.emit();
             return;
           }
@@ -1409,12 +1822,16 @@ class DualChannelAudioEngine {
     }
 
     this.userPausedAt = 0;
+    this.isBuffering = track.source === 'stream';
+    this.streamErrorCount = 0;
     this.activeChannel = incomingChannelId;
     this.currentTrack = track;
     this.currentTime = 0;
     this.duration = track.duration || 180;
     this.isPlaying = true;
+    this.resetWatchdog(track.id);
     localDb.pushHistory(track.id);
+    localDb.incrementPlayCount(track.id);
 
     const now = ctx.currentTime;
     if (wasPlaying && crossfade > 0 && outgoingStrip && outgoingStrip !== incomingStrip) {
@@ -1576,6 +1993,7 @@ class DualChannelAudioEngine {
   pause(): void {
     if (!this.currentTrack) return;
     this.userPausedAt = Date.now();
+    this.isBuffering = false;
     this.isPlaying = false;
     this.stopBgKeepalive();
 
@@ -1659,6 +2077,7 @@ class DualChannelAudioEngine {
   seek(targetSeconds: number): void {
     const clamped = Math.max(0, Math.min(this.duration || 180, targetSeconds));
     this.currentTime = clamped;
+    this.noteProgress(clamped, true);
 
     if (this.ytActive && this.ytPlayer && this.ytReady) {
       try {

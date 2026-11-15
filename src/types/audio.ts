@@ -116,6 +116,8 @@ export interface AudioEngineSnapshot {
   syncedChannels: number;
   isPlaying: boolean;
   isCrossfading: boolean;
+  isBuffering: boolean;
+  streamErrorCount: number;
   currentTime: number;
   duration: number;
   sampleRate: number;
