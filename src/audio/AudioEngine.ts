@@ -8,6 +8,7 @@ import {
   subscribeNativeKeepalive,
 } from '../utils/nativeMediaBridge';
 import {
+  clampCrossfadeSeconds,
   computeMasterOutputGain,
   extractYouTubeSearchResults,
   rankYouTubeSearchResults,
@@ -602,6 +603,15 @@ class DualChannelAudioEngine {
       objectUrl: null,
       fadeTimer: null,
     };
+
+    audioEl.addEventListener('loadedmetadata', () => {
+      if (this.activeChannel === id && !this.ytActive && this.currentTrack?.source !== 'synth') {
+        if (Number.isFinite(audioEl.duration) && audioEl.duration > 0) {
+          this.duration = audioEl.duration;
+          this.emit();
+        }
+      }
+    });
 
     audioEl.addEventListener('timeupdate', () => {
       if (this.activeChannel === id && !this.ytActive && this.currentTrack?.source !== 'synth') {
@@ -1208,7 +1218,7 @@ class DualChannelAudioEngine {
     }
 
     const wasPlaying = this.isPlaying && this.currentTrack !== null;
-    const crossfade = wasPlaying ? this.dspSettings.crossfadeSeconds : 0;
+    const crossfade = wasPlaying ? clampCrossfadeSeconds(this.dspSettings.crossfadeSeconds) : 0;
 
     const outgoingChannelId = this.activeChannel;
     const incomingChannelId: 'A' | 'B' =
@@ -1241,7 +1251,10 @@ class DualChannelAudioEngine {
     if (wasPlaying && crossfade > 0 && outgoingStrip && outgoingStrip !== incomingStrip) {
       this.isCrossfading = true;
       outgoingStrip.gainNode.gain.cancelScheduledValues(now);
-      outgoingStrip.gainNode.gain.setValueAtTime(outgoingStrip.gainNode.gain.value || 1, now);
+      outgoingStrip.gainNode.gain.setValueAtTime(
+        Math.max(0.01, outgoingStrip.gainNode.gain.value),
+        now
+      );
       outgoingStrip.gainNode.gain.linearRampToValueAtTime(0, now + crossfade);
 
       incomingStrip.gainNode.gain.cancelScheduledValues(now);
@@ -1320,18 +1333,26 @@ class DualChannelAudioEngine {
       incomingStrip.audioEl.volume = 1.0;
       incomingStrip.audioEl.muted = false;
       const blob = await localDb.getAudioBlob(track.id);
+      if (seq !== this.playSeq) return;
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
+      if (seq !== this.playSeq) return;
       if (blob) {
         const url = URL.createObjectURL(blob);
         incomingStrip.objectUrl = url;
         incomingStrip.audioEl.src = url;
+        incomingStrip.audioEl.currentTime = 0;
         try {
           await incomingStrip.audioEl.play();
         } catch {
+          if (seq !== this.playSeq) return;
           // Fallback to synth if browser rejects codec
           if (track.synthProfile) await this.startSynthOnStrip(incomingStrip, track);
         }
       } else if (track.streamUrl) {
         incomingStrip.audioEl.src = track.streamUrl;
+        incomingStrip.audioEl.currentTime = 0;
         await incomingStrip.audioEl.play().catch(() => {});
       }
     } else if (track.streamUrl) {
@@ -1499,23 +1520,27 @@ class DualChannelAudioEngine {
   }
 
   updateDspSettings(next: DspSettings): void {
-    this.dspSettings = next;
-    localDb.saveDspSettings(next);
+    const normalized: DspSettings = {
+      ...next,
+      crossfadeSeconds: clampCrossfadeSeconds(next.crossfadeSeconds),
+    };
+    this.dspSettings = normalized;
+    localDb.saveDspSettings(normalized);
 
     if (this.ctx) {
       const now = this.ctx.currentTime;
       this.eqFilters.forEach((filter, idx) => {
-        filter.gain.setTargetAtTime(next.bands[idx] ?? 0, now, 0.02);
+        filter.gain.setTargetAtTime(normalized.bands[idx] ?? 0, now, 0.02);
       });
       if (this.bassBoostFilter) {
         this.bassBoostFilter.gain.setTargetAtTime(
-          next.bassBoostEnabled ? next.bassBoostDb : 0,
+          normalized.bassBoostEnabled ? normalized.bassBoostDb : 0,
           now,
           0.02
         );
       }
       if (this.masterGainNode) {
-        this.masterGainNode.gain.setTargetAtTime(computeMasterOutputGain(next), now, 0.02);
+        this.masterGainNode.gain.setTargetAtTime(computeMasterOutputGain(normalized), now, 0.02);
       }
     }
   }

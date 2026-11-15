@@ -1,5 +1,6 @@
 import React from 'react';
 import {
+  ArrowLeftRight,
   ChevronRight,
   FolderOpen,
   FolderSearch,
@@ -153,7 +154,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <p className="font-mono-tabular text-xs text-[#8E929B] truncate">
                 Preset: {dsp.preset} · Bass Boost:{' '}
                 {dsp.bassBoostEnabled ? `+${dsp.bassBoostDb} dB` : 'Bypass'} · Crossfade:{' '}
-                {dsp.crossfadeSeconds.toFixed(1)}s
+                {dsp.crossfadeSeconds <= 0 ? 'Off' : `${dsp.crossfadeSeconds.toFixed(1)}s`}
               </p>
             </div>
           </div>
@@ -219,11 +220,84 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       </section>
 
-      {/* Playback & Autoplay Radio */}
+      {/* Playback, Crossfade & Autoplay Radio */}
       <section className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-4 sm:p-6 space-y-3">
         <h2 className="font-display text-base sm:text-lg font-bold text-[#F4F3F0]">
           Streaming &amp; Playback
         </h2>
+
+        {/* User-Configurable Crossfade Duration */}
+        <div className="rounded-xl border border-[#1E2028] bg-[#07080B] px-4 py-3.5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-3 min-w-0">
+              <ArrowLeftRight className="h-4 w-4 shrink-0 text-[#E11D48]" />
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-[#F4F3F0]">Track Crossfade</div>
+                <div className="text-xs text-[#8E929B]">
+                  Seamlessly fade from one song into the next when switching tracks
+                </div>
+              </div>
+            </div>
+            <span
+              data-testid="settings-crossfade-value"
+              className="shrink-0 font-mono-tabular text-sm font-bold text-[#FF4D6D]"
+            >
+              {dsp.crossfadeSeconds <= 0 ? 'Off (0s)' : `${dsp.crossfadeSeconds.toFixed(1)}s`}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <span className="font-mono-tabular text-xs text-[#8E929B] shrink-0">0s</span>
+            <input
+              type="range"
+              min={0}
+              max={10}
+              step={0.5}
+              value={Math.min(10, dsp.crossfadeSeconds)}
+              aria-label="Track Crossfade Duration in seconds"
+              onChange={(e) =>
+                onUpdateDsp({
+                  ...dsp,
+                  crossfadeSeconds: Number(e.target.value),
+                })
+              }
+              className="hardware-slider w-full"
+            />
+            <span className="font-mono-tabular text-xs text-[#F4F3F0] shrink-0">10s</span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {[
+              { label: 'Off', value: 0 },
+              { label: '1s', value: 1 },
+              { label: '2s', value: 2 },
+              { label: '3s', value: 3 },
+              { label: '5s', value: 5 },
+            ].map((preset) => {
+              const active = Math.abs(dsp.crossfadeSeconds - preset.value) < 0.05;
+              return (
+                <button
+                  key={preset.label}
+                  type="button"
+                  aria-pressed={active}
+                  onClick={() =>
+                    onUpdateDsp({
+                      ...dsp,
+                      crossfadeSeconds: preset.value,
+                    })
+                  }
+                  className={`rounded-lg border px-3 py-1.5 font-mono-tabular text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    active
+                      ? 'border-[#E11D48] bg-[#E11D48] text-white'
+                      : 'border-[#232631] bg-[#13151B] text-[#B4B7C2] hover:border-[#E11D48] hover:text-white'
+                  }`}
+                >
+                  {preset.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
 
         <div className="flex items-center justify-between gap-3 rounded-xl border border-[#1E2028] bg-[#07080B] px-4 py-3.5">
           <div className="flex items-center gap-3 min-w-0">

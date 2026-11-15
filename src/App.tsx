@@ -37,7 +37,12 @@ import {
   subscribeNativePipState,
   syncNativeNowPlaying,
 } from './utils/nativeMediaBridge';
-import { mergeAutoplayQueue } from './utils/streamFilter';
+import {
+  buildCollectionQueue,
+  enqueueImportedOfflineTracks,
+  mergeAutoplayQueue,
+  reorderQueueItems,
+} from './utils/streamFilter';
 import { fetchSyncedLyricsForTrack } from './utils/lyricsFetcher';
 import { fetchRelatedRadioTracks } from './utils/streamRadio';
 import {
@@ -107,6 +112,13 @@ export default function App() {
       setPlaylists(dbPlaylists);
       setLyricsMap(dbLyrics);
       setLyricsHydrated(true);
+
+      // Seed saved offline songs into the queue on startup so Quick Play & Next play them automatically
+      const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
+      const offlineTracks = dbTracks.filter((t) => !stemIds.has(t.id));
+      if (offlineTracks.length > 0 && !audioEngine.getSnapshot().currentTrack) {
+        setQueue((prev) => enqueueImportedOfflineTracks(prev, offlineTracks, stemIds));
+      }
     })();
     return () => {
       active = false;
@@ -184,12 +196,39 @@ export default function App() {
           void populateRelatedRadio(track, true);
         }
       } else {
-        setQueue((prev) => (prev.some((t) => t.id === track.id) ? prev : [...prev, track]));
+        setQueue((prev) => {
+          const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
+          if (track.source === 'local' && prev.every((t) => stemIds.has(t.id))) {
+            return [track];
+          }
+          return prev.some((t) => t.id === track.id) ? prev : [...prev, track];
+        });
       }
       void audioEngine.playTrack(track);
     },
     [populateRelatedRadio]
   );
+
+  const playCollection = useCallback((tracks: Track[], startIndex = 0) => {
+    const { queue: nextQueue, startTrack } = buildCollectionQueue(tracks, startIndex);
+    if (!startTrack) return;
+    playedHistoryIdsRef.current.add(startTrack.id);
+    setQueue(nextQueue);
+    void audioEngine.playTrack(startTrack);
+  }, []);
+
+  const handleReorderQueue = useCallback((fromIndex: number, toIndex: number) => {
+    setQueue((prev) => {
+      const reordered = reorderQueueItems(prev, fromIndex, toIndex);
+      const moved = reordered[toIndex];
+      if (moved?.autoQueued) {
+        return reordered.map((item, idx) =>
+          idx === toIndex ? { ...item, autoQueued: false } : item
+        );
+      }
+      return reordered;
+    });
+  }, []);
 
   const handleToggleAutoplayRadio = useCallback(() => {
     setAutoplayRadioEnabled((prev) => {
@@ -455,11 +494,14 @@ export default function App() {
     for (const { track, file } of entries) {
       await localDb.saveTrack(track, file);
     }
+    const importedTracks = entries.map((e) => e.track);
     setSavedTracks((prev) => {
       const existingIds = new Set(prev.map((t) => t.id));
-      const newOnes = entries.map((e) => e.track).filter((t) => !existingIds.has(t.id));
+      const newOnes = importedTracks.filter((t) => !existingIds.has(t.id));
       return [...newOnes, ...prev];
     });
+    const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
+    setQueue((prev) => enqueueImportedOfflineTracks(prev, importedTracks, stemIds));
   };
 
   const handlePickSongFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -508,7 +550,7 @@ export default function App() {
       if (imported.length > 0) {
         await handleImportTracks(imported);
         setActiveTab('library');
-        if (!engine.currentTrack) {
+        if (!engine.currentTrack || !engine.isPlaying || engine.currentTrack.source === 'synth') {
           playTrack(imported[0].track);
         }
       }
@@ -528,7 +570,7 @@ export default function App() {
         if (!result.cancelled && !result.error && result.entries.length > 0) {
           await handleImportTracks(result.entries);
           setActiveTab('library');
-          if (!engine.currentTrack) {
+          if (!engine.currentTrack || !engine.isPlaying || engine.currentTrack.source === 'synth') {
             playTrack(result.entries[0].track);
           }
         }
@@ -574,7 +616,7 @@ export default function App() {
         if (imported.length > 0) {
           await handleImportTracks(imported);
           setActiveTab('library');
-          if (!engine.currentTrack) {
+          if (!engine.currentTrack || !engine.isPlaying || engine.currentTrack.source === 'synth') {
             playTrack(imported[0].track);
           }
         }
@@ -587,7 +629,7 @@ export default function App() {
     }
 
     folderPickerRef.current?.click();
-  }, [engine.currentTrack, playTrack]);
+  }, [engine.currentTrack, engine.isPlaying, playTrack]);
 
   const handleCreatePlaylist = async (name: string, description: string) => {
     const pl: Playlist = {
@@ -754,6 +796,7 @@ export default function App() {
             favoriteIds={favoriteIds}
             engine={engine}
             onPlayTrack={playTrack}
+            onPlayCollection={playCollection}
             onTogglePlay={() => void audioEngine.togglePlay()}
             onAddToQueue={(t) =>
               setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]))
@@ -871,6 +914,7 @@ export default function App() {
         onPrev={handlePrev}
         onPlayTrack={playTrack}
         onRemoveFromQueue={(id) => setQueue((prev) => prev.filter((t) => t.id !== id))}
+        onReorderQueue={handleReorderQueue}
         onToggleFavorite={handleToggleFavorite}
         onOpenDsp={() => setIsDspOpen(true)}
         onUpdateLyricsOffset={(id, offset) => void handleUpdateLyricsOffset(id, offset)}

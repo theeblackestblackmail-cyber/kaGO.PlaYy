@@ -261,7 +261,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <div className="flex items-center justify-between py-2.5">
                 <dt className="text-[#8E929B]">Crossfade Duration</dt>
                 <dd className="font-mono-tabular font-semibold text-[#F4F3F0]">
-                  {dsp.crossfadeSeconds.toFixed(1)}s
+                  {dsp.crossfadeSeconds <= 0 ? 'Off (0s)' : `${dsp.crossfadeSeconds.toFixed(1)}s`}
                 </dd>
               </div>
               <div className="flex items-center justify-between py-2.5">

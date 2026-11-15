@@ -1337,4 +1337,79 @@ export function computeMasterOutputGain(dsp: {
   return Number(Math.max(1.0, Math.min(1.4, 1.38 - combinedBoost * 0.022)).toFixed(3));
 }
 
+export function clampCrossfadeSeconds(seconds: number): number {
+  if (!Number.isFinite(seconds)) return 2.5;
+  const clamped = Math.max(0, Math.min(12, seconds));
+  return Math.round(clamped * 10) / 10;
+}
+
+export function reorderQueueItems<T>(items: T[], fromIndex: number, toIndex: number): T[] {
+  if (
+    fromIndex === toIndex ||
+    fromIndex < 0 ||
+    toIndex < 0 ||
+    fromIndex >= items.length ||
+    toIndex >= items.length
+  ) {
+    return items;
+  }
+  const next = [...items];
+  const [moved] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, moved);
+  return next;
+}
+
+/**
+ * Enqueue a batch of uploaded/imported offline songs so all tracks automatically play in sequence
+ * rather than leaving only the first track in the queue.
+ */
+export function enqueueImportedOfflineTracks(
+  existingQueue: Track[],
+  importedTracks: Track[],
+  stemIds: Set<string>
+): Track[] {
+  if (importedTracks.length === 0) return existingQueue;
+
+  const dedupedImports: Track[] = [];
+  const importedIds = new Set<string>();
+  for (const t of importedTracks) {
+    if (!importedIds.has(t.id)) {
+      importedIds.add(t.id);
+      dedupedImports.push(t);
+    }
+  }
+
+  const onlyDefaultStems = existingQueue.every((t) => stemIds.has(t.id));
+  if (onlyDefaultStems) {
+    return dedupedImports;
+  }
+
+  const preserved = existingQueue.filter((t) => !stemIds.has(t.id) && !importedIds.has(t.id));
+  return [...preserved, ...dedupedImports];
+}
+
+export function buildCollectionQueue(
+  collectionTracks: Track[],
+  startIndex = 0
+): { queue: Track[]; startTrack: Track | null } {
+  const seen = new Set<string>();
+  const deduped: Track[] = [];
+  for (const t of collectionTracks) {
+    if (!seen.has(t.id)) {
+      seen.add(t.id);
+      deduped.push(t);
+    }
+  }
+  if (deduped.length === 0) {
+    return { queue: [], startTrack: null };
+  }
+  const target = collectionTracks[startIndex];
+  const resolvedIdx = target ? deduped.findIndex((t) => t.id === target.id) : 0;
+  const safeIdx = resolvedIdx >= 0 ? resolvedIdx : 0;
+  return {
+    queue: deduped,
+    startTrack: deduped[safeIdx] ?? deduped[0],
+  };
+}
+
 

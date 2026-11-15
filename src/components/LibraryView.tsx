@@ -24,6 +24,7 @@ interface LibraryViewProps {
   favoriteIds: string[];
   engine: AudioEngineSnapshot;
   onPlayTrack: (track: Track) => void;
+  onPlayCollection?: (tracks: Track[], startIndex: number) => void;
   onTogglePlay: () => void;
   onAddToQueue: (track: Track) => void;
   onToggleFavorite: (trackId: string) => void;
@@ -51,6 +52,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   favoriteIds,
   engine,
   onPlayTrack,
+  onPlayCollection,
   onTogglePlay,
   onAddToQueue,
   onToggleFavorite,
@@ -133,9 +135,25 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       );
     }
 
+    const playRowInList = (track: Track, listIdx: number) => {
+      if (!onPlayCollection) {
+        onPlayTrack(track);
+        return;
+      }
+      if (track.source !== 'synth') {
+        const userOnlyList = list.filter((t) => t.source !== 'synth');
+        const userIdx = userOnlyList.findIndex((t) => t.id === track.id);
+        if (userOnlyList.length > 0 && userIdx >= 0) {
+          onPlayCollection(userOnlyList, userIdx);
+          return;
+        }
+      }
+      onPlayCollection(list, listIdx);
+    };
+
     return (
       <div className="divide-y divide-[#1A1C24] rounded-xl border border-[#1F2129] bg-[#0D0E12] overflow-hidden">
-        {list.map((track) => {
+        {list.map((track, listIdx) => {
           const isCurrent = engine.currentTrack?.id === track.id;
           const isPlaying = isCurrent && engine.isPlaying;
           const isFav = favoriteIds.includes(track.id);
@@ -150,7 +168,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               <div className="flex min-w-0 flex-1 items-center gap-3">
                 <button
                   type="button"
-                  onClick={() => (isCurrent ? onTogglePlay() : onPlayTrack(track))}
+                  onClick={() => (isCurrent ? onTogglePlay() : playRowInList(track, listIdx))}
                   aria-label={isPlaying ? `Pause ${track.title}` : `Play ${track.title}`}
                   className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border transition-colors cursor-pointer ${
                     isCurrent
@@ -401,7 +419,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     {plTracks.length > 0 && (
                       <button
                         type="button"
-                        onClick={() => onPlayTrack(plTracks[0])}
+                        onClick={() =>
+                          onPlayCollection ? onPlayCollection(plTracks, 0) : onPlayTrack(plTracks[0])
+                        }
                         className="mt-4 inline-flex items-center justify-center gap-2 rounded-lg border border-[#282B36] bg-[#14161D] py-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer"
                       >
                         <Play className="h-3.5 w-3.5 fill-current text-[#E11D48]" />
@@ -432,17 +452,33 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             if (activeTracks) {
               return (
                 <div className="space-y-3">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <h2 className="font-display text-lg font-bold text-[#F4F3F0]">
                       {selectedGroup}
                     </h2>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedGroup(null)}
-                      className="rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs text-[#D1D5DB] hover:border-[#E11D48] cursor-pointer"
-                    >
-                      Back to all {subTab}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      {activeTracks.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onPlayCollection
+                              ? onPlayCollection(activeTracks, 0)
+                              : onPlayTrack(activeTracks[0])
+                          }
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer whitespace-nowrap"
+                        >
+                          <Play className="h-3.5 w-3.5 fill-current" />
+                          <span>Play All</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => setSelectedGroup(null)}
+                        className="rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs text-[#D1D5DB] hover:border-[#E11D48] cursor-pointer whitespace-nowrap"
+                      >
+                        Back to all {subTab}
+                      </button>
+                    </div>
                   </div>
                   {renderTrackRows(activeTracks)}
                 </div>

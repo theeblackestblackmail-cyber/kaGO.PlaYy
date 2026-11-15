@@ -1,9 +1,12 @@
 import { DEFAULT_DSP_SETTINGS } from '../data/presetsAndStems';
 import type { DspSettings, Playlist, StoredLyrics, Track } from '../types/audio';
 import { looksLikeMojibake, repairCorruptedTrack } from '../utils/audioMetadata';
+import { clampCrossfadeSeconds } from '../utils/streamFilter';
 
 const DB_NAME = 'kagoplay_offline_db';
 const DB_VERSION = 1;
+const MAX_IDB_AUDIO_BLOB_BYTES = 150 * 1024 * 1024;
+const memoryBlobCache = new Map<string, Blob>();
 
 const STORES = {
   TRACKS: 'tracks',
@@ -150,8 +153,11 @@ export const localDb = {
 
   async saveTrack(track: Track, audioBlob?: Blob): Promise<void> {
     await putInStore(STORES.TRACKS, track);
-    if (audioBlob && audioBlob.size <= 35 * 1024 * 1024) {
-      await putInStore(STORES.BLOBS, audioBlob, track.id);
+    if (audioBlob) {
+      memoryBlobCache.set(track.id, audioBlob);
+      if (audioBlob.size <= MAX_IDB_AUDIO_BLOB_BYTES) {
+        await putInStore(STORES.BLOBS, audioBlob, track.id);
+      }
     }
   },
 
@@ -173,10 +179,17 @@ export const localDb = {
   },
 
   async getAudioBlob(trackId: string): Promise<Blob | undefined> {
-    return getByKey<Blob>(STORES.BLOBS, trackId);
+    const cached = memoryBlobCache.get(trackId);
+    if (cached) return cached;
+    const stored = await getByKey<Blob>(STORES.BLOBS, trackId);
+    if (stored) {
+      memoryBlobCache.set(trackId, stored);
+    }
+    return stored;
   },
 
   async deleteTrack(trackId: string): Promise<void> {
+    memoryBlobCache.delete(trackId);
     await deleteByKey(STORES.TRACKS, trackId);
     await deleteByKey(STORES.BLOBS, trackId);
   },
@@ -214,6 +227,10 @@ export const localDb = {
       return {
         ...DEFAULT_DSP_SETTINGS,
         ...parsed,
+        crossfadeSeconds:
+          typeof parsed.crossfadeSeconds === 'number'
+            ? clampCrossfadeSeconds(parsed.crossfadeSeconds)
+            : DEFAULT_DSP_SETTINGS.crossfadeSeconds,
         bands:
           Array.isArray(parsed.bands) && parsed.bands.length === 5
             ? (parsed.bands as DspSettings['bands'])

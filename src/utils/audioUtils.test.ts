@@ -9,9 +9,12 @@ import {
 } from './audioMetadata';
 import {
   buildCategorySearchPlan,
+  buildCollectionQueue,
   buildInnertubeSearchBody,
   buildRadioSeedQuery,
+  clampCrossfadeSeconds,
   computeMasterOutputGain,
+  enqueueImportedOfflineTracks,
   extractYouTubeArtists,
   extractYouTubeCollections,
   extractYouTubePlaylistTracks,
@@ -29,6 +32,7 @@ import {
   parseYouTubeViewCount,
   pushRecentSearch,
   rankYouTubeSearchResults,
+  reorderQueueItems,
   shouldAutoResumeBackgroundPause,
   sortStudioQueue,
 } from './streamFilter';
@@ -897,3 +901,116 @@ test('filterMusicSuggestions, buildInnertubeSearchBody, and filterRelevantAudius
     ['audius-2']
   );
 });
+
+test('reorderQueueItems moves tracks forward, backward, and guards out-of-bounds indices', () => {
+  const mk = (id: string): Track => ({
+    id,
+    title: `Song ${id}`,
+    artist: 'Artist',
+    album: 'Offline',
+    duration: 180,
+    source: 'local',
+    addedAt: 1,
+  });
+  const q = [mk('a'), mk('b'), mk('c'), mk('d')];
+
+  const moveDown = reorderQueueItems(q, 0, 2);
+  assert.deepEqual(
+    moveDown.map((t) => t.id),
+    ['b', 'c', 'a', 'd']
+  );
+
+  const moveUp = reorderQueueItems(moveDown, 3, 1);
+  assert.deepEqual(
+    moveUp.map((t) => t.id),
+    ['b', 'd', 'c', 'a']
+  );
+
+  // Invalid or no-op moves return unchanged order
+  assert.deepEqual(reorderQueueItems(q, -1, 2).map((t) => t.id), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(reorderQueueItems(q, 1, 99).map((t) => t.id), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(reorderQueueItems(q, 2, 2).map((t) => t.id), ['a', 'b', 'c', 'd']);
+});
+
+test('enqueueImportedOfflineTracks and buildCollectionQueue queue all uploaded offline tracks in sequence', () => {
+  const stem1: Track = {
+    id: 'stem-1',
+    title: 'Stem 1',
+    artist: 'Synth',
+    album: 'Stems',
+    duration: 180,
+    source: 'synth',
+    addedAt: 1,
+  };
+  const stem2: Track = {
+    id: 'stem-2',
+    title: 'Stem 2',
+    artist: 'Synth',
+    album: 'Stems',
+    duration: 180,
+    source: 'synth',
+    addedAt: 2,
+  };
+  const stemIds = new Set(['stem-1', 'stem-2']);
+
+  const off1: Track = {
+    id: 'local-1',
+    title: 'Track One',
+    artist: 'Local Artist',
+    album: 'Folder',
+    duration: 200,
+    source: 'local',
+    addedAt: 3,
+  };
+  const off2: Track = {
+    id: 'local-2',
+    title: 'Track Two',
+    artist: 'Local Artist',
+    album: 'Folder',
+    duration: 210,
+    source: 'local',
+    addedAt: 4,
+  };
+  const off3: Track = {
+    id: 'local-3',
+    title: 'Track Three',
+    artist: 'Local Artist',
+    album: 'Folder',
+    duration: 220,
+    source: 'local',
+    addedAt: 5,
+  };
+
+  // Uploading offline tracks when queue only has default stems replaces stems cleanly with all uploaded songs
+  const afterInitialUpload = enqueueImportedOfflineTracks([stem1, stem2], [off1, off2], stemIds);
+  assert.deepEqual(
+    afterInitialUpload.map((t) => t.id),
+    ['local-1', 'local-2']
+  );
+
+  // Subsequent upload appends new songs without duplicating existing ones
+  const afterSecondUpload = enqueueImportedOfflineTracks(afterInitialUpload, [off2, off3], stemIds);
+  assert.deepEqual(
+    afterSecondUpload.map((t) => t.id),
+    ['local-1', 'local-2', 'local-3']
+  );
+
+  // Playing from Library collection queues entire folder/playlist and starts at clicked index
+  const collection = buildCollectionQueue([off1, off2, off3, off1], 1);
+  assert.deepEqual(
+    collection.queue.map((t) => t.id),
+    ['local-1', 'local-2', 'local-3']
+  );
+  assert.equal(collection.startTrack?.id, 'local-2');
+});
+
+test('clampCrossfadeSeconds enforces 0s to 12s bounds for user crossfade preferences', () => {
+  assert.equal(clampCrossfadeSeconds(0), 0);
+  assert.equal(clampCrossfadeSeconds(2), 2);
+  assert.equal(clampCrossfadeSeconds(3), 3);
+  assert.equal(clampCrossfadeSeconds(2.5), 2.5);
+  assert.equal(clampCrossfadeSeconds(-4), 0);
+  assert.equal(clampCrossfadeSeconds(25), 12);
+  assert.equal(clampCrossfadeSeconds(Number.NaN), 2.5);
+});
+

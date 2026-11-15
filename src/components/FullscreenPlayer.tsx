@@ -1,7 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  ChevronDown,
+  ChevronUp,
   Disc3,
+  GripVertical,
   Heart,
   Loader2,
   Mic2,
@@ -49,6 +52,7 @@ interface FullscreenPlayerProps {
   onPrev: () => void;
   onPlayTrack: (track: Track) => void;
   onRemoveFromQueue: (trackId: string) => void;
+  onReorderQueue?: (fromIndex: number, toIndex: number) => void;
   onToggleFavorite: (trackId: string) => void;
   onOpenDsp: () => void;
   onUpdateLyricsOffset: (trackId: string, offset: number) => void;
@@ -81,6 +85,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   onPrev,
   onPlayTrack,
   onRemoveFromQueue,
+  onReorderQueue,
   onToggleFavorite,
   onOpenDsp,
   onUpdateLyricsOffset,
@@ -96,6 +101,9 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   const [fallbackRelated, setFallbackRelated] = useState<Track[]>([]);
   const [loadingWatchRelated, setLoadingWatchRelated] = useState(false);
   const [lyricSearchQuery, setLyricSearchQuery] = useState('');
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
+  const pointerDragFromRef = useRef<number | null>(null);
   const activeLineRef = useRef<HTMLButtonElement | null>(null);
 
   const rawLrc = storedLyrics?.rawLrc ?? track?.lrcLyrics ?? '';
@@ -515,10 +523,16 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
           {subTab === 'queue' && (
             <div className="space-y-2">
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#1F2129] bg-[#0D0E12] px-3.5 py-2.5">
-                <div className="flex items-center gap-2 text-xs text-[#8E929B]">
+                <div className="flex flex-wrap items-center gap-2 text-xs text-[#8E929B]">
                   <span className="font-semibold text-[#F4F3F0]">Active Playback Queue</span>
                   <span aria-hidden="true">·</span>
                   <span className="font-mono-tabular">{queue.length} tracks</span>
+                  {queue.length > 1 && onReorderQueue && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span>Drag or use arrows to reorder</span>
+                    </>
+                  )}
                   {isFetchingRadio && (
                     <>
                       <span aria-hidden="true">·</span>
@@ -549,22 +563,106 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
               ) : (
                 queue.map((qTrack, idx) => {
                   const active = qTrack.id === track.id;
+                  const isDragging = dragIdx === idx;
+                  const isDropTarget = dragOverIdx === idx && dragIdx !== null && dragIdx !== idx;
                   return (
                     <div
                       key={`${qTrack.id}-${idx}`}
-                      className={`flex items-center justify-between gap-3 rounded-lg border px-3.5 py-2.5 ${
-                        active
+                      data-queue-index={idx}
+                      draggable={Boolean(onReorderQueue) && queue.length > 1}
+                      onDragStart={(e) => {
+                        if (!onReorderQueue) return;
+                        setDragIdx(idx);
+                        setDragOverIdx(idx);
+                        e.dataTransfer.effectAllowed = 'move';
+                        e.dataTransfer.setData('text/plain', String(idx));
+                      }}
+                      onDragOver={(e) => {
+                        if (!onReorderQueue || dragIdx === null) return;
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = 'move';
+                        if (dragOverIdx !== idx) {
+                          setDragOverIdx(idx);
+                        }
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (onReorderQueue && dragIdx !== null && dragIdx !== idx) {
+                          onReorderQueue(dragIdx, idx);
+                        }
+                        setDragIdx(null);
+                        setDragOverIdx(null);
+                      }}
+                      onDragEnd={() => {
+                        setDragIdx(null);
+                        setDragOverIdx(null);
+                      }}
+                      className={`flex items-center justify-between gap-2 rounded-lg border px-2.5 sm:px-3.5 py-2.5 transition-colors ${
+                        isDropTarget
+                          ? 'border-[#E11D48] bg-[#E11D48]/20'
+                          : active
                           ? 'border-[#E11D48] bg-[#E11D48]/10'
                           : 'border-[#1F2129] bg-[#0D0E12]'
-                      }`}
+                      } ${isDragging ? 'opacity-50' : ''}`}
                     >
+                      {onReorderQueue && queue.length > 1 && (
+                        <button
+                          type="button"
+                          aria-label={`Drag to reorder ${qTrack.title}`}
+                          title="Drag to reorder"
+                          onPointerDown={(e) => {
+                            if (e.pointerType === 'mouse') return;
+                            e.preventDefault();
+                            pointerDragFromRef.current = idx;
+                            setDragIdx(idx);
+                            setDragOverIdx(idx);
+                            try {
+                              e.currentTarget.setPointerCapture(e.pointerId);
+                            } catch {
+                              // Ignore pointer capture failure
+                            }
+                          }}
+                          onPointerMove={(e) => {
+                            if (pointerDragFromRef.current === null) return;
+                            const hit = document
+                              .elementFromPoint(e.clientX, e.clientY)
+                              ?.closest('[data-queue-index]');
+                            const rawIdx = hit?.getAttribute('data-queue-index');
+                            if (rawIdx !== null && rawIdx !== undefined) {
+                              const parsed = Number(rawIdx);
+                              if (Number.isInteger(parsed) && parsed !== dragOverIdx) {
+                                setDragOverIdx(parsed);
+                              }
+                            }
+                          }}
+                          onPointerUp={() => {
+                            const from = pointerDragFromRef.current;
+                            const to = dragOverIdx;
+                            pointerDragFromRef.current = null;
+                            if (from !== null && to !== null && from !== to) {
+                              onReorderQueue(from, to);
+                            }
+                            setDragIdx(null);
+                            setDragOverIdx(null);
+                          }}
+                          onPointerCancel={() => {
+                            pointerDragFromRef.current = null;
+                            setDragIdx(null);
+                            setDragOverIdx(null);
+                          }}
+                          className="touch-none flex h-8 w-6 shrink-0 items-center justify-center rounded text-[#8E929B] hover:text-white cursor-grab active:cursor-grabbing"
+                        >
+                          <GripVertical className="h-4 w-4" />
+                        </button>
+                      )}
+
                       <button
                         type="button"
                         onClick={() => onPlayTrack(qTrack)}
-                        className="flex min-w-0 flex-1 items-center gap-3 text-left cursor-pointer"
+                        className="flex min-w-0 flex-1 items-center gap-2.5 text-left cursor-pointer"
                       >
                         <span
-                          className={`w-6 font-mono-tabular text-xs ${
+                          className={`w-5 shrink-0 font-mono-tabular text-xs ${
                             active ? 'font-bold text-[#FF4D6D]' : 'text-[#8E929B]'
                           }`}
                         >
@@ -589,10 +687,34 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                         </div>
                       </button>
 
-                      <div className="flex items-center gap-2 shrink-0">
-                        <span className="font-mono-tabular text-xs text-[#8E929B]">
+                      <div className="flex items-center gap-1 shrink-0">
+                        <span className="hidden sm:inline mr-1 font-mono-tabular text-xs text-[#8E929B]">
                           {formatDuration(qTrack.duration)}
                         </span>
+                        {onReorderQueue && queue.length > 1 && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={idx === 0}
+                              onClick={() => onReorderQueue(idx, idx - 1)}
+                              aria-label={`Move ${qTrack.title} up`}
+                              title="Move up"
+                              className="flex h-8 w-7 items-center justify-center rounded text-[#8E929B] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
+                            >
+                              <ChevronUp className="h-4 w-4" />
+                            </button>
+                            <button
+                              type="button"
+                              disabled={idx === queue.length - 1}
+                              onClick={() => onReorderQueue(idx, idx + 1)}
+                              aria-label={`Move ${qTrack.title} down`}
+                              title="Move down"
+                              className="flex h-8 w-7 items-center justify-center rounded text-[#8E929B] hover:text-white disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer"
+                            >
+                              <ChevronDown className="h-4 w-4" />
+                            </button>
+                          </>
+                        )}
                         <button
                           type="button"
                           onClick={() => onRemoveFromQueue(qTrack.id)}
