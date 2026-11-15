@@ -30,6 +30,7 @@ export interface NativeMediaBridgeApi {
   setVideoModeActive: (active: boolean) => void;
   requestNotificationPermission: () => void;
   fetchUrlAsync?: (requestId: string, urlString: string) => void;
+  fetchUrlPostAsync?: (requestId: string, urlString: string, jsonBody: string) => void;
   pickFolderNative?: (requestId: string) => void;
   readDocumentChunkBase64?: (uriString: string, offset: number, length: number) => string;
 }
@@ -88,14 +89,14 @@ function decodeBase64Utf8(base64: string): string {
   }
 }
 
-export function nativeFetchText(
-  url: string,
-  timeoutMs = 9500
-): Promise<{ ok: boolean; status: number; text: string } | null> {
-  if (typeof window === 'undefined' || typeof window.KaGoNative?.fetchUrlAsync !== 'function') {
-    return Promise.resolve(null);
-  }
+export function hasNativeHttpPostBridge(): boolean {
+  return typeof window !== 'undefined' && typeof window.KaGoNative?.fetchUrlPostAsync === 'function';
+}
 
+function awaitNativeHttpResponse(
+  trigger: (requestId: string) => void,
+  timeoutMs: number
+): Promise<{ ok: boolean; status: number; text: string } | null> {
   const requestId = `req-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
   return new Promise((resolve) => {
@@ -134,7 +135,7 @@ export function nativeFetchText(
 
     window.addEventListener('kago-native-http', onHttpEvent);
     try {
-      window.KaGoNative?.fetchUrlAsync?.(requestId, url);
+      trigger(requestId);
     } catch {
       if (!settled) {
         settled = true;
@@ -143,6 +144,34 @@ export function nativeFetchText(
       }
     }
   });
+}
+
+export function nativeFetchText(
+  url: string,
+  timeoutMs = 9500
+): Promise<{ ok: boolean; status: number; text: string } | null> {
+  if (typeof window === 'undefined' || typeof window.KaGoNative?.fetchUrlAsync !== 'function') {
+    return Promise.resolve(null);
+  }
+  return awaitNativeHttpResponse(
+    (requestId) => window.KaGoNative?.fetchUrlAsync?.(requestId, url),
+    timeoutMs
+  );
+}
+
+export function nativePostJson(
+  url: string,
+  body: unknown,
+  timeoutMs = 9500
+): Promise<{ ok: boolean; status: number; text: string } | null> {
+  if (typeof window === 'undefined' || typeof window.KaGoNative?.fetchUrlPostAsync !== 'function') {
+    return Promise.resolve(null);
+  }
+  const serialized = typeof body === 'string' ? body : JSON.stringify(body);
+  return awaitNativeHttpResponse(
+    (requestId) => window.KaGoNative?.fetchUrlPostAsync?.(requestId, url, serialized),
+    timeoutMs
+  );
 }
 
 export function pickNativeFolder(timeoutMs = 180000): Promise<NativeFolderPickResult | null> {

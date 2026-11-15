@@ -6,6 +6,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import {
   buildCategorySearchPlan,
+  buildInnertubeSearchBody,
   buildRadioSeedQuery,
   extractYouTubeArtists,
   extractYouTubeCollections,
@@ -13,11 +14,13 @@ import {
   extractYouTubePodcasts,
   extractYouTubeRelatedResults,
   extractYouTubeSearchResults,
+  filterRelevantAudiusTracks,
   isIndividualSong,
   parseYouTubeSuggestResponse,
   rankYouTubeSearchResults,
   sortStudioQueue,
   toYouTubeTracks,
+  type ParsedYouTubeVideo,
 } from './src/utils/streamFilter';
 import {
   convertPlainLyricsToLrc,
@@ -142,6 +145,71 @@ interface AudiusTrack {
   artwork?: { '480x480'?: string; '150x150'?: string };
 }
 
+const YT_COOKIE_HEADER =
+  'SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwODE0LjA3X3AwGgJlbiACGgYIgJnPsgY; PREF=hl=en&gl=US&f6=8';
+
+async function fetchYouTubeSearchPayload(
+  searchQuery: string,
+  sp?: string
+): Promise<string[]> {
+  const payloads: string[] = [];
+
+  try {
+    const innertubeRes = await fetch(
+      'https://www.youtube.com/youtubei/v1/search?prettyPrint=false',
+      {
+        method: 'POST',
+        signal: AbortSignal.timeout(6500),
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Origin: 'https://www.youtube.com',
+          Referer: 'https://www.youtube.com/',
+          Cookie: YT_COOKIE_HEADER,
+        },
+        body: buildInnertubeSearchBody(searchQuery, sp),
+      }
+    );
+    if (innertubeRes.ok) {
+      const jsonText = await innertubeRes.text();
+      if (jsonText.trim().startsWith('{')) {
+        payloads.push(jsonText);
+      }
+    }
+  } catch {
+    // Fall back to HTML scrape
+  }
+
+  if (payloads.length === 0) {
+    try {
+      const spParam = sp ? `&sp=${sp}` : '';
+      const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(
+        searchQuery
+      )}${spParam}&gl=US&hl=en&persist_gl=1&persist_hl=1`;
+
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(7000),
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Cookie: YT_COOKIE_HEADER,
+        },
+      });
+      if (response.ok) {
+        payloads.push(await response.text());
+      }
+    } catch {
+      // Unreachable
+    }
+  }
+
+  return payloads;
+}
+
 async function searchYouTubeCategory(
   rawQuery: string,
   genre = '',
@@ -150,46 +218,79 @@ async function searchYouTubeCategory(
 ): Promise<{ tracks: Track[]; artists: StreamArtistResult[] }> {
   try {
     const plan = buildCategorySearchPlan(rawQuery, genre, category);
-    const spParam = plan.sp ? `&sp=${plan.sp}` : '';
-    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(
-      plan.searchQuery
-    )}${spParam}`;
+    const payloads = await fetchYouTubeSearchPayload(plan.searchQuery, plan.sp);
 
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(7000),
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-        Cookie: 'SOCS=CAI',
-      },
-    });
-    if (!response.ok) return { tracks: [], artists: [] };
-    const html = await response.text();
+    const allArtists: StreamArtistResult[] = [];
+    const seenArtists = new Set<string>();
+    const addArtists = (list: StreamArtistResult[]) => {
+      for (const a of list) {
+        const key = a.name.toLowerCase();
+        if (!seenArtists.has(key)) {
+          seenArtists.add(key);
+          allArtists.push(a);
+        }
+      }
+    };
 
-    const artists = extractYouTubeArtists(html);
+    for (const p of payloads) {
+      addArtists(extractYouTubeArtists(p));
+    }
 
     if (category === 'albums' || category === 'playlists' || category === 'featured_playlists') {
-      const collections = extractYouTubeCollections(html, category, genre);
-      return { tracks: collections, artists };
+      for (const p of payloads) {
+        const collections = extractYouTubeCollections(p, category, genre);
+        if (collections.length > 0) return { tracks: collections, artists: allArtists };
+      }
+      return { tracks: [], artists: allArtists };
     }
 
     if (category === 'podcasts') {
-      const podcasts = extractYouTubePodcasts(html, genre);
-      return { tracks: podcasts, artists };
+      for (const p of payloads) {
+        const podcasts = extractYouTubePodcasts(p, genre);
+        if (podcasts.length > 0) return { tracks: podcasts, artists: allArtists };
+      }
+      return { tracks: [], artists: allArtists };
     }
 
-    const extracted = extractYouTubeSearchResults(html).filter(
-      (item) => !excludeYoutubeId || item.videoId !== excludeYoutubeId
+    const mergedMap = new Map<string, ParsedYouTubeVideo>();
+    const collectVideos = (raw: string) => {
+      for (const item of extractYouTubeSearchResults(raw)) {
+        if (excludeYoutubeId && item.videoId === excludeYoutubeId) continue;
+        if (!mergedMap.has(item.videoId)) {
+          mergedMap.set(item.videoId, item);
+        }
+      }
+    };
+    for (const p of payloads) {
+      collectVideos(p);
+    }
+
+    const hasOfficialYet = Array.from(mergedMap.values()).some(
+      (v) => v.isOfficial || (v.viewCount || 0) >= 100_000
     );
+    if ((mergedMap.size < 3 || !hasOfficialYet) && (plan.sp || plan.searchQuery !== rawQuery.trim())) {
+      const organicQuery =
+        [rawQuery.trim(), genre ? `${genre} music` : ''].filter(Boolean).join(' ') ||
+        plan.searchQuery;
+      const organicPayloads = await fetchYouTubeSearchPayload(organicQuery, undefined);
+      for (const p of organicPayloads) {
+        addArtists(extractYouTubeArtists(p));
+        collectVideos(p);
+      }
+    }
+
     const rankingQuery = rawQuery.trim() || plan.searchQuery;
-    const ranked = rankYouTubeSearchResults(extracted, rankingQuery, category).slice(0, 15);
+    const ranked = rankYouTubeSearchResults(
+      Array.from(mergedMap.values()),
+      rankingQuery,
+      category
+    ).slice(0, 15);
     const tracks = toYouTubeTracks(ranked, genre).map((t) => ({
       ...t,
       resultType: category === 'videos' ? ('video' as const) : ('song' as const),
     }));
 
-    return { tracks, artists };
+    return { tracks, artists: allArtists };
   } catch {
     return { tracks: [], artists: [] };
   }
@@ -302,7 +403,7 @@ async function startServer() {
       return res.json({ suggestions: [] });
     }
     try {
-      const suggestUrl = `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(
+      const suggestUrl = `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&hl=en&gl=us&q=${encodeURIComponent(
         query
       )}`;
       const upstream = await fetch(suggestUrl, {
@@ -314,7 +415,7 @@ async function startServer() {
       });
       if (!upstream.ok) return res.json({ suggestions: [] });
       const raw = await upstream.text();
-      return res.json({ suggestions: parseYouTubeSuggestResponse(raw) });
+      return res.json({ suggestions: parseYouTubeSuggestResponse(raw, query) });
     } catch {
       return res.json({ suggestions: [] });
     }
@@ -441,10 +542,11 @@ async function startServer() {
       });
     }
 
-    const audiusResults = await searchAudiusTracks(
+    const rawAudius = await searchAudiusTracks(
       [query, genre].filter(Boolean).join(' ') || 'synthwave',
       genre
     );
+    const audiusResults = query ? filterRelevantAudiusTracks(rawAudius, query) : rawAudius;
     if (audiusResults.length > 0) {
       return res.json({
         results: audiusResults,

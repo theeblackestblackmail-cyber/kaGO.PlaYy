@@ -24,18 +24,14 @@ import type {
 import { formatDuration } from '../utils/lrcParser';
 import { hasNativeHttpBridge, nativeFetchText } from '../utils/nativeMediaBridge';
 import {
-  buildCategorySearchPlan,
-  extractYouTubeArtists,
-  extractYouTubeCollections,
   extractYouTubePlaylistTracks,
-  extractYouTubePodcasts,
-  extractYouTubeSearchResults,
-  isIndividualSong,
-  parseYouTubeSuggestResponse,
   pushRecentSearch,
-  rankYouTubeSearchResults,
-  toYouTubeTracks,
 } from '../utils/streamFilter';
+import {
+  fetchMusicSuggestions,
+  searchStreamsUnified,
+  searchYouTubeNatively,
+} from '../utils/streamSearch';
 
 interface StreamViewProps {
   engine: AudioEngineSnapshot;
@@ -119,27 +115,9 @@ export const StreamView: React.FC<StreamViewProps> = ({
 
     let cancelled = false;
     const timer = window.setTimeout(async () => {
-      try {
-        const res = await fetch(`/api/stream/suggest?q=${encodeURIComponent(trimmed)}`);
-        if (!cancelled && res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
-          const data = (await res.json()) as { suggestions?: string[] };
-          setSuggestions(data.suggestions || []);
-          return;
-        }
-      } catch {
-        // Fall through to native Android HTTP bridge
-      }
-
-      if (!cancelled && hasNativeHttpBridge()) {
-        const nativeRes = await nativeFetchText(
-          `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(
-            trimmed
-          )}`,
-          4500
-        );
-        if (!cancelled && nativeRes?.ok && nativeRes.text) {
-          setSuggestions(parseYouTubeSuggestResponse(nativeRes.text));
-        }
+      const next = await fetchMusicSuggestions(trimmed);
+      if (!cancelled) {
+        setSuggestions(next);
       }
     }, 220);
 
@@ -148,47 +126,6 @@ export const StreamView: React.FC<StreamViewProps> = ({
       clearTimeout(timer);
     };
   }, [query]);
-
-  const searchYouTubeNatively = async (
-    searchTerm: string,
-    genreFilter: string,
-    category: StreamSearchCategory = 'all',
-    excludeId?: string
-  ): Promise<{ tracks: Track[]; artists: StreamArtistResult[] }> => {
-    if (!hasNativeHttpBridge()) return { tracks: [], artists: [] };
-    const plan = buildCategorySearchPlan(searchTerm, genreFilter, category);
-    const spParam = plan.sp ? `&sp=${plan.sp}` : '';
-    const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(
-      plan.searchQuery
-    )}${spParam}`;
-    const nativeRes = await nativeFetchText(ytUrl, 9000);
-    if (!nativeRes?.ok || !nativeRes.text) return { tracks: [], artists: [] };
-
-    const artists = extractYouTubeArtists(nativeRes.text);
-    if (category === 'albums' || category === 'playlists' || category === 'featured_playlists') {
-      return {
-        tracks: extractYouTubeCollections(nativeRes.text, category, genreFilter),
-        artists,
-      };
-    }
-    if (category === 'podcasts') {
-      return {
-        tracks: extractYouTubePodcasts(nativeRes.text, genreFilter),
-        artists,
-      };
-    }
-
-    const extracted = extractYouTubeSearchResults(nativeRes.text).filter(
-      (item) => !excludeId || item.videoId !== excludeId
-    );
-    const rankingTerm = searchTerm.trim() || plan.searchQuery;
-    const ranked = rankYouTubeSearchResults(extracted, rankingTerm, category).slice(0, 15);
-    const tracks = toYouTubeTracks(ranked, genreFilter).map((t) => ({
-      ...t,
-      resultType: category === 'videos' ? ('video' as const) : ('song' as const),
-    }));
-    return { tracks, artists };
-  };
 
   const executeSearch = async (
     searchText: string,
@@ -205,109 +142,13 @@ export const StreamView: React.FC<StreamViewProps> = ({
     setIsLoading(true);
     setStatusNote('');
 
-    const isCollectionOrPodcast =
-      category === 'albums' ||
-      category === 'playlists' ||
-      category === 'featured_playlists' ||
-      category === 'podcasts';
-
     try {
-      let liveSongs: Track[] = [];
-      let liveArtists: StreamArtistResult[] = [];
-      let sourceFlag = 'live';
-
-      // 1. Try server /api/stream/search (AI Studio / Web Node server)
-      try {
-        const params = new URLSearchParams();
-        if (cleanQ) params.set('q', cleanQ);
-        if (genreFilter) params.set('genre', genreFilter);
-        params.set('category', category);
-
-        const res = await fetch(`/api/stream/search?${params.toString()}`);
-        if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
-          const data = (await res.json()) as {
-            results?: Track[];
-            artists?: StreamArtistResult[];
-            source?: string;
-          };
-          const rawResults = data.results || [];
-          liveSongs = isCollectionOrPodcast
-            ? rawResults
-            : rawResults.filter((t) => isIndividualSong(t.title, t.album, t.duration));
-          liveArtists = Array.isArray(data.artists) ? data.artists : [];
-          sourceFlag = data.source || 'live';
-        }
-      } catch {
-        // Fall through to native APK / Audius search
-      }
-
-      // 2. Android APK native YouTube search bridge
-      if (liveSongs.length === 0 && liveArtists.length === 0 && hasNativeHttpBridge()) {
-        const nativeOut = await searchYouTubeNatively(cleanQ, genreFilter, category);
-        liveSongs = nativeOut.tracks;
-        liveArtists = nativeOut.artists;
-        if (liveSongs.length > 0 || liveArtists.length > 0) {
-          sourceFlag = 'live';
-        }
-      }
-
-      // 3. Last-resort CORS Audius fallback
-      if (liveSongs.length === 0 && category !== 'artists') {
-        const audiusQ = [cleanQ, genreFilter].filter(Boolean).join(' ') || 'synthwave';
-        const aRes = await fetch(
-          `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(audiusQ)}&limit=12`
-        );
-        if (aRes.ok) {
-          const aJson = (await aRes.json()) as {
-            data?: Array<{
-              id?: string;
-              title?: string;
-              duration?: number;
-              genre?: string;
-              user?: { name?: string };
-              artwork?: { '480x480'?: string; '150x150'?: string };
-            }>;
-          };
-          liveSongs = (aJson.data || [])
-            .filter(
-              (item) =>
-                item.id &&
-                item.title &&
-                item.duration &&
-                isIndividualSong(item.title, item.genre, item.duration)
-            )
-            .map((item) => ({
-              id: `audius-${item.id}`,
-              streamProvider: 'audius' as const,
-              title: item.title!,
-              artist: item.user?.name || 'Audius Artist',
-              album: 'Audius Full Stream',
-              duration: Math.round(item.duration!),
-              source: 'stream' as const,
-              artworkUrl: item.artwork?.['480x480'] || item.artwork?.['150x150'],
-              streamUrl: `https://api.audius.co/v1/tracks/${encodeURIComponent(item.id!)}/stream`,
-              genre: item.genre || genreFilter || 'Stream',
-              addedAt: Date.now(),
-            }));
-        }
-      }
-
-      // Derive artist cards from official song results if Artists tab yielded no dedicated channel cards
-      if (category === 'artists' && liveArtists.length === 0 && liveSongs.length > 0) {
-        const seenNames = new Set<string>();
-        for (const t of liveSongs) {
-          const key = t.artist.toLowerCase();
-          if (seenNames.has(key)) continue;
-          seenNames.add(key);
-          liveArtists.push({
-            id: `derived-${key}`,
-            name: t.artist,
-            thumbnailUrl: t.artworkUrl,
-            subscriberText: 'Artists',
-            isOfficial: t.isOfficial,
-          });
-        }
-      }
+      const { tracks: liveSongs, artists: liveArtists, source: sourceFlag } =
+        await searchStreamsUnified({
+          query: cleanQ,
+          genre: genreFilter,
+          category,
+        });
 
       setArtistResults(liveArtists);
 
@@ -324,7 +165,11 @@ export const StreamView: React.FC<StreamViewProps> = ({
       const merged = liveSongs.length > 0 ? liveSongs : localMatches;
       setResults(merged.length > 0 ? merged : category === 'artists' ? [] : CURATED_STREAM_BANK);
       if (sourceFlag === 'fallback' && liveSongs.length === 0 && liveArtists.length === 0) {
-        setStatusNote('Showing curated offline sound bank tracks (individual songs only).');
+        setStatusNote(
+          cleanQ
+            ? `No official stream matched "${cleanQ}". Showing offline curated sound bank.`
+            : 'Showing curated offline sound bank tracks (individual songs only).'
+        );
       }
     } catch {
       setArtistResults([]);

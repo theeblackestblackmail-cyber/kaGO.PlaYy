@@ -4,11 +4,10 @@ import { hasNativeHttpBridge, nativeFetchText } from './nativeMediaBridge';
 import {
   buildRadioSeedQuery,
   extractYouTubeRelatedResults,
-  extractYouTubeSearchResults,
   isIndividualSong,
-  rankYouTubeSearchResults,
   toYouTubeTracks,
 } from './streamFilter';
+import { searchYouTubeNatively } from './streamSearch';
 
 export async function fetchRelatedRadioTracks(
   seedTrack: Track,
@@ -65,20 +64,16 @@ export async function fetchRelatedRadioTracks(
 
     if (collected.length < 6) {
       const radioQuery = buildRadioSeedQuery(seedTrack);
-      const searchRes = await nativeFetchText(
-        `https://www.youtube.com/results?search_query=${encodeURIComponent(radioQuery)}&sp=EgIQAQ%3D%3D`,
-        8500
+      const nativeRelated = await searchYouTubeNatively(
+        radioQuery,
+        seedTrack.genre || '',
+        'songs',
+        seedTrack.youtubeId
       );
-      if (searchRes?.ok && searchRes.text) {
-        const extracted = extractYouTubeSearchResults(searchRes.text).filter(
-          (item) => item.videoId !== seedTrack.youtubeId
-        );
-        const ranked = rankYouTubeSearchResults(extracted, radioQuery);
-        for (const t of toYouTubeTracks(ranked, seedTrack.genre, { autoQueued: true })) {
-          if (!seenIds.has(t.id)) {
-            seenIds.add(t.id);
-            collected.push(t);
-          }
+      for (const t of nativeRelated.tracks) {
+        if (!seenIds.has(t.id)) {
+          seenIds.add(t.id);
+          collected.push({ ...t, autoQueued: true });
         }
       }
     }

@@ -368,6 +368,8 @@ public class MainActivity extends BridgeActivity {
         if (urlString == null) return false;
         return urlString.startsWith("https://www.youtube.com/")
             || urlString.startsWith("https://m.youtube.com/")
+            || urlString.startsWith("https://music.youtube.com/")
+            || urlString.startsWith("https://youtubei.googleapis.com/")
             || urlString.startsWith("https://suggestqueries.google.com/")
             || urlString.startsWith("https://api.audius.co/")
             || urlString.startsWith("https://lrclib.net/");
@@ -547,6 +549,24 @@ public class MainActivity extends BridgeActivity {
 
         @JavascriptInterface
         public void fetchUrlAsync(final String requestId, final String urlString) {
+            executeHttpRequestAsync(requestId, urlString, "GET", null);
+        }
+
+        @JavascriptInterface
+        public void fetchUrlPostAsync(
+            final String requestId,
+            final String urlString,
+            final String jsonBody
+        ) {
+            executeHttpRequestAsync(requestId, urlString, "POST", jsonBody);
+        }
+
+        private void executeHttpRequestAsync(
+            final String requestId,
+            final String urlString,
+            final String method,
+            final String jsonBody
+        ) {
             if (!isAllowedFetchUrl(urlString)) {
                 try {
                     JSONObject err = new JSONObject();
@@ -566,16 +586,32 @@ public class MainActivity extends BridgeActivity {
                 try {
                     URL url = new URL(urlString);
                     conn = (HttpURLConnection) url.openConnection();
-                    conn.setConnectTimeout(7000);
-                    conn.setReadTimeout(8000);
+                    conn.setConnectTimeout(7500);
+                    conn.setReadTimeout(9500);
                     conn.setInstanceFollowRedirects(true);
-                    conn.setRequestMethod("GET");
+                    conn.setRequestMethod(method);
                     conn.setRequestProperty(
                         "User-Agent",
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
                     );
                     conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
-                    conn.setRequestProperty("Cookie", "SOCS=CAI");
+                    conn.setRequestProperty(
+                        "Cookie",
+                        "SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjQwODE0LjA3X3AwGgJlbiACGgYIgJnPsgY; PREF=hl=en&gl=US&f6=8"
+                    );
+
+                    if ("POST".equals(method) && jsonBody != null) {
+                        byte[] bodyBytes = jsonBody.getBytes(StandardCharsets.UTF_8);
+                        conn.setDoOutput(true);
+                        conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                        conn.setRequestProperty("Accept", "application/json");
+                        conn.setRequestProperty("Origin", "https://www.youtube.com");
+                        conn.setRequestProperty("Referer", "https://www.youtube.com/");
+                        conn.setFixedLengthStreamingMode(bodyBytes.length);
+                        try (java.io.OutputStream out = conn.getOutputStream()) {
+                            out.write(bodyBytes);
+                        }
+                    }
 
                     status = conn.getResponseCode();
                     InputStream stream = (status >= 200 && status < 400)
@@ -590,7 +626,7 @@ public class MainActivity extends BridgeActivity {
                         while ((read = stream.read(chunk)) != -1) {
                             buffer.write(chunk, 0, read);
                             total += read;
-                            if (total >= 4 * 1024 * 1024) break;
+                            if (total >= 8 * 1024 * 1024) break;
                         }
                         stream.close();
                     }

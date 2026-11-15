@@ -16,15 +16,8 @@ import { CURATED_STREAM_BANK } from '../data/presetsAndStems';
 import { localDb } from '../db/localDb';
 import type { AudioEngineSnapshot, Track } from '../types/audio';
 import { formatDuration } from '../utils/lrcParser';
-import { hasNativeHttpBridge, nativeFetchText } from '../utils/nativeMediaBridge';
-import {
-  extractYouTubeSearchResults,
-  isIndividualSong,
-  parseYouTubeSuggestResponse,
-  pushRecentSearch,
-  rankYouTubeSearchResults,
-  toYouTubeTracks,
-} from '../utils/streamFilter';
+import { pushRecentSearch } from '../utils/streamFilter';
+import { fetchMusicSuggestions, searchStreamsUnified } from '../utils/streamSearch';
 
 interface SearchViewProps {
   libraryTracks: Track[];
@@ -91,31 +84,9 @@ export const SearchView: React.FC<SearchViewProps> = ({
 
     let cancelled = false;
     const timer = window.setTimeout(async () => {
-      try {
-        const res = await fetch(`/api/stream/suggest?q=${encodeURIComponent(trimmed)}`);
-        if (
-          !cancelled &&
-          res.ok &&
-          (res.headers.get('content-type') || '').includes('application/json')
-        ) {
-          const data = (await res.json()) as { suggestions?: string[] };
-          setSuggestions(data.suggestions || []);
-          return;
-        }
-      } catch {
-        // Fall through to native Android HTTP bridge
-      }
-
-      if (!cancelled && hasNativeHttpBridge()) {
-        const nativeRes = await nativeFetchText(
-          `https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(
-            trimmed
-          )}`,
-          4500
-        );
-        if (!cancelled && nativeRes?.ok && nativeRes.text) {
-          setSuggestions(parseYouTubeSuggestResponse(nativeRes.text));
-        }
+      const next = await fetchMusicSuggestions(trimmed);
+      if (!cancelled) {
+        setSuggestions(next);
       }
     }, 220);
 
@@ -149,74 +120,10 @@ export const SearchView: React.FC<SearchViewProps> = ({
     setHasSearchedOnline(true);
 
     try {
-      let liveSongs: Track[] = [];
-
-      // 1. Try Node server search
-      try {
-        const res = await fetch(`/api/stream/search?q=${encodeURIComponent(cleanQ)}`);
-        if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
-          const data = (await res.json()) as { results?: Track[] };
-          liveSongs = (data.results || []).filter((t) =>
-            isIndividualSong(t.title, t.album, t.duration)
-          );
-        }
-      } catch {
-        // Fall through to native Android HTTP bridge
-      }
-
-      // 2. Native Android YouTube search
-      if (liveSongs.length === 0 && hasNativeHttpBridge()) {
-        const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(
-          cleanQ
-        )}&sp=EgIQAQ%3D%3D`;
-        const nativeRes = await nativeFetchText(ytUrl, 9000);
-        if (nativeRes?.ok && nativeRes.text) {
-          const extracted = extractYouTubeSearchResults(nativeRes.text);
-          const ranked = rankYouTubeSearchResults(extracted, cleanQ).slice(0, 12);
-          liveSongs = toYouTubeTracks(ranked, '');
-        }
-      }
-
-      // 3. Audius CORS fallback
-      if (liveSongs.length === 0) {
-        const aRes = await fetch(
-          `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(cleanQ)}&limit=12`
-        );
-        if (aRes.ok) {
-          const aJson = (await aRes.json()) as {
-            data?: Array<{
-              id?: string;
-              title?: string;
-              duration?: number;
-              genre?: string;
-              user?: { name?: string };
-              artwork?: { '480x480'?: string; '150x150'?: string };
-            }>;
-          };
-          liveSongs = (aJson.data || [])
-            .filter(
-              (item) =>
-                item.id &&
-                item.title &&
-                item.duration &&
-                isIndividualSong(item.title, item.genre, item.duration)
-            )
-            .map((item) => ({
-              id: `audius-${item.id}`,
-              streamProvider: 'audius' as const,
-              title: item.title!,
-              artist: item.user?.name || 'Audius Artist',
-              album: 'Audius Full Stream',
-              duration: Math.round(item.duration!),
-              source: 'stream' as const,
-              artworkUrl: item.artwork?.['480x480'] || item.artwork?.['150x150'],
-              streamUrl: `https://api.audius.co/v1/tracks/${encodeURIComponent(item.id!)}/stream`,
-              genre: item.genre || 'Stream',
-              addedAt: Date.now(),
-            }));
-        }
-      }
-
+      const { tracks: liveSongs } = await searchStreamsUnified({
+        query: cleanQ,
+        category: 'all',
+      });
       setStreamResults(liveSongs.length > 0 ? liveSongs : CURATED_STREAM_BANK);
     } finally {
       setIsSearching(false);

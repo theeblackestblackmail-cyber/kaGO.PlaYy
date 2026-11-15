@@ -9,6 +9,7 @@ import {
 } from './audioMetadata';
 import {
   buildCategorySearchPlan,
+  buildInnertubeSearchBody,
   buildRadioSeedQuery,
   computeMasterOutputGain,
   extractYouTubeArtists,
@@ -17,6 +18,8 @@ import {
   extractYouTubePodcasts,
   extractYouTubeRelatedResults,
   extractYouTubeSearchResults,
+  filterMusicSuggestions,
+  filterRelevantAudiusTracks,
   isIndividualSong,
   MAX_RECENT_SEARCHES,
   mergeAutoplayQueue,
@@ -594,10 +597,10 @@ test('rankYouTubeSearchResults ranks popular official songs #1 even with minor s
     },
   ];
 
-  // Typo "wangeci" (missing 'h') still boosts official 3.4M hit to #1
+  // Typo "wangeci" (missing 'h') still boosts official 3.4M hit to #1 and filters out unrequested acoustic covers
   const ranked = rankYouTubeSearchResults(candidates, 'we wega wangeci', 'songs');
   assert.equal(ranked[0].videoId, 'popularhit1');
-  assert.equal(ranked[ranked.length - 1].videoId, 'coverhit002');
+  assert.equal(ranked.some((r) => r.videoId === 'coverhit002'), false);
 });
 
 test('buildCategorySearchPlan builds appropriate search queries and YouTube filters for all 8 categories', () => {
@@ -775,4 +778,122 @@ test('sanitizeTrackForLyrics, pickBestLrclibCandidate, and convertPlainLyricsToL
   const parsed = parseLrc(lrc);
   assert.equal(parsed.length, 3);
   assert.ok(parsed[0].time < parsed[1].time && parsed[1].time < parsed[2].time);
+});
+
+test('extractYouTubeSearchResults parses Innertube JSON, videoWithContextRenderer, and rejects unverified "Official Audio" title spam', () => {
+  const innertubeJson = JSON.stringify({
+    contents: {
+      twoColumnSearchResultsRenderer: {
+        primaryContents: {
+          sectionListRenderer: {
+            contents: [
+              {
+                itemSectionRenderer: {
+                  contents: [
+                    {
+                      // Spam channel putting "Official Lyric Video" in title with 650 views
+                      videoWithContextRenderer: {
+                        videoId: 'spam0000001',
+                        headline: { runs: [{ text: 'Burna Boy - Last Last (Official Lyric Video)' }] },
+                        shortBylineText: { runs: [{ text: 'Random Lyrics Uploads' }] },
+                        lengthText: { simpleText: '2:53' },
+                        shortViewCountText: { simpleText: '650 views' },
+                      },
+                    },
+                    {
+                      // Sped up derivative version with medium views
+                      videoRenderer: {
+                        videoId: 'spedup00002',
+                        title: { runs: [{ text: 'Burna Boy - Last Last (Sped Up + Reverb)' }] },
+                        ownerText: { runs: [{ text: 'SpeedBeats' }] },
+                        lengthText: { simpleText: '2:25' },
+                        viewCountText: { simpleText: '420K views' },
+                      },
+                    },
+                    {
+                      // Real verified official hit
+                      videoRenderer: {
+                        videoId: '421w1j87fEM',
+                        title: { runs: [{ text: 'Burna Boy - Last Last [Official Music Video]' }] },
+                        ownerText: { runs: [{ text: 'Burna Boy' }] },
+                        ownerBadges: [{ metadataBadgeRenderer: { style: 'BADGE_STYLE_TYPE_VERIFIED_ARTIST' } }],
+                        lengthText: { simpleText: '2:56' },
+                        viewCountText: { simpleText: '340M views' },
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+  });
+
+  const extracted = extractYouTubeSearchResults(innertubeJson);
+  assert.equal(extracted.length, 3);
+
+  const spamItem = extracted.find((v) => v.videoId === 'spam0000001');
+  const officialItem = extracted.find((v) => v.videoId === '421w1j87fEM');
+  assert.equal(spamItem?.isOfficial, false);
+  assert.equal(officialItem?.isOfficial, true);
+
+  // Plain search drops Sped Up and ranks verified 340M official upload #1
+  const rankedPlain = rankYouTubeSearchResults(extracted, 'Burna Boy Last Last', 'songs');
+  assert.equal(rankedPlain[0].videoId, '421w1j87fEM');
+  assert.equal(rankedPlain.some((r) => r.videoId === 'spedup00002'), false);
+
+  // Explicit derivative search keeps Sped Up when requested
+  const rankedSpedUp = rankYouTubeSearchResults(extracted, 'Burna Boy Last Last sped up', 'songs');
+  assert.equal(rankedSpedUp.some((r) => r.videoId === 'spedup00002'), true);
+});
+
+test('filterMusicSuggestions, buildInnertubeSearchBody, and filterRelevantAudiusTracks enforce clean music search hygiene', () => {
+  const suggestions = filterMusicSuggestions(
+    [
+      'drake hotline bling',
+      'drake hotline bling piano tutorial',
+      'drake hotline bling reaction',
+      'drake hotline bling slowed reverb',
+      'drake gods plan',
+    ],
+    'drake'
+  );
+  assert.deepEqual(suggestions, ['drake hotline bling', 'drake gods plan']);
+
+  const innertubeBody = JSON.parse(buildInnertubeSearchBody('Rema Calm Down', 'EgIQAQ%3D%3D')) as {
+    context: { client: { gl: string; hl: string } };
+    query: string;
+    params?: string;
+  };
+  assert.equal(innertubeBody.query, 'Rema Calm Down');
+  assert.equal(innertubeBody.params, 'EgIQAQ==');
+  assert.equal(innertubeBody.context.client.gl, 'US');
+
+  const audiusCandidates: Track[] = [
+    {
+      id: 'audius-1',
+      title: 'Unrelated Synth Jam',
+      artist: 'Bedroom Producer',
+      album: 'Audius',
+      duration: 180,
+      source: 'stream',
+      addedAt: 1,
+    },
+    {
+      id: 'audius-2',
+      title: 'Hotline Bling (Flip)',
+      artist: 'Drake Fan Club',
+      album: 'Audius',
+      duration: 210,
+      source: 'stream',
+      addedAt: 2,
+    },
+  ];
+  const relevant = filterRelevantAudiusTracks(audiusCandidates, 'Drake Hotline Bling');
+  assert.deepEqual(
+    relevant.map((t) => t.id),
+    ['audius-2']
+  );
 });
