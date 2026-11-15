@@ -44,6 +44,7 @@ import {
   reorderQueueItems,
 } from './utils/streamFilter';
 import { fetchSyncedLyricsForTrack } from './utils/lyricsFetcher';
+import { triggerHaptic } from './utils/haptics';
 import { fetchRelatedRadioTracks } from './utils/streamRadio';
 import {
   applyThemeToDocument,
@@ -171,6 +172,7 @@ export default function App() {
 
   const playTrack = useCallback(
     (track: Track) => {
+      triggerHaptic('selection');
       playedHistoryIdsRef.current.add(track.id);
       if (track.source === 'stream') {
         if (track.autoQueued) {
@@ -212,12 +214,14 @@ export default function App() {
   const playCollection = useCallback((tracks: Track[], startIndex = 0) => {
     const { queue: nextQueue, startTrack } = buildCollectionQueue(tracks, startIndex);
     if (!startTrack) return;
+    triggerHaptic('selection');
     playedHistoryIdsRef.current.add(startTrack.id);
     setQueue(nextQueue);
     void audioEngine.playTrack(startTrack);
   }, []);
 
   const handleReorderQueue = useCallback((fromIndex: number, toIndex: number) => {
+    triggerHaptic('medium', 12);
     setQueue((prev) => {
       const reordered = reorderQueueItems(prev, fromIndex, toIndex);
       const moved = reordered[toIndex];
@@ -278,6 +282,12 @@ export default function App() {
       unsubSnap();
     };
   }, []);
+
+  // Re-align YouTube viewport once page enter transition settles
+  useEffect(() => {
+    const timer = window.setTimeout(() => audioEngine.resyncYouTubeViewport(), 230);
+    return () => window.clearTimeout(timer);
+  }, [activeTab]);
 
   useEffect(() => {
     const unsubEnd = audioEngine.onTrackEnd(() => {
@@ -466,6 +476,7 @@ export default function App() {
   };
 
   const handleToggleFavorite = (trackId: string) => {
+    triggerHaptic('light');
     setFavoriteIds((prev) => {
       const next = prev.includes(trackId)
         ? prev.filter((id) => id !== trackId)
@@ -756,10 +767,11 @@ export default function App() {
 
       <main className="mx-auto max-w-[1440px] px-3.5 py-4 sm:px-6 sm:py-6 lg:px-8 pb-[calc(9.5rem+env(safe-area-inset-bottom))] md:pb-28">
         {folderImportStatus && (
-          <div className="mb-4 rounded-xl border border-[#E11D48]/50 bg-[#15090E] px-4 py-2.5 font-mono-tabular text-xs text-[#FDA4AF]">
+          <div className="mb-4 kago-panel-enter rounded-xl border border-[#E11D48]/50 bg-[#15090E] px-4 py-2.5 font-mono-tabular text-xs text-[#FDA4AF]">
             {folderImportStatus}
           </div>
         )}
+        <div key={activeTab} className="kago-page-enter">
         {activeTab === 'dashboard' && (
           <DashboardView
             engine={engine}
@@ -782,9 +794,10 @@ export default function App() {
             engine={engine}
             onPlayTrack={playTrack}
             onTogglePlay={() => void audioEngine.togglePlay()}
-            onAddToQueue={(t) =>
-              setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]))
-            }
+            onAddToQueue={(t) => {
+              triggerHaptic('selection');
+              setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]));
+            }}
             onSaveTrackToLibrary={(t) => void handleSaveTrackToLibrary(t)}
           />
         )}
@@ -798,9 +811,10 @@ export default function App() {
             onPlayTrack={playTrack}
             onPlayCollection={playCollection}
             onTogglePlay={() => void audioEngine.togglePlay()}
-            onAddToQueue={(t) =>
-              setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]))
-            }
+            onAddToQueue={(t) => {
+              triggerHaptic('selection');
+              setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]));
+            }}
             onToggleFavorite={handleToggleFavorite}
             onPickSong={() => songPickerRef.current?.click()}
             onPickFolder={() => void handlePickFolder()}
@@ -847,9 +861,10 @@ export default function App() {
             engine={engine}
             onPlayTrack={playTrack}
             onTogglePlay={() => void audioEngine.togglePlay()}
-            onAddToQueue={(t) =>
-              setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]))
-            }
+            onAddToQueue={(t) => {
+              triggerHaptic('selection');
+              setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]));
+            }}
             onSaveTrackToLibrary={(t) => void handleSaveTrackToLibrary(t)}
             onPickSong={() => songPickerRef.current?.click()}
             onPickFolder={() => void handlePickFolder()}
@@ -877,6 +892,7 @@ export default function App() {
             onBack={() => setActiveTab('settings')}
           />
         )}
+        </div>
       </main>
 
       <MiniPlayer

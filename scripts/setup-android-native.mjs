@@ -29,6 +29,7 @@ export function applyAndroidNativeOverrides(rootDir = process.cwd()) {
     '<uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />',
     '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
     '<uses-permission android:name="android.permission.WAKE_LOCK" />',
+    '<uses-permission android:name="android.permission.VIBRATE" />',
   ];
 
   for (const perm of permissions) {

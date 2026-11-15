@@ -30,6 +30,23 @@
     background-color: #f3f4f8;
     color: #0f172a;
   }
+
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    -webkit-tap-highlight-color: transparent;
+    transition:
+      transform 140ms cubic-bezier(0.16, 1, 0.3, 1),
+      background-color 160ms ease,
+      border-color 160ms ease,
+      color 160ms ease,
+      box-shadow 180ms ease,
+      opacity 160ms ease;
+  }
+
+  button:not(:disabled):active,
+  [role="button"]:not([aria-disabled="true"]):active {
+    transform: scale(0.965);
+  }
 }
 
 .no-scrollbar {
@@ -396,9 +413,81 @@ html.light .text-\[\#FDA4AF\] {
   color: var(--kago-accent) !important;
 }
 
+@keyframes kago-page-enter {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 8px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes kago-panel-enter {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 5px, 0) scale(0.992);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+@keyframes kago-modal-backdrop {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes kago-sheet-slide {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 12px, 0) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+.kago-page-enter {
+  animation: kago-page-enter 210ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.kago-panel-enter {
+  animation: kago-panel-enter 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.kago-modal-backdrop {
+  animation: kago-modal-backdrop 160ms ease-out both;
+}
+
+.kago-sheet-slide {
+  animation: kago-sheet-slide 210ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+button.kago-press-subtle:not(:disabled):active {
+  transform: scale(0.986);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .vinyl-spinning-33,
-  .vinyl-spinning-45 {
+  .vinyl-spinning-45,
+  .kago-page-enter,
+  .kago-panel-enter,
+  .kago-modal-backdrop,
+  .kago-sheet-slide {
     animation: none !important;
+  }
+
+  button:not(:disabled):active,
+  [role="button"]:not([aria-disabled="true"]):active,
+  button.kago-press-subtle:not(:disabled):active {
+    transform: none !important;
   }
 }

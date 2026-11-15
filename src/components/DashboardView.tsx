@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { PROCEDURAL_STEMS } from '../data/presetsAndStems';
 import type { ActiveTab, AudioEngineSnapshot, DspSettings, Track } from '../types/audio';
+import { triggerHaptic } from '../utils/haptics';
 import { SpectrumVisualizer } from './SpectrumVisualizer';
 import { VinylTurntable } from './VinylTurntable';
 import { WatchVideoViewport } from './WatchVideoViewport';
@@ -77,7 +78,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <div className="flex flex-wrap items-center gap-3 shrink-0">
             <button
               type="button"
-              onClick={engine.currentTrack ? onTogglePlay : onQuickPlay}
+              onClick={() => {
+                triggerHaptic('medium');
+                if (engine.currentTrack) {
+                  onTogglePlay();
+                } else {
+                  onQuickPlay();
+                }
+              }}
               className="inline-flex items-center gap-2.5 rounded-lg bg-[#E11D48] px-5 py-2.5 text-sm font-semibold text-white shadow-[0_0_20px_rgba(225,29,72,0.45)] hover:bg-[#BE123C] transition-colors whitespace-nowrap cursor-pointer"
             >
               {activeIsRunning ? (
@@ -95,7 +103,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
             <button
               type="button"
-              onClick={onOpenDsp}
+              onClick={() => {
+                triggerHaptic('light');
+                onOpenDsp();
+              }}
               className="inline-flex items-center gap-2 rounded-lg border border-[#282B36] bg-[#14161D] px-4 py-2.5 text-sm font-semibold text-[#F4F3F0] hover:border-[#E11D48] transition-colors whitespace-nowrap cursor-pointer"
             >
               <Sliders className="h-4 w-4 text-[#E11D48]" />
@@ -113,8 +124,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <div className="mt-5 grid grid-cols-1 min-[340px]:grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-3">
           <button
             type="button"
-            onClick={onPickSong}
-            className="flex items-center gap-3 rounded-lg border border-[#222530] bg-[#13151C] px-3.5 py-3 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
+            onClick={() => {
+              triggerHaptic('light');
+              onPickSong();
+            }}
+            className="kago-press-subtle flex items-center gap-3 rounded-lg border border-[#222530] bg-[#13151C] px-3.5 py-3 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
           >
             <Music className="h-5 w-5 shrink-0 text-[#E11D48]" />
             <div className="min-w-0">
@@ -125,8 +139,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <button
             type="button"
-            onClick={onPickFolder}
-            className="flex items-center gap-3 rounded-lg border border-[#222530] bg-[#13151C] px-3.5 py-3 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
+            onClick={() => {
+              triggerHaptic('light');
+              onPickFolder();
+            }}
+            className="kago-press-subtle flex items-center gap-3 rounded-lg border border-[#222530] bg-[#13151C] px-3.5 py-3 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
           >
             <FolderOpen className="h-5 w-5 shrink-0 text-[#E11D48]" />
             <div className="min-w-0">
@@ -137,8 +154,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <button
             type="button"
-            onClick={() => onNavigate('stream')}
-            className="flex items-center gap-3 rounded-lg border border-[#222530] bg-[#13151C] px-3.5 py-3 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
+            onClick={() => {
+              triggerHaptic('light');
+              onNavigate('stream');
+            }}
+            className="kago-press-subtle flex items-center gap-3 rounded-lg border border-[#222530] bg-[#13151C] px-3.5 py-3 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
           >
             <Radio className="h-5 w-5 shrink-0 text-[#E11D48]" />
             <div className="min-w-0">
@@ -149,8 +169,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <button
             type="button"
-            onClick={() => onNavigate('lyrics')}
-            className="flex items-center gap-3 rounded-lg border border-[#222530] bg-[#13151C] px-3.5 py-3 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
+            onClick={() => {
+              triggerHaptic('light');
+              onNavigate('lyrics');
+            }}
+            className="kago-press-subtle flex items-center gap-3 rounded-lg border border-[#222530] bg-[#13151C] px-3.5 py-3 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
           >
             <Mic2 className="h-5 w-5 shrink-0 text-[#E11D48]" />
             <div className="min-w-0">
@@ -175,7 +198,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 type="button"
                 role="tab"
                 aria-selected={deckMode === 'turntable'}
-                onClick={() => setDeckMode('turntable')}
+                onClick={() => {
+                  triggerHaptic('light');
+                  setDeckMode('turntable');
+                }}
                 className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
                   deckMode === 'turntable'
                     ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
@@ -190,7 +216,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                 type="button"
                 role="tab"
                 aria-selected={deckMode === 'video'}
-                onClick={() => setDeckMode('video')}
+                onClick={() => {
+                  triggerHaptic('light');
+                  setDeckMode('video');
+                }}
                 className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
                   deckMode === 'video'
                     ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
@@ -214,11 +243,20 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <div className="flex-1 flex flex-col justify-center">
             {deckMode === 'turntable' ? (
-              <VinylTurntable
-                track={engine.currentTrack}
-                isPlaying={activeIsRunning}
-                onTogglePlay={engine.currentTrack ? onTogglePlay : onQuickPlay}
-              />
+              <div className="kago-panel-enter">
+                <VinylTurntable
+                  track={engine.currentTrack}
+                  isPlaying={activeIsRunning}
+                  onTogglePlay={() => {
+                    triggerHaptic('light');
+                    if (engine.currentTrack) {
+                      onTogglePlay();
+                    } else {
+                      onQuickPlay();
+                    }
+                  }}
+                />
+              </div>
             ) : (
               <WatchVideoViewport
                 track={engine.currentTrack}
@@ -295,7 +333,10 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
 
           <button
             type="button"
-            onClick={onOpenDsp}
+            onClick={() => {
+              triggerHaptic('light');
+              onOpenDsp();
+            }}
             className="mt-5 flex w-full items-center justify-center gap-2 rounded-lg border border-[#2A2D39] bg-[#14161D] py-2.5 text-sm font-semibold text-[#F4F3F0] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
           >
             <Sliders className="h-4 w-4 text-[#E11D48]" />
@@ -340,7 +381,14 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     </div>
                     <button
                       type="button"
-                      onClick={() => (isCurrent ? onTogglePlay() : onPlayTrack(stem))}
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        if (isCurrent) {
+                          onTogglePlay();
+                        } else {
+                          onPlayTrack(stem);
+                        }
+                      }}
                       aria-label={isStemPlaying ? `Pause ${stem.title}` : `Play ${stem.title}`}
                       className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors cursor-pointer ${
                         isStemPlaying

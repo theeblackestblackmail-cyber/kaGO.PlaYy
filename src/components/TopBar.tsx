@@ -1,6 +1,7 @@
 import React from 'react';
 import { Sliders, WifiOff } from 'lucide-react';
 import type { ActiveTab } from '../types/audio';
+import { triggerHaptic } from '../utils/haptics';
 
 interface TopBarProps {
   activeTab: ActiveTab;
@@ -42,7 +43,10 @@ export const TopBar: React.FC<TopBarProps> = ({
           {/* Left: Brand Logo */}
           <button
             type="button"
-            onClick={() => onSelectTab('dashboard')}
+            onClick={() => {
+              triggerHaptic('light');
+              onSelectTab('dashboard');
+            }}
             className="flex items-center gap-2.5 text-left whitespace-nowrap shrink-0 cursor-pointer group"
             aria-label="kaGO.PIaY Dashboard"
           >
@@ -66,15 +70,20 @@ export const TopBar: React.FC<TopBarProps> = ({
                 <button
                   key={item.id}
                   type="button"
-                  onClick={() => onSelectTab(item.id)}
+                  onClick={() => {
+                    triggerHaptic('light');
+                    onSelectTab(item.id);
+                  }}
                   className={`relative py-4 text-sm font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                     active ? 'text-[#FF4D6D]' : 'text-[#8E929B] hover:text-[#F4F3F0]'
                   }`}
                 >
                   {item.label}
-                  {active && (
-                    <span className="absolute inset-x-0 bottom-0 h-0.5 bg-[#E11D48] shadow-[0_0_10px_rgba(225,29,72,0.8)]" />
-                  )}
+                  <span
+                    className={`absolute inset-x-0 bottom-0 h-0.5 bg-[#E11D48] shadow-[0_0_10px_rgba(225,29,72,0.8)] transition-transform duration-200 origin-center ${
+                      active ? 'scale-x-100 opacity-100' : 'scale-x-0 opacity-0'
+                    }`}
+                  />
                 </button>
               );
             })}
@@ -84,7 +93,10 @@ export const TopBar: React.FC<TopBarProps> = ({
           <div className="flex items-center gap-2.5 shrink-0">
             <button
               type="button"
-              onClick={onOpenDsp}
+              onClick={() => {
+                triggerHaptic('light');
+                onOpenDsp();
+              }}
               aria-label="Open Hardware DSP Studio"
               title="Hardware DSP Studio"
               className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#282B36] bg-[#121318] text-[#F4F3F0] hover:border-[#E11D48] hover:text-[#FF4D6D] transition-colors cursor-pointer"

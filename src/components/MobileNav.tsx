@@ -1,6 +1,7 @@
 import React from 'react';
 import { LayoutDashboard, Library, Radio, Search, Settings } from 'lucide-react';
 import type { ActiveTab } from '../types/audio';
+import { triggerHaptic } from '../utils/haptics';
 
 interface MobileNavProps {
   activeTab: ActiveTab;
@@ -21,13 +22,7 @@ const MOBILE_ITEMS: Array<{
 
 export const MobileNav: React.FC<MobileNavProps> = ({ activeTab, onSelectTab }) => {
   const handleTap = (tab: ActiveTab) => {
-    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
-      try {
-        navigator.vibrate(12);
-      } catch {
-        // Ignore if vibration blocked
-      }
-    }
+    triggerHaptic('light');
     onSelectTab(tab);
   };
 
@@ -43,11 +38,15 @@ export const MobileNav: React.FC<MobileNavProps> = ({ activeTab, onSelectTab }) 
             key={id}
             type="button"
             onClick={() => handleTap(id)}
-            className={`flex min-h-[52px] flex-col items-center justify-center gap-1 px-1 py-1.5 text-[11px] font-medium transition-colors cursor-pointer ${
+            className={`relative flex min-h-[52px] flex-col items-center justify-center gap-1 px-1 py-1.5 text-[11px] font-medium transition-colors cursor-pointer ${
               active ? 'text-[#FF4D6D]' : 'text-[#8E929B] hover:text-[#F4F3F0]'
             }`}
           >
-            <Icon className={`h-5 w-5 ${active ? 'text-[#E11D48]' : ''}`} />
+            <Icon
+              className={`h-5 w-5 transition-transform duration-150 ${
+                active ? 'text-[#E11D48] scale-110' : 'scale-100'
+              }`}
+            />
             <span className="truncate max-w-full">{label}</span>
           </button>
         );

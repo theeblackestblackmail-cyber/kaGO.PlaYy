@@ -33,6 +33,7 @@ import {
   pushRecentSearch,
   rankYouTubeSearchResults,
   reorderQueueItems,
+  selectActiveYouTubeViewport,
   shouldAutoResumeBackgroundPause,
   sortStudioQueue,
 } from './streamFilter';
@@ -337,6 +338,7 @@ test('setup-android-native patches AndroidManifest, Gradle, and copies Java Medi
     assert.ok(manifest.includes('android:hardwareAccelerated="true"'));
     assert.ok(manifest.includes('ACCESS_WIFI_STATE'));
     assert.ok(manifest.includes('ACCESS_NETWORK_STATE'));
+    assert.ok(manifest.includes('VIBRATE'));
     assert.ok(manifest.includes('FOREGROUND_SERVICE_MEDIA_PLAYBACK'));
     assert.ok(manifest.includes('POST_NOTIFICATIONS'));
     assert.ok(manifest.includes('android:supportsPictureInPicture="true"'));
@@ -347,7 +349,9 @@ test('setup-android-native patches AndroidManifest, Gradle, and copies Java Medi
     assert.equal(gradle.match(/androidx\.media:media:1\.7\.0/g)?.length, 1);
     assert.equal(gradle.match(/JavaVersion\.VERSION_17/g)?.length, 2);
 
-    assert.ok(fs.existsSync(path.join(androidMain, 'java', 'com', 'kagoplay', 'workstation', 'MainActivity.java')));
+    const mainActivityPath = path.join(androidMain, 'java', 'com', 'kagoplay', 'workstation', 'MainActivity.java');
+    assert.ok(fs.existsSync(mainActivityPath));
+    assert.ok(fs.readFileSync(mainActivityPath, 'utf8').includes('triggerHaptic'));
     assert.ok(fs.existsSync(path.join(androidMain, 'java', 'com', 'kagoplay', 'workstation', 'KaGoMediaService.java')));
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
@@ -1014,3 +1018,55 @@ test('clampCrossfadeSeconds enforces 0s to 12s bounds for user crossfade prefere
   assert.equal(clampCrossfadeSeconds(Number.NaN), 2.5);
 });
 
+test('selectActiveYouTubeViewport prioritizes highest visible connected viewport and skips collapsed slots', () => {
+  const dashboard = { name: 'dashboard', zIndex: 30, order: 1, connected: true, width: 340, height: 191 };
+  const fullscreen = { name: 'fullscreen', zIndex: 60, order: 2, connected: true, width: 358, height: 201 };
+  const dashboardLaterRemount = {
+    name: 'dashboard-later',
+    zIndex: 30,
+    order: 5,
+    connected: true,
+    width: 340,
+    height: 191,
+  };
+  const detachedOverlay = { name: 'detached', zIndex: 110, order: 9, connected: false, width: 300, height: 168 };
+  const zeroBoxOverlay = { name: 'zero', zIndex: 110, order: 10, connected: true, width: 0, height: 0 };
+
+  // Lower zIndex dashboard remounting later must NEVER clobber fullscreen (zIndex 60)
+  const picked = selectActiveYouTubeViewport([
+    dashboard,
+    fullscreen,
+    dashboardLaterRemount,
+    detachedOverlay,
+    zeroBoxOverlay,
+  ]);
+  assert.equal(picked?.name, 'fullscreen');
+
+  // When fullscreen unmounts, falls back cleanly to connected visible dashboard
+  const fallback = selectActiveYouTubeViewport([dashboardLaterRemount, detachedOverlay, zeroBoxOverlay]);
+  assert.equal(fallback?.name, 'dashboard-later');
+
+  // Ties at same zIndex pick the most recently mounted viewport
+  const pipOlder = { name: 'pip-old', zIndex: 65, order: 3, connected: true, width: 280, height: 158 };
+  const pipNewer = { name: 'pip-new', zIndex: 65, order: 7, connected: true, width: 280, height: 158 };
+  assert.equal(selectActiveYouTubeViewport([pipOlder, pipNewer])?.name, 'pip-new');
+
+  // Returns null if nothing is visible/connected
+  assert.equal(selectActiveYouTubeViewport([detachedOverlay, zeroBoxOverlay]), null);
+});
+
+test('haptics engine resolves patterns for all styles and throttles rapid triggers cleanly', async () => {
+  const { HAPTIC_PATTERNS, resolveHapticPattern, shouldThrottleHaptic } = await import('./haptics');
+
+  assert.equal(resolveHapticPattern('light'), HAPTIC_PATTERNS.light);
+  assert.equal(resolveHapticPattern('selection'), HAPTIC_PATTERNS.selection);
+  assert.equal(resolveHapticPattern('medium'), HAPTIC_PATTERNS.medium);
+  assert.equal(resolveHapticPattern('reorder'), HAPTIC_PATTERNS.reorder);
+  assert.deepEqual(resolveHapticPattern('success'), HAPTIC_PATTERNS.success);
+
+  // Rapid triggers within cooldown window (35ms) should be throttled
+  assert.equal(shouldThrottleHaptic(1020, 1000, 35), true);
+  // Triggers at or past cooldown window should proceed
+  assert.equal(shouldThrottleHaptic(1035, 1000, 35), false);
+  assert.equal(shouldThrottleHaptic(10, 0, 35), false);
+});

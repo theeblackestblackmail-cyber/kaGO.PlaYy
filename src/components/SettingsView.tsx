@@ -19,6 +19,7 @@ import {
 import { EQ_PRESETS, EQ_PRESET_ORDER } from '../data/presetsAndStems';
 import type { ActiveTab, DspSettings, EqBands, EqPresetName } from '../types/audio';
 import type { ThemeMode, ThemePreferences } from '../utils/themeManager';
+import { triggerHaptic } from '../utils/haptics';
 import { AccentColorPicker } from './AccentColorPicker';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -56,6 +57,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onNavigate,
 }) => {
   const handlePresetQuick = (name: EqPresetName) => {
+    triggerHaptic('selection');
     onUpdateDsp({
       ...dsp,
       preset: name,
@@ -106,7 +108,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <button
               type="button"
               aria-pressed={themePrefs.mode === 'dark'}
-              onClick={() => onChangeThemeMode('dark')}
+              onClick={() => {
+                triggerHaptic('light');
+                onChangeThemeMode('dark');
+              }}
               className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors cursor-pointer ${
                 themePrefs.mode === 'dark'
                   ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
@@ -119,7 +124,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <button
               type="button"
               aria-pressed={themePrefs.mode === 'light'}
-              onClick={() => onChangeThemeMode('light')}
+              onClick={() => {
+                triggerHaptic('light');
+                onChangeThemeMode('light');
+              }}
               className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors cursor-pointer ${
                 themePrefs.mode === 'light'
                   ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
@@ -161,7 +169,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
           <button
             type="button"
-            onClick={onOpenDsp}
+            onClick={() => {
+              triggerHaptic('light');
+              onOpenDsp();
+            }}
             className="inline-flex items-center gap-2 rounded-lg bg-[#E11D48] px-4 py-2.5 text-xs font-semibold text-white shadow-[0_0_16px_rgba(225,29,72,0.45)] hover:bg-[#BE123C] transition-colors whitespace-nowrap cursor-pointer"
           >
             <Sliders className="h-4 w-4" />
@@ -208,7 +219,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             type="button"
             role="switch"
             aria-checked={dsp.bassBoostEnabled}
-            onClick={() => onUpdateDsp({ ...dsp, bassBoostEnabled: !dsp.bassBoostEnabled })}
+            onClick={() => {
+              triggerHaptic('selection');
+              onUpdateDsp({ ...dsp, bassBoostEnabled: !dsp.bassBoostEnabled });
+            }}
             className={`shrink-0 rounded-lg border px-3.5 py-1.5 text-xs font-semibold transition-colors cursor-pointer ${
               dsp.bassBoostEnabled
                 ? 'border-[#E11D48] bg-[#E11D48] text-white'
@@ -255,12 +269,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               step={0.5}
               value={Math.min(10, dsp.crossfadeSeconds)}
               aria-label="Track Crossfade Duration in seconds"
-              onChange={(e) =>
+              onChange={(e) => {
+                triggerHaptic('light', 45);
                 onUpdateDsp({
                   ...dsp,
                   crossfadeSeconds: Number(e.target.value),
-                })
-              }
+                });
+              }}
               className="hardware-slider w-full"
             />
             <span className="font-mono-tabular text-xs text-[#F4F3F0] shrink-0">10s</span>
@@ -280,12 +295,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   key={preset.label}
                   type="button"
                   aria-pressed={active}
-                  onClick={() =>
+                  onClick={() => {
+                    triggerHaptic('selection');
                     onUpdateDsp({
                       ...dsp,
                       crossfadeSeconds: preset.value,
-                    })
-                  }
+                    });
+                  }}
                   className={`rounded-lg border px-3 py-1.5 font-mono-tabular text-xs font-semibold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                     active
                       ? 'border-[#E11D48] bg-[#E11D48] text-white'
@@ -315,7 +331,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             type="button"
             role="switch"
             aria-checked={autoplayRadioEnabled}
-            onClick={onToggleAutoplayRadio}
+            onClick={() => {
+              triggerHaptic('selection');
+              onToggleAutoplayRadio();
+            }}
             className={`shrink-0 rounded-lg border px-3.5 py-1.5 text-xs font-semibold transition-colors cursor-pointer ${
               autoplayRadioEnabled
                 ? 'border-[#E11D48] bg-[#E11D48] text-white'
@@ -336,8 +355,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <button
             type="button"
-            onClick={onPickFolder}
-            className="flex items-center justify-between gap-3 rounded-xl border border-[#222530] bg-[#13151C] px-4 py-3.5 text-left hover:border-[#E11D48] transition-colors cursor-pointer"
+            onClick={() => {
+              triggerHaptic('light');
+              onPickFolder();
+            }}
+            className="kago-press-subtle flex items-center justify-between gap-3 rounded-xl border border-[#222530] bg-[#13151C] px-4 py-3.5 text-left hover:border-[#E11D48] transition-colors cursor-pointer"
           >
             <div className="flex items-center gap-3 min-w-0">
               <FolderOpen className="h-5 w-5 shrink-0 text-[#E11D48]" />
@@ -351,8 +373,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
           <button
             type="button"
-            onClick={onPickSong}
-            className="flex items-center justify-between gap-3 rounded-xl border border-[#222530] bg-[#13151C] px-4 py-3.5 text-left hover:border-[#E11D48] transition-colors cursor-pointer"
+            onClick={() => {
+              triggerHaptic('light');
+              onPickSong();
+            }}
+            className="kago-press-subtle flex items-center justify-between gap-3 rounded-xl border border-[#222530] bg-[#13151C] px-4 py-3.5 text-left hover:border-[#E11D48] transition-colors cursor-pointer"
           >
             <div className="flex items-center gap-3 min-w-0">
               <Music className="h-5 w-5 shrink-0 text-[#E11D48]" />
@@ -366,8 +391,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
           <button
             type="button"
-            onClick={() => onNavigate('scanner')}
-            className="flex items-center justify-between gap-3 rounded-xl border border-[#222530] bg-[#13151C] px-4 py-3.5 text-left hover:border-[#E11D48] transition-colors cursor-pointer"
+            onClick={() => {
+              triggerHaptic('light');
+              onNavigate('scanner');
+            }}
+            className="kago-press-subtle flex items-center justify-between gap-3 rounded-xl border border-[#222530] bg-[#13151C] px-4 py-3.5 text-left hover:border-[#E11D48] transition-colors cursor-pointer"
           >
             <div className="flex items-center gap-3 min-w-0">
               <FolderSearch className="h-5 w-5 shrink-0 text-[#E11D48]" />
@@ -381,8 +409,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
           <button
             type="button"
-            onClick={() => onNavigate('lyrics')}
-            className="flex items-center justify-between gap-3 rounded-xl border border-[#222530] bg-[#13151C] px-4 py-3.5 text-left hover:border-[#E11D48] transition-colors cursor-pointer"
+            onClick={() => {
+              triggerHaptic('light');
+              onNavigate('lyrics');
+            }}
+            className="kago-press-subtle flex items-center justify-between gap-3 rounded-xl border border-[#222530] bg-[#13151C] px-4 py-3.5 text-left hover:border-[#E11D48] transition-colors cursor-pointer"
           >
             <div className="flex items-center gap-3 min-w-0">
               <Mic2 className="h-5 w-5 shrink-0 text-[#E11D48]" />

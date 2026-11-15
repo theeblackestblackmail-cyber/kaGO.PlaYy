@@ -12,6 +12,7 @@ import {
   computeMasterOutputGain,
   extractYouTubeSearchResults,
   rankYouTubeSearchResults,
+  selectActiveYouTubeViewport,
   shouldAutoResumeBackgroundPause,
 } from '../utils/streamFilter';
 
@@ -367,9 +368,16 @@ class DualChannelAudioEngine {
   private ytStartupTimer: number | null = null;
   private ytRecoveryAttempts = 0;
   private playSeq = 0;
-  private ytViewportEl: HTMLElement | null = null;
-  private ytViewportZIndex = 30;
-  private ytResizeObserver: ResizeObserver | null = null;
+  private ytViewports = new Map<
+    HTMLElement,
+    { zIndex: number; order: number; observer: ResizeObserver | null }
+  >();
+  private ytViewportSeq = 0;
+  private ytWasHostVisible = false;
+  private ytSettleTimers: number[] = [];
+  private ytPositionMonitorTimer: number | null = null;
+  private ytCompositorNudgeRaf1: number | null = null;
+  private ytCompositorNudgeRaf2: number | null = null;
   private ytSyncListenerBound = false;
   private backgroundTransitionUntil = 0;
   private userPausedAt = 0;
@@ -395,7 +403,12 @@ class DualChannelAudioEngine {
     };
 
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState !== 'visible' && this.isPlaying) {
+      if (document.visibilityState === 'visible') {
+        if (this.ytActive && this.ytViewports.size > 0) {
+          this.syncYouTubeHostGeometry(true);
+          this.scheduleYouTubeGeometrySettle();
+        }
+      } else if (this.isPlaying) {
         this.handleBackgroundTransition();
       }
     });
@@ -797,74 +810,228 @@ class DualChannelAudioEngine {
     }, 6500);
   }
 
+  private clearYtSettleTimers() {
+    for (const id of this.ytSettleTimers) {
+      window.clearTimeout(id);
+    }
+    this.ytSettleTimers = [];
+  }
+
+  private scheduleYouTubeGeometrySettle() {
+    if (typeof window === 'undefined') return;
+    this.clearYtSettleTimers();
+    if (typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(() => this.syncYouTubeHostGeometry());
+    }
+    for (const delay of [50, 180, 380]) {
+      const id = window.setTimeout(() => this.syncYouTubeHostGeometry(), delay);
+      this.ytSettleTimers.push(id);
+    }
+  }
+
+  private updateYtPositionMonitor() {
+    if (typeof window === 'undefined') return;
+    const shouldPoll = this.ytActive && this.ytViewports.size > 0;
+    if (shouldPoll && this.ytPositionMonitorTimer === null) {
+      this.ytPositionMonitorTimer = window.setInterval(() => {
+        if (!this.ytActive || this.ytViewports.size === 0) {
+          this.updateYtPositionMonitor();
+          return;
+        }
+        this.syncYouTubeHostGeometry();
+      }, 150);
+    } else if (!shouldPoll && this.ytPositionMonitorTimer !== null) {
+      window.clearInterval(this.ytPositionMonitorTimer);
+      this.ytPositionMonitorTimer = null;
+    }
+  }
+
+  private cancelCompositorNudge() {
+    if (typeof window === 'undefined') return;
+    if (this.ytCompositorNudgeRaf1 !== null) {
+      window.cancelAnimationFrame(this.ytCompositorNudgeRaf1);
+      this.ytCompositorNudgeRaf1 = null;
+    }
+    if (this.ytCompositorNudgeRaf2 !== null) {
+      window.cancelAnimationFrame(this.ytCompositorNudgeRaf2);
+      this.ytCompositorNudgeRaf2 = null;
+    }
+  }
+
+  /**
+   * Android WebView & Chromium can stop painting video frames inside an iframe while it is
+   * occluded at z-index:-1 / opacity:0.001. A 1px two-frame width nudge forces an instant
+   * GPU surface re-composite without reloading or interrupting audio playback.
+   */
+  private refreshYouTubeCompositorSurface() {
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    this.cancelCompositorNudge();
+    const frame = document.getElementById('kago-yt-frame');
+    if (!frame) return;
+
+    frame.style.display = 'block';
+    frame.style.width = 'calc(100% - 1px)';
+    frame.style.height = '100%';
+
+    if (typeof window.requestAnimationFrame === 'function') {
+      this.ytCompositorNudgeRaf1 = window.requestAnimationFrame(() => {
+        this.ytCompositorNudgeRaf1 = null;
+        this.ytCompositorNudgeRaf2 = window.requestAnimationFrame(() => {
+          this.ytCompositorNudgeRaf2 = null;
+          const liveFrame = document.getElementById('kago-yt-frame');
+          if (liveFrame) {
+            liveFrame.style.width = '100%';
+            liveFrame.style.height = '100%';
+          }
+          this.syncYouTubeHostGeometry();
+        });
+      });
+    } else {
+      frame.style.width = '100%';
+    }
+  }
+
+  resyncYouTubeViewport(): void {
+    this.syncYouTubeHostGeometry(true);
+    this.scheduleYouTubeGeometrySettle();
+  }
+
   attachYouTubeViewport(el: HTMLElement | null, zIndex = 30): () => void {
-    this.ytViewportEl = el;
-    this.ytViewportZIndex = zIndex;
+    if (!el) return () => {};
 
-    if (this.ytResizeObserver) {
-      this.ytResizeObserver.disconnect();
-      this.ytResizeObserver = null;
+    const prev = this.ytViewports.get(el);
+    if (prev?.observer) {
+      prev.observer.disconnect();
     }
 
-    if (el && typeof ResizeObserver !== 'undefined') {
-      this.ytResizeObserver = new ResizeObserver(() => this.syncYouTubeHostGeometry());
-      this.ytResizeObserver.observe(el);
+    const order = ++this.ytViewportSeq;
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => this.syncYouTubeHostGeometry());
+      observer.observe(el);
+      if (el.parentElement) {
+        observer.observe(el.parentElement);
+      }
     }
+
+    this.ytViewports.set(el, { zIndex, order, observer });
 
     if (typeof window !== 'undefined' && !this.ytSyncListenerBound) {
       this.ytSyncListenerBound = true;
       const sync = () => this.syncYouTubeHostGeometry();
       window.addEventListener('scroll', sync, true);
       window.addEventListener('resize', sync);
+      window.addEventListener('focus', () => this.syncYouTubeHostGeometry(true));
     }
 
+    this.updateYtPositionMonitor();
     this.syncYouTubeHostGeometry();
+    this.scheduleYouTubeGeometrySettle();
 
     return () => {
-      if (this.ytViewportEl === el) {
-        this.ytViewportEl = null;
-        if (this.ytResizeObserver) {
-          this.ytResizeObserver.disconnect();
-          this.ytResizeObserver = null;
-        }
-        this.syncYouTubeHostGeometry();
+      const current = this.ytViewports.get(el);
+      if (current && current.order === order) {
+        current.observer?.disconnect();
+        this.ytViewports.delete(el);
+      } else if (observer) {
+        observer.disconnect();
       }
+      this.updateYtPositionMonitor();
+      this.syncYouTubeHostGeometry();
     };
   }
 
-  private syncYouTubeHostGeometry() {
+  private syncYouTubeHostGeometry(forceSurfaceRefresh = false) {
     if (typeof document === 'undefined') return;
     const host = document.getElementById('kago-yt-host');
     if (!host) return;
 
     const frame = document.getElementById('kago-yt-frame');
-    if (frame) {
+    if (frame && this.ytCompositorNudgeRaf1 === null && this.ytCompositorNudgeRaf2 === null) {
+      frame.style.display = 'block';
       frame.style.width = '100%';
       frame.style.height = '100%';
     }
 
-    if (this.ytViewportEl && this.ytActive && document.contains(this.ytViewportEl)) {
-      const rect = this.ytViewportEl.getBoundingClientRect();
-      if (rect.width > 20 && rect.height > 20) {
+    if (this.ytActive && this.ytViewports.size > 0) {
+      const candidates: Array<{
+        el: HTMLElement;
+        zIndex: number;
+        order: number;
+        connected: boolean;
+        width: number;
+        height: number;
+        rect: DOMRect;
+      }> = [];
+
+      for (const [el, entry] of this.ytViewports.entries()) {
+        if (!document.contains(el)) {
+          entry.observer?.disconnect();
+          this.ytViewports.delete(el);
+          continue;
+        }
+        const rect = el.getBoundingClientRect();
+        candidates.push({
+          el,
+          zIndex: entry.zIndex,
+          order: entry.order,
+          connected: true,
+          width: rect.width,
+          height: rect.height,
+          rect,
+        });
+      }
+
+      const active = selectActiveYouTubeViewport(candidates);
+      if (active) {
+        const wasHidden = !this.ytWasHostVisible;
+        this.ytWasHostVisible = true;
+
         host.removeAttribute('aria-hidden');
         host.removeAttribute('inert');
+        host.style.display = 'block';
+        host.style.visibility = 'visible';
         host.style.position = 'fixed';
-        host.style.top = `${Math.round(rect.top)}px`;
-        host.style.left = `${Math.round(rect.left)}px`;
+        host.style.top = `${Math.round(active.rect.top)}px`;
+        host.style.left = `${Math.round(active.rect.left)}px`;
         host.style.bottom = 'auto';
         host.style.right = 'auto';
-        host.style.width = `${Math.round(rect.width)}px`;
-        host.style.height = `${Math.round(rect.height)}px`;
+        host.style.width = `${Math.round(active.rect.width)}px`;
+        host.style.height = `${Math.round(active.rect.height)}px`;
         host.style.opacity = '1';
         host.style.pointerEvents = 'auto';
-        host.style.zIndex = String(this.ytViewportZIndex);
+        host.style.zIndex = String(active.zIndex);
         host.style.borderRadius = '10px';
+        host.style.backgroundColor = '#000000';
+        host.style.transform = 'translate3d(0, 0, 0)';
+        host.style.willChange = 'transform';
+
+        if (wasHidden || forceSurfaceRefresh) {
+          this.refreshYouTubeCompositorSurface();
+          if (this.isPlaying && this.ytPlayer && this.ytReady) {
+            try {
+              const state = this.ytPlayer.getPlayerState();
+              const statePaused = window.YT?.PlayerState?.PAUSED ?? 2;
+              const userPausedRecently =
+                this.userPausedAt > 0 && Date.now() - this.userPausedAt < 2500;
+              if (!userPausedRecently && (state === statePaused || state === 5)) {
+                this.ytPlayer.playVideo();
+              }
+            } catch {
+              // Ignore transient player query errors
+            }
+          }
+        }
         return;
       }
     }
 
+    this.ytWasHostVisible = false;
+    this.cancelCompositorNudge();
     host.setAttribute('aria-hidden', 'true');
     host.setAttribute('inert', '');
+    host.style.display = 'block';
+    host.style.visibility = 'visible';
     host.style.position = 'fixed';
     host.style.top = 'auto';
     host.style.left = 'auto';
@@ -875,6 +1042,7 @@ class DualChannelAudioEngine {
     host.style.opacity = '0.001';
     host.style.pointerEvents = 'none';
     host.style.zIndex = '-1';
+    host.style.transform = 'translate3d(0, 0, 0)';
   }
 
   private stopYouTubePlayback(fadeSeconds = 0) {
@@ -973,7 +1141,8 @@ class DualChannelAudioEngine {
               onReady: (ev) => {
                 clearTimeout(timeoutId);
                 this.ytReady = true;
-                this.syncYouTubeHostGeometry();
+                this.syncYouTubeHostGeometry(true);
+                this.scheduleYouTubeGeometrySettle();
                 try {
                   ev.target.unMute?.();
                   ev.target.setVolume(100);
@@ -1277,7 +1446,9 @@ class DualChannelAudioEngine {
     if (track.youtubeId) {
       this.stopSynthTicker();
       this.ytActive = true;
-      this.syncYouTubeHostGeometry();
+      this.updateYtPositionMonitor();
+      this.syncYouTubeHostGeometry(true);
+      this.scheduleYouTubeGeometrySettle();
       this.emit();
 
       const alreadyMounted = Boolean(this.ytPlayer && this.ytReady);

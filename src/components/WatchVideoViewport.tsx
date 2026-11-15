@@ -57,6 +57,11 @@ export const WatchVideoViewport: React.FC<WatchVideoViewportProps> = ({
     };
   }, [hasYouTubeVideo, track?.youtubeId, zIndex, isInAppPip, isDocPipOpen]);
 
+  useEffect(() => {
+    if (!hasYouTubeVideo || isInAppPip || isDocPipOpen) return;
+    audioEngine.resyncYouTubeViewport();
+  }, [hasYouTubeVideo, track?.youtubeId, isPlaying, isInAppPip, isDocPipOpen]);
+
   // Keep an open Document PiP window synced when user skips to another track
   useEffect(() => {
     if (!isDocPipOpen || !track?.youtubeId) return;

@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import type { Track } from '../types/audio';
 import { formatDuration } from '../utils/lrcParser';
+import { triggerHaptic } from '../utils/haptics';
 
 interface MiniPlayerProps {
   track: Track | null;
@@ -44,7 +45,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
   return (
     <div
       data-testid="floating-mini-player"
-      className="fixed inset-x-2.5 sm:inset-x-3 bottom-[calc(58px+env(safe-area-inset-bottom))] md:bottom-4 md:inset-x-auto md:left-1/2 md:-translate-x-1/2 md:w-full md:max-w-4xl z-30 overflow-hidden rounded-xl border border-[#262936] bg-[#0C0D12]/95 backdrop-blur-md shadow-[0_16px_48px_rgba(0,0,0,0.8)]"
+      className="kago-sheet-slide fixed inset-x-2.5 sm:inset-x-3 bottom-[calc(58px+env(safe-area-inset-bottom))] md:bottom-4 md:inset-x-auto md:left-1/2 md:-translate-x-1/2 md:w-full md:max-w-4xl z-30 overflow-hidden rounded-xl border border-[#262936] bg-[#0C0D12]/95 backdrop-blur-md shadow-[0_16px_48px_rgba(0,0,0,0.8)]"
     >
       {/* Top Crimson (played) / White (unplayed) Progress Line */}
       <div className="h-0.5 w-full bg-white/85">
@@ -58,9 +59,12 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
         {/* Track Info Trigger -> Opens Fullscreen Player */}
         <button
           type="button"
-          onClick={onExpand}
+          onClick={() => {
+            triggerHaptic('light');
+            onExpand();
+          }}
           aria-label={`Expand fullscreen player for ${track.title}`}
-          className="flex min-w-0 flex-1 items-center gap-3 text-left cursor-pointer group"
+          className="kago-press-subtle flex min-w-0 flex-1 items-center gap-3 text-left cursor-pointer group"
         >
           <div className="relative flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-[#262936] bg-[#14161F]">
             {track.artworkUrl ? (
@@ -102,7 +106,10 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
         <div className="flex items-center gap-1 sm:gap-2 shrink-0">
           <button
             type="button"
-            onClick={() => onToggleFavorite(track.id)}
+            onClick={() => {
+              triggerHaptic('selection');
+              onToggleFavorite(track.id);
+            }}
             aria-label={isFavorite ? `Remove ${track.title} from favorites` : `Favorite ${track.title}`}
             className={`flex h-9 w-9 items-center justify-center rounded-lg transition-colors cursor-pointer ${
               isFavorite ? 'text-[#FF4D6D]' : 'text-[#8E929B] hover:text-white'
@@ -113,7 +120,10 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
 
           <button
             type="button"
-            onClick={() => onSeekBy(-10)}
+            onClick={() => {
+              triggerHaptic('light');
+              onSeekBy(-10);
+            }}
             aria-label="Rewind 10 seconds"
             title="Rewind 10s"
             className="hidden sm:flex h-9 w-9 items-center justify-center rounded-lg text-[#B4B7C2] hover:bg-[#191B24] hover:text-white transition-colors cursor-pointer"
@@ -123,7 +133,10 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
 
           <button
             type="button"
-            onClick={onTogglePlay}
+            onClick={() => {
+              triggerHaptic('selection');
+              onTogglePlay();
+            }}
             aria-label={isPlaying ? 'Pause playback' : 'Play track'}
             className="flex h-10 w-10 items-center justify-center rounded-full bg-[#E11D48] text-white shadow-[0_0_16px_rgba(225,29,72,0.55)] hover:bg-[#BE123C] transition-colors cursor-pointer"
           >
@@ -132,7 +145,10 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
 
           <button
             type="button"
-            onClick={() => onSeekBy(10)}
+            onClick={() => {
+              triggerHaptic('light');
+              onSeekBy(10);
+            }}
             aria-label="Forward 10 seconds"
             title="Forward 10s"
             className="hidden sm:flex h-9 w-9 items-center justify-center rounded-lg text-[#B4B7C2] hover:bg-[#191B24] hover:text-white transition-colors cursor-pointer"
@@ -142,7 +158,10 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
 
           <button
             type="button"
-            onClick={onNext}
+            onClick={() => {
+              triggerHaptic('light');
+              onNext();
+            }}
             aria-label="Skip to next track"
             className="flex h-9 w-9 items-center justify-center rounded-lg text-[#B4B7C2] hover:bg-[#191B24] hover:text-white transition-colors cursor-pointer"
           >
@@ -151,7 +170,10 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
 
           <button
             type="button"
-            onClick={onExpand}
+            onClick={() => {
+              triggerHaptic('light');
+              onExpand();
+            }}
             aria-label="Open fullscreen player"
             className="flex h-9 w-9 items-center justify-center rounded-lg text-[#8E929B] hover:bg-[#191B24] hover:text-white transition-colors cursor-pointer"
           >

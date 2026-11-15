@@ -1412,4 +1412,31 @@ export function buildCollectionQueue(
   };
 }
 
+export interface YouTubeViewportCandidate {
+  zIndex: number;
+  order: number;
+  connected: boolean;
+  width: number;
+  height: number;
+}
 
+/**
+ * Selects the highest-priority visible YouTube viewport slot so background or lower-zIndex
+ * mounts (e.g. DashboardView at zIndex=30) never clobber overlays (FullscreenPlayer zIndex=60 / PiP).
+ */
+export function selectActiveYouTubeViewport<T extends YouTubeViewportCandidate>(
+  candidates: T[]
+): T | null {
+  let best: T | null = null;
+  for (const c of candidates) {
+    if (!c.connected || c.width <= 20 || c.height <= 20) continue;
+    if (
+      !best ||
+      c.zIndex > best.zIndex ||
+      (c.zIndex === best.zIndex && c.order > best.order)
+    ) {
+      best = c;
+    }
+  }
+  return best;
+}

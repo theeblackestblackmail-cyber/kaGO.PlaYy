@@ -22,6 +22,7 @@ import type {
   Track,
 } from '../types/audio';
 import { formatDuration } from '../utils/lrcParser';
+import { triggerHaptic } from '../utils/haptics';
 import { hasNativeHttpBridge, nativeFetchText } from '../utils/nativeMediaBridge';
 import {
   extractYouTubePlaylistTracks,
@@ -189,12 +190,14 @@ export const StreamView: React.FC<StreamViewProps> = ({
   };
 
   const handleGenreClick = (genre: string) => {
+    triggerHaptic('light');
     const nextGenre = selectedGenre === genre ? '' : genre;
     setSelectedGenre(nextGenre);
     void executeSearch(query, nextGenre, selectedCategory);
   };
 
   const handleCategoryClick = (category: StreamSearchCategory) => {
+    triggerHaptic('light');
     setSelectedCategory(category);
     void executeSearch(query, selectedGenre, category);
   };
@@ -404,18 +407,19 @@ export const StreamView: React.FC<StreamViewProps> = ({
               <div
                 role="listbox"
                 aria-label="Popular search suggestions"
-                className="absolute left-0 right-0 top-full z-40 mt-1.5 overflow-hidden rounded-lg border border-[#282B36] bg-[#101219] shadow-2xl"
+                className="kago-panel-enter absolute left-0 right-0 top-full z-40 mt-1.5 overflow-hidden rounded-lg border border-[#282B36] bg-[#101219] shadow-2xl"
               >
                 {suggestions.map((item) => (
                   <button
                     key={item}
                     type="button"
                     onClick={() => {
+                      triggerHaptic('selection');
                       setQuery(item);
                       setShowSuggestions(false);
                       void executeSearch(item, selectedGenre, selectedCategory);
                     }}
-                    className="flex w-full items-center gap-2.5 border-b border-[#1A1C24] px-3.5 py-2.5 text-left text-xs text-[#E5E7EB] last:border-b-0 hover:bg-[#1A1D27] hover:text-white cursor-pointer"
+                    className="kago-press-subtle flex w-full items-center gap-2.5 border-b border-[#1A1C24] px-3.5 py-2.5 text-left text-xs text-[#E5E7EB] last:border-b-0 hover:bg-[#1A1D27] hover:text-white cursor-pointer"
                   >
                     <Search className="h-3.5 w-3.5 shrink-0 text-[#E11D48]" />
                     <span className="truncate">{item}</span>
@@ -473,6 +477,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
               key={term}
               type="button"
               onClick={() => {
+                triggerHaptic('light');
                 setQuery(term);
                 void executeSearch(term, '', selectedCategory);
               }}
@@ -492,6 +497,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
                 key={term}
                 type="button"
                 onClick={() => {
+                  triggerHaptic('light');
                   setQuery(term);
                   void executeSearch(term, selectedGenre, selectedCategory);
                 }}
@@ -502,7 +508,10 @@ export const StreamView: React.FC<StreamViewProps> = ({
             ))}
             <button
               type="button"
-              onClick={() => setRecentSearches([])}
+              onClick={() => {
+                triggerHaptic('light');
+                setRecentSearches([]);
+              }}
               className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-[#8E929B] hover:text-[#FF4D6D] cursor-pointer"
             >
               <Trash2 className="h-3 w-3" />
@@ -550,11 +559,12 @@ export const StreamView: React.FC<StreamViewProps> = ({
                 key={artist.id}
                 type="button"
                 onClick={() => {
+                  triggerHaptic('selection');
                   setQuery(artist.name);
                   setSelectedCategory('songs');
                   void executeSearch(artist.name, selectedGenre, 'songs');
                 }}
-                className="flex items-center gap-3.5 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-3.5 text-left transition-colors hover:border-[#E11D48] cursor-pointer"
+                className="kago-press-subtle flex items-center gap-3.5 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-3.5 text-left transition-colors hover:border-[#E11D48] cursor-pointer"
               >
                 <div className="h-14 w-14 shrink-0 overflow-hidden rounded-full border border-[#282B36] bg-[#14161D]">
                   {artist.thumbnailUrl ? (
@@ -591,7 +601,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
 
       {/* 3-Column Stream Results Grid */}
       {results.length > 0 && (
-        <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <section className="kago-panel-enter grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {results.map((track) => {
             const isCurrent = engine.currentTrack?.id === track.id;
             const isTrackPlaying = isCurrent && engine.isPlaying;
@@ -603,7 +613,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
             return (
               <article
                 key={track.id}
-                className={`flex flex-col justify-between rounded-xl border p-4 transition-colors ${
+                className={`flex flex-col justify-between rounded-xl border p-4 transition-[border-color,background-color,transform] duration-200 ${
                   isCurrent
                     ? 'border-[#E11D48] bg-[#13090E]'
                     : 'border-[#1F2129] bg-[#0D0E12] hover:border-[#303444]'
@@ -672,7 +682,10 @@ export const StreamView: React.FC<StreamViewProps> = ({
                   {!isPlaylistCollection && (
                     <button
                       type="button"
-                      onClick={() => handleAutoRecover(track)}
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        void handleAutoRecover(track);
+                      }}
                       disabled={isRecovering}
                       className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-2.5 py-2 text-xs font-medium text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors whitespace-nowrap cursor-pointer"
                     >
@@ -687,6 +700,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
                     type="button"
                     disabled={isCollectionBusy}
                     onClick={() => {
+                      triggerHaptic('selection');
                       if (isPlaylistCollection) {
                         void handleCollectionAction(track, 'queue');
                       } else {
@@ -705,6 +719,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
                     type="button"
                     disabled={isCollectionBusy}
                     onClick={() => {
+                      triggerHaptic('selection');
                       if (isPlaylistCollection) {
                         void handleCollectionAction(track, 'play');
                       } else if (isCurrent) {

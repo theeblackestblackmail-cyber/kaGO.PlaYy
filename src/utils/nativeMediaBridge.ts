@@ -33,6 +33,7 @@ export interface NativeMediaBridgeApi {
   fetchUrlPostAsync?: (requestId: string, urlString: string, jsonBody: string) => void;
   pickFolderNative?: (requestId: string) => void;
   readDocumentChunkBase64?: (uriString: string, offset: number, length: number) => string;
+  triggerHaptic?: (style: string) => void;
 }
 
 export type NativeMediaActionDetail =
@@ -322,6 +323,18 @@ export function stopNativeMediaService(): void {
     window.KaGoNative.stopBackgroundService();
   } catch {
     // Ignore
+  }
+}
+
+export function triggerNativeHaptic(style: string): boolean {
+  if (typeof window === 'undefined' || typeof window.KaGoNative?.triggerHaptic !== 'function') {
+    return false;
+  }
+  try {
+    window.KaGoNative.triggerHaptic(style);
+    return true;
+  } catch {
+    return false;
   }
 }
 

@@ -16,6 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import type { AudioEngineSnapshot, LibrarySubTab, Playlist, Track } from '../types/audio';
+import { triggerHaptic } from '../utils/haptics';
 import { formatDuration } from '../utils/lrcParser';
 
 interface LibraryViewProps {
@@ -168,7 +169,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               <div className="flex min-w-0 flex-1 items-center gap-3">
                 <button
                   type="button"
-                  onClick={() => (isCurrent ? onTogglePlay() : playRowInList(track, listIdx))}
+                  onClick={() => {
+                    triggerHaptic('selection');
+                    if (isCurrent) {
+                      onTogglePlay();
+                    } else {
+                      playRowInList(track, listIdx);
+                    }
+                  }}
                   aria-label={isPlaying ? `Pause ${track.title}` : `Play ${track.title}`}
                   className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border transition-colors cursor-pointer ${
                     isCurrent
@@ -213,7 +221,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => onToggleFavorite(track.id)}
+                  onClick={() => {
+                    triggerHaptic('light');
+                    onToggleFavorite(track.id);
+                  }}
                   aria-label={isFav ? `Unfavorite ${track.title}` : `Favorite ${track.title}`}
                   className={`flex h-8 w-8 items-center justify-center rounded-md transition-colors cursor-pointer ${
                     isFav ? 'text-[#FF4D6D]' : 'text-[#8E929B] hover:text-white'
@@ -224,7 +235,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => onAddToQueue(track)}
+                  onClick={() => {
+                    triggerHaptic('selection');
+                    onAddToQueue(track);
+                  }}
                   aria-label={`Add ${track.title} to queue`}
                   title="Add to Queue"
                   className="flex h-8 w-8 items-center justify-center rounded-md text-[#8E929B] hover:bg-[#1C1E27] hover:text-white cursor-pointer"
@@ -235,9 +249,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 {playlists.length > 0 && (
                   <button
                     type="button"
-                    onClick={() =>
-                      setAssigningTrackId((prev) => (prev === track.id ? null : track.id))
-                    }
+                    onClick={() => {
+                      triggerHaptic('light');
+                      setAssigningTrackId((prev) => (prev === track.id ? null : track.id));
+                    }}
                     aria-label={`Add ${track.title} to playlist`}
                     title="Add to Playlist"
                     className="flex h-8 w-8 items-center justify-center rounded-md text-[#8E929B] hover:bg-[#1C1E27] hover:text-white cursor-pointer"
@@ -249,7 +264,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 {track.source !== 'synth' && (
                   <button
                     type="button"
-                    onClick={() => onDeleteTrack(track.id)}
+                    onClick={() => {
+                      triggerHaptic('light');
+                      onDeleteTrack(track.id);
+                    }}
                     aria-label={`Delete ${track.title}`}
                     className="flex h-8 w-8 items-center justify-center rounded-md text-[#8E929B] hover:text-[#FF4D6D] cursor-pointer"
                   >
@@ -259,13 +277,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
               </div>
 
               {assigningTrackId === track.id && (
-                <div className="mt-2 flex w-full flex-wrap items-center gap-2 border-t border-[#1D1F28] pt-2">
+                <div className="kago-panel-enter mt-2 flex w-full flex-wrap items-center gap-2 border-t border-[#1D1F28] pt-2">
                   <span className="text-xs text-[#8E929B]">Add to playlist:</span>
                   {playlists.map((pl) => (
                     <button
                       key={pl.id}
                       type="button"
                       onClick={() => {
+                        triggerHaptic('selection');
                         onAddTrackToPlaylist(pl.id, track.id);
                         setAssigningTrackId(null);
                       }}
@@ -300,7 +319,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           <div className="flex flex-wrap items-center gap-2.5">
             <button
               type="button"
-              onClick={onOpenLiveStudio}
+              onClick={() => {
+                triggerHaptic('light');
+                onOpenLiveStudio();
+              }}
               className="inline-flex items-center gap-2 rounded-lg bg-[#E11D48] px-4 py-2 text-xs font-semibold text-white shadow-[0_0_16px_rgba(225,29,72,0.45)] hover:bg-[#BE123C] transition-colors whitespace-nowrap cursor-pointer"
             >
               <Radio className="h-4 w-4" />
@@ -309,7 +331,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
             <button
               type="button"
-              onClick={onPickSong}
+              onClick={() => {
+                triggerHaptic('light');
+                onPickSong();
+              }}
               className="inline-flex items-center gap-2 rounded-lg border border-[#282B36] bg-[#14161D] px-4 py-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] transition-colors whitespace-nowrap cursor-pointer"
             >
               <Music className="h-4 w-4 text-[#E11D48]" />
@@ -318,7 +343,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
             <button
               type="button"
-              onClick={onPickFolder}
+              onClick={() => {
+                triggerHaptic('light');
+                onPickFolder();
+              }}
               className="inline-flex items-center gap-2 rounded-lg border border-[#282B36] bg-[#14161D] px-4 py-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] transition-colors whitespace-nowrap cursor-pointer"
             >
               <FolderOpen className="h-4 w-4 text-[#E11D48]" />
@@ -342,6 +370,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 role="tab"
                 aria-selected={active}
                 onClick={() => {
+                  triggerHaptic('light');
                   setSubTab(tab.id);
                   setSelectedGroup(null);
                 }}
@@ -359,6 +388,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       </section>
 
       {/* Tab Content */}
+      <div key={`${subTab}-${selectedGroup || 'root'}`} className="kago-panel-enter">
       {subTab === 'all' && renderTrackRows(tracks)}
       {subTab === 'favorites' && renderTrackRows(favoriteTracks)}
 
@@ -368,7 +398,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <h2 className="font-display text-lg font-bold text-[#F4F3F0]">Custom Playlists</h2>
             <button
               type="button"
-              onClick={() => setShowNewPlaylistModal(true)}
+              onClick={() => {
+                triggerHaptic('light');
+                setShowNewPlaylistModal(true);
+              }}
               className="inline-flex items-center gap-2 rounded-lg bg-[#E11D48] px-4 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
             >
               <Plus className="h-4 w-4" />
@@ -404,7 +437,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                         </div>
                         <button
                           type="button"
-                          onClick={() => onDeletePlaylist(pl.id)}
+                          onClick={() => {
+                            triggerHaptic('light');
+                            onDeletePlaylist(pl.id);
+                          }}
                           aria-label={`Delete playlist ${pl.name}`}
                           className="text-[#8E929B] hover:text-[#FF4D6D] cursor-pointer"
                         >
@@ -419,9 +455,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                     {plTracks.length > 0 && (
                       <button
                         type="button"
-                        onClick={() =>
-                          onPlayCollection ? onPlayCollection(plTracks, 0) : onPlayTrack(plTracks[0])
-                        }
+                        onClick={() => {
+                          triggerHaptic('selection');
+                          if (onPlayCollection) {
+                            onPlayCollection(plTracks, 0);
+                          } else {
+                            onPlayTrack(plTracks[0]);
+                          }
+                        }}
                         className="mt-4 inline-flex items-center justify-center gap-2 rounded-lg border border-[#282B36] bg-[#14161D] py-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer"
                       >
                         <Play className="h-3.5 w-3.5 fill-current text-[#E11D48]" />
@@ -460,11 +501,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       {activeTracks.length > 0 && (
                         <button
                           type="button"
-                          onClick={() =>
-                            onPlayCollection
-                              ? onPlayCollection(activeTracks, 0)
-                              : onPlayTrack(activeTracks[0])
-                          }
+                          onClick={() => {
+                            triggerHaptic('selection');
+                            if (onPlayCollection) {
+                              onPlayCollection(activeTracks, 0);
+                            } else {
+                              onPlayTrack(activeTracks[0]);
+                            }
+                          }}
                           className="inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer whitespace-nowrap"
                         >
                           <Play className="h-3.5 w-3.5 fill-current" />
@@ -473,7 +517,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       )}
                       <button
                         type="button"
-                        onClick={() => setSelectedGroup(null)}
+                        onClick={() => {
+                          triggerHaptic('light');
+                          setSelectedGroup(null);
+                        }}
                         className="rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs text-[#D1D5DB] hover:border-[#E11D48] cursor-pointer whitespace-nowrap"
                       >
                         Back to all {subTab}
@@ -491,8 +538,11 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                   <button
                     key={groupName}
                     type="button"
-                    onClick={() => setSelectedGroup(groupName)}
-                    className="flex items-center gap-3 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-4 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
+                    onClick={() => {
+                      triggerHaptic('light');
+                      setSelectedGroup(groupName);
+                    }}
+                    className="kago-press-subtle flex items-center gap-3 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-4 text-left hover:border-[#E11D48]/60 transition-colors cursor-pointer"
                   >
                     <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[#252834] bg-[#14161E] text-[#E11D48]">
                       {subTab === 'folders' ? (
@@ -518,16 +568,17 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           })()}
         </div>
       )}
+      </div>
 
       {/* New Playlist Modal */}
       {showNewPlaylistModal && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+          className="kago-modal-backdrop fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
           role="dialog"
           aria-modal="true"
           aria-labelledby="new-playlist-title"
         >
-          <div className="w-full max-w-md rounded-xl border border-[#242732] bg-[#0D0E12] p-6">
+          <div className="kago-sheet-slide w-full max-w-md rounded-xl border border-[#242732] bg-[#0D0E12] p-6">
             <div className="flex items-center justify-between">
               <h2 id="new-playlist-title" className="font-display text-lg font-bold text-[#F4F3F0]">
                 New Offline Playlist

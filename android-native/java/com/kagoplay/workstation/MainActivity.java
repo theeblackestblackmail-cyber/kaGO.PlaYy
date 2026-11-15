@@ -2,6 +2,7 @@ package com.kagoplay.workstation;
 
 import android.app.Activity;
 import android.app.PictureInPictureParams;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
@@ -11,9 +12,13 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
+import android.os.VibratorManager;
 import android.provider.DocumentsContract;
 import android.util.Base64;
 import android.util.Rational;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
@@ -458,6 +463,59 @@ public class MainActivity extends BridgeActivity {
         @JavascriptInterface
         public void setVideoModeActive(final boolean active) {
             runOnUiThread(() -> updateAutoPipParams(active));
+        }
+
+        @JavascriptInterface
+        public void triggerHaptic(final String style) {
+            runOnUiThread(() -> {
+                try {
+                    WebView webView = getBridge() != null ? getBridge().getWebView() : null;
+                    int feedbackConst = HapticFeedbackConstants.CLOCK_TICK;
+                    long durationMs = 12L;
+                    if ("selection".equals(style)) {
+                        feedbackConst = HapticFeedbackConstants.CONTEXT_CLICK;
+                        durationMs = 15L;
+                    } else if ("medium".equals(style)) {
+                        feedbackConst = HapticFeedbackConstants.VIRTUAL_KEY;
+                        durationMs = 20L;
+                    } else if ("reorder".equals(style)) {
+                        feedbackConst = HapticFeedbackConstants.LONG_PRESS;
+                        durationMs = 24L;
+                    } else if ("success".equals(style)) {
+                        feedbackConst = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                            ? HapticFeedbackConstants.CONFIRM
+                            : HapticFeedbackConstants.VIRTUAL_KEY;
+                        durationMs = 22L;
+                    }
+
+                    boolean performed = false;
+                    if (webView != null) {
+                        performed = webView.performHapticFeedback(
+                            feedbackConst,
+                            HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING
+                        );
+                    }
+                    if (!performed) {
+                        Vibrator vibrator = null;
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            VibratorManager vm = (VibratorManager) getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+                            if (vm != null) {
+                                vibrator = vm.getDefaultVibrator();
+                            }
+                        } else {
+                            vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+                        }
+                        if (vibrator != null && vibrator.hasVibrator()) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                vibrator.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE));
+                            } else {
+                                vibrator.vibrate(durationMs);
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            });
         }
 
         @JavascriptInterface

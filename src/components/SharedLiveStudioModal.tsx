@@ -12,6 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import type { StudioRoomState, Track } from '../types/audio';
+import { triggerHaptic } from '../utils/haptics';
 import { formatDuration } from '../utils/lrcParser';
 
 interface SharedLiveStudioModalProps {
@@ -137,39 +138,48 @@ export const SharedLiveStudioModal: React.FC<SharedLiveStudioModalProps> = ({
 
   const handleUpdateName = (e: React.FormEvent) => {
     e.preventDefault();
+    triggerHaptic('light');
     sendSocket({ type: 'studio:join', name: userName });
   };
 
   const handleAddTrack = () => {
     const track = availableTracks.find((t) => t.id === selectedAddTrackId);
     if (!track) return;
+    triggerHaptic('selection');
     sendSocket({ type: 'studio:add_track', track });
   };
 
   const handleSendChat = (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
+    triggerHaptic('light');
     sendSocket({ type: 'studio:chat', text: chatInput });
     setChatInput('');
   };
 
   return (
     <div
-      className="fixed inset-0 z-[70] flex flex-col sm:items-center sm:justify-center bg-black/90 backdrop-blur-sm sm:p-6"
+      className="kago-modal-backdrop fixed inset-0 z-[70] flex flex-col sm:items-center sm:justify-center bg-black/90 backdrop-blur-sm sm:p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="shared-studio-title"
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) {
+          triggerHaptic('light');
+          onClose();
+        }
       }}
     >
-      <div className="flex h-[100dvh] w-full flex-col bg-[#0D0E12] sm:h-auto sm:max-h-[90dvh] sm:max-w-5xl sm:rounded-xl sm:border sm:border-[#242732] overflow-hidden">
+      <div className="kago-sheet-slide flex h-[100dvh] w-full flex-col bg-[#0D0E12] sm:h-auto sm:max-h-[90dvh] sm:max-w-5xl sm:rounded-xl sm:border sm:border-[#242732] overflow-hidden">
         {/* Modal Header */}
         <div className="shrink-0 flex flex-wrap items-center justify-between gap-2.5 border-b border-[#1E2028] bg-[#090A0E] px-3.5 py-3 sm:px-5 sm:py-4 pt-[max(0.75rem,env(safe-area-inset-top))] sm:pt-4">
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
             <button
               type="button"
-              onClick={onClose}
+              onClick={() => {
+                triggerHaptic('light');
+                onClose();
+              }}
               aria-label="Back from Shared Live Studio"
               className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-[#262936] bg-[#14161D] px-3 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
             >
@@ -218,7 +228,10 @@ export const SharedLiveStudioModal: React.FC<SharedLiveStudioModalProps> = ({
             </form>
             <button
               type="button"
-              onClick={onClose}
+              onClick={() => {
+                triggerHaptic('light');
+                onClose();
+              }}
               aria-label="Close Shared Live Studio"
               className="hidden sm:flex h-9 w-9 items-center justify-center rounded-lg border border-[#262936] bg-[#14161D] text-[#8E929B] hover:text-white cursor-pointer"
             >
@@ -243,7 +256,10 @@ export const SharedLiveStudioModal: React.FC<SharedLiveStudioModalProps> = ({
                 </div>
                 <button
                   type="button"
-                  onClick={() => onPlayTrack(roomState.nowPlaying!.track)}
+                  onClick={() => {
+                    triggerHaptic('selection');
+                    onPlayTrack(roomState.nowPlaying!.track);
+                  }}
                   className="shrink-0 rounded-lg bg-[#E11D48] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
                 >
                   Listen Sync
@@ -302,7 +318,10 @@ export const SharedLiveStudioModal: React.FC<SharedLiveStudioModalProps> = ({
                     <div className="flex items-center gap-1.5 shrink-0">
                       <button
                         type="button"
-                        onClick={() => sendSocket({ type: 'studio:toggle_upvote', itemId: item.id })}
+                        onClick={() => {
+                          triggerHaptic('selection');
+                          sendSocket({ type: 'studio:toggle_upvote', itemId: item.id });
+                        }}
                         aria-label={`Upvote ${item.track.title}`}
                         className={`inline-flex items-center gap-1 rounded-md border px-2.5 py-1.5 font-mono-tabular text-xs font-semibold transition-colors cursor-pointer ${
                           hasVoted
@@ -317,6 +336,7 @@ export const SharedLiveStudioModal: React.FC<SharedLiveStudioModalProps> = ({
                       <button
                         type="button"
                         onClick={() => {
+                          triggerHaptic('selection');
                           sendSocket({ type: 'studio:play_track', track: item.track });
                           onPlayTrack(item.track);
                         }}
@@ -328,7 +348,10 @@ export const SharedLiveStudioModal: React.FC<SharedLiveStudioModalProps> = ({
 
                       <button
                         type="button"
-                        onClick={() => sendSocket({ type: 'studio:remove_track', itemId: item.id })}
+                        onClick={() => {
+                          triggerHaptic('light');
+                          sendSocket({ type: 'studio:remove_track', itemId: item.id });
+                        }}
                         aria-label={`Remove ${item.track.title} from shared queue`}
                         className="flex h-8 w-8 items-center justify-center rounded-md text-[#8E929B] hover:text-[#FF4D6D] cursor-pointer"
                       >

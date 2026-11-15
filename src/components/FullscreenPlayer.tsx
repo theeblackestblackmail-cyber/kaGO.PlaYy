@@ -23,8 +23,9 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { DspSettings, StoredLyrics, Track } from '../types/audio';
-import { findActiveLyricIndex, formatDuration, parseLrc } from '../utils/lrcParser';
+import { formatDuration, parseLrc, findActiveLyricIndex } from '../utils/lrcParser';
 import { sanitizeTrackForLyrics } from '../utils/lyricsFetcher';
+import { triggerHaptic } from '../utils/haptics';
 import { fetchRelatedRadioTracks } from '../utils/streamRadio';
 import { SpectrumVisualizer } from './SpectrumVisualizer';
 import { VinylTurntable } from './VinylTurntable';
@@ -185,13 +186,16 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
       role="dialog"
       aria-modal="true"
       aria-label="Fullscreen Vinyl Turntable Player"
-      className="fixed inset-0 z-50 flex flex-col bg-black text-[#F4F3F0] animate-[fadeIn_180ms_ease-out]"
+      className="fixed inset-0 z-50 flex flex-col bg-black text-[#F4F3F0]"
     >
       {/* Top Bar */}
       <div className="shrink-0 flex items-center justify-between gap-2 sm:gap-4 border-b border-[#1A1C24] bg-[#06070A] px-3 py-3 sm:px-6 pt-[max(0.75rem,env(safe-area-inset-top))] sm:pt-3">
         <button
           type="button"
-          onClick={onClose}
+          onClick={() => {
+            triggerHaptic('light');
+            onClose();
+          }}
           aria-label="Back from fullscreen player"
           className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-[#242732] bg-[#111319] px-2.5 sm:px-3 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
         >
@@ -220,7 +224,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                 type="button"
                 role="tab"
                 aria-selected={active}
-                onClick={() => setSubTab(t.id)}
+                onClick={() => {
+                  triggerHaptic('light');
+                  setSubTab(t.id);
+                }}
                 className={`shrink-0 rounded-md px-2.5 sm:px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
                   active
                     ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
@@ -235,7 +242,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
 
         <button
           type="button"
-          onClick={onOpenDsp}
+          onClick={() => {
+            triggerHaptic('light');
+            onOpenDsp();
+          }}
           aria-label="Open Hardware DSP Studio"
           className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#111319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
         >
@@ -247,11 +257,14 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
       <div className="flex-1 overflow-y-auto px-4 py-6 sm:px-8">
         <div className="mx-auto max-w-3xl">
           {subTab === 'turntable' && (
-            <div className="space-y-6">
+            <div className="kago-panel-enter space-y-6">
               <VinylTurntable
                 track={track}
                 isPlaying={isPlaying}
-                onTogglePlay={onTogglePlay}
+                onTogglePlay={() => {
+                  triggerHaptic('light');
+                  onTogglePlay();
+                }}
                 size="lg"
               />
               <SpectrumVisualizer isPlaying={isPlaying} dsp={dsp} compact />
@@ -302,8 +315,11 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                       <button
                         key={rec.id}
                         type="button"
-                        onClick={() => onPlayTrack({ ...rec, autoQueued: false })}
-                        className="group w-[calc((100%-20px)/3)] min-w-[110px] sm:min-w-[168px] shrink-0 snap-start overflow-hidden rounded-xl border border-[#222530] bg-[#0D0E12] text-left hover:border-[#E11D48] transition-colors cursor-pointer"
+                        onClick={() => {
+                          triggerHaptic('selection');
+                          onPlayTrack({ ...rec, autoQueued: false });
+                        }}
+                        className="kago-press-subtle group w-[calc((100%-20px)/3)] min-w-[110px] sm:min-w-[168px] shrink-0 snap-start overflow-hidden rounded-xl border border-[#222530] bg-[#0D0E12] text-left hover:border-[#E11D48] transition-colors cursor-pointer"
                       >
                         <div className="relative aspect-video w-full overflow-hidden bg-[#14161E]">
                           {rec.artworkUrl ? (
@@ -353,7 +369,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
           )}
 
           {subTab === 'lyrics' && (
-            <div className="space-y-4">
+            <div className="kago-panel-enter space-y-4">
               {/* Sync Status & Calibration Header */}
               <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#1F2129] bg-[#0D0E12] px-4 py-3">
                 <div className="flex min-w-0 items-center gap-2">
@@ -379,7 +395,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                     <button
                       type="button"
                       disabled={isFetchingLyrics}
-                      onClick={() => onFetchTrackLyrics(track)}
+                      onClick={() => {
+                        triggerHaptic('light');
+                        onFetchTrackLyrics(track);
+                      }}
                       aria-label="Refresh synced lyrics"
                       className="inline-flex h-8 items-center gap-1.5 rounded-md border border-[#2A2D39] bg-[#14161D] px-2.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] disabled:opacity-50 cursor-pointer"
                     >
@@ -393,12 +412,13 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                   <button
                     type="button"
                     aria-label="Decrease lyric timing offset"
-                    onClick={() =>
+                    onClick={() => {
+                      triggerHaptic('light');
                       onUpdateLyricsOffset(
                         track.id,
                         Math.max(-2, Number((offsetSeconds - 0.1).toFixed(1)))
-                      )
-                    }
+                      );
+                    }}
                     className="flex h-8 w-8 items-center justify-center rounded-md border border-[#2A2D39] bg-[#14161D] text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer"
                   >
                     <Minus className="h-3.5 w-3.5" />
@@ -409,19 +429,23 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                   <button
                     type="button"
                     aria-label="Increase lyric timing offset"
-                    onClick={() =>
+                    onClick={() => {
+                      triggerHaptic('light');
                       onUpdateLyricsOffset(
                         track.id,
                         Math.min(2, Number((offsetSeconds + 0.1).toFixed(1)))
-                      )
-                    }
+                      );
+                    }}
                     className="flex h-8 w-8 items-center justify-center rounded-md border border-[#2A2D39] bg-[#14161D] text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer"
                   >
                     <Plus className="h-3.5 w-3.5" />
                   </button>
                   <button
                     type="button"
-                    onClick={() => onUpdateLyricsOffset(track.id, 0)}
+                    onClick={() => {
+                      triggerHaptic('light');
+                      onUpdateLyricsOffset(track.id, 0);
+                    }}
                     className="rounded-md border border-[#2A2D39] bg-[#14161D] px-2 py-1 font-mono-tabular text-xs text-[#8E929B] hover:text-white cursor-pointer"
                   >
                     0.0s
@@ -443,7 +467,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                         key={`${line.time}-${idx}`}
                         ref={isActive ? activeLineRef : undefined}
                         type="button"
-                        onClick={() => onSeek(line.time)}
+                        onClick={() => {
+                          triggerHaptic('selection');
+                          onSeek(line.time);
+                        }}
                         aria-current={isActive ? 'true' : undefined}
                         className={`block w-full rounded-xl px-4 py-2.5 transition-all duration-300 cursor-pointer ${
                           isActive
@@ -521,7 +548,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
           )}
 
           {subTab === 'queue' && (
-            <div className="space-y-2">
+            <div className="kago-panel-enter space-y-2">
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#1F2129] bg-[#0D0E12] px-3.5 py-2.5">
                 <div className="flex flex-wrap items-center gap-2 text-xs text-[#8E929B]">
                   <span className="font-semibold text-[#F4F3F0]">Active Playback Queue</span>
@@ -545,7 +572,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                   type="button"
                   role="switch"
                   aria-checked={autoplayRadioEnabled}
-                  onClick={onToggleAutoplayRadio}
+                  onClick={() => {
+                    triggerHaptic('light');
+                    onToggleAutoplayRadio();
+                  }}
                   className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors cursor-pointer ${
                     autoplayRadioEnabled
                       ? 'border-[#E11D48] bg-[#E11D48]/15 text-[#FF4D6D]'
@@ -572,6 +602,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                       draggable={Boolean(onReorderQueue) && queue.length > 1}
                       onDragStart={(e) => {
                         if (!onReorderQueue) return;
+                        triggerHaptic('reorder', 10);
                         setDragIdx(idx);
                         setDragOverIdx(idx);
                         e.dataTransfer.effectAllowed = 'move';
@@ -582,6 +613,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                         e.preventDefault();
                         e.dataTransfer.dropEffect = 'move';
                         if (dragOverIdx !== idx) {
+                          triggerHaptic('selection', 35);
                           setDragOverIdx(idx);
                         }
                       }}
@@ -597,13 +629,13 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                         setDragIdx(null);
                         setDragOverIdx(null);
                       }}
-                      className={`flex items-center justify-between gap-2 rounded-lg border px-2.5 sm:px-3.5 py-2.5 transition-colors ${
+                      className={`flex items-center justify-between gap-2 rounded-lg border px-2.5 sm:px-3.5 py-2.5 transition-[transform,background-color,border-color,opacity] duration-150 ${
                         isDropTarget
-                          ? 'border-[#E11D48] bg-[#E11D48]/20'
+                          ? 'scale-[1.01] border-[#E11D48] bg-[#E11D48]/20'
                           : active
                           ? 'border-[#E11D48] bg-[#E11D48]/10'
                           : 'border-[#1F2129] bg-[#0D0E12]'
-                      } ${isDragging ? 'opacity-50' : ''}`}
+                      } ${isDragging ? 'scale-[0.985] opacity-55' : ''}`}
                     >
                       {onReorderQueue && queue.length > 1 && (
                         <button
@@ -613,6 +645,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                           onPointerDown={(e) => {
                             if (e.pointerType === 'mouse') return;
                             e.preventDefault();
+                            triggerHaptic('reorder', 10);
                             pointerDragFromRef.current = idx;
                             setDragIdx(idx);
                             setDragOverIdx(idx);
@@ -631,6 +664,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                             if (rawIdx !== null && rawIdx !== undefined) {
                               const parsed = Number(rawIdx);
                               if (Number.isInteger(parsed) && parsed !== dragOverIdx) {
+                                triggerHaptic('selection', 35);
                                 setDragOverIdx(parsed);
                               }
                             }
@@ -659,7 +693,7 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                       <button
                         type="button"
                         onClick={() => onPlayTrack(qTrack)}
-                        className="flex min-w-0 flex-1 items-center gap-2.5 text-left cursor-pointer"
+                        className="kago-press-subtle flex min-w-0 flex-1 items-center gap-2.5 text-left cursor-pointer"
                       >
                         <span
                           className={`w-5 shrink-0 font-mono-tabular text-xs ${
@@ -717,7 +751,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                         )}
                         <button
                           type="button"
-                          onClick={() => onRemoveFromQueue(qTrack.id)}
+                          onClick={() => {
+                            triggerHaptic('light');
+                            onRemoveFromQueue(qTrack.id);
+                          }}
                           aria-label={`Remove ${qTrack.title} from queue`}
                           className="flex h-8 w-8 items-center justify-center rounded text-[#8E929B] hover:text-[#FF4D6D] cursor-pointer"
                         >
@@ -748,7 +785,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
 
             <button
               type="button"
-              onClick={() => onToggleFavorite(track.id)}
+              onClick={() => {
+                triggerHaptic('selection');
+                onToggleFavorite(track.id);
+              }}
               aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
               className={`flex h-10 w-10 sm:h-11 sm:w-11 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#121319] transition-colors cursor-pointer ${
                 isFavorite ? 'text-[#FF4D6D]' : 'text-[#8E929B] hover:text-white'
@@ -788,7 +828,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
           <div className="mt-2.5 sm:mt-3 flex items-center justify-center gap-2.5 min-[380px]:gap-4 sm:gap-6">
             <button
               type="button"
-              onClick={() => onSeekBy(-10)}
+              onClick={() => {
+                triggerHaptic('light');
+                onSeekBy(-10);
+              }}
               aria-label="Rewind 10 seconds"
               className="flex h-10 w-10 sm:h-11 sm:w-11 items-center justify-center rounded-full border border-[#242732] bg-[#121319] text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
             >
@@ -797,7 +840,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
 
             <button
               type="button"
-              onClick={onPrev}
+              onClick={() => {
+                triggerHaptic('light');
+                onPrev();
+              }}
               aria-label="Previous track"
               className="flex h-12 w-12 items-center justify-center rounded-full border border-[#242732] bg-[#121319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
             >
@@ -806,7 +852,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
 
             <button
               type="button"
-              onClick={onTogglePlay}
+              onClick={() => {
+                triggerHaptic('selection');
+                onTogglePlay();
+              }}
               aria-label={isPlaying ? 'Pause' : 'Play'}
               className="flex h-14 w-14 items-center justify-center rounded-full bg-[#E11D48] text-white shadow-[0_0_24px_rgba(225,29,72,0.65)] hover:bg-[#BE123C] transition-colors cursor-pointer"
             >
@@ -819,7 +868,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
 
             <button
               type="button"
-              onClick={onNext}
+              onClick={() => {
+                triggerHaptic('light');
+                onNext();
+              }}
               aria-label="Next track"
               className="flex h-12 w-12 items-center justify-center rounded-full border border-[#242732] bg-[#121319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
             >
@@ -828,7 +880,10 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
 
             <button
               type="button"
-              onClick={() => onSeekBy(10)}
+              onClick={() => {
+                triggerHaptic('light');
+                onSeekBy(10);
+              }}
               aria-label="Forward 10 seconds"
               className="flex h-11 w-11 items-center justify-center rounded-full border border-[#242732] bg-[#121319] text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
             >

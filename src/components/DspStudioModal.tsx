@@ -2,6 +2,7 @@ import React from 'react';
 import { ArrowLeft, RotateCcw, Sliders, X } from 'lucide-react';
 import { EQ_FREQUENCIES, EQ_PRESETS, EQ_PRESET_ORDER } from '../data/presetsAndStems';
 import type { DspSettings, EqBands, EqPresetName } from '../types/audio';
+import { triggerHaptic } from '../utils/haptics';
 
 interface DspStudioModalProps {
   isOpen: boolean;
@@ -21,6 +22,7 @@ export const DspStudioModal: React.FC<DspStudioModalProps> = ({
   if (!isOpen) return null;
 
   const handlePreset = (name: EqPresetName) => {
+    triggerHaptic('selection');
     onUpdateDsp({
       ...dsp,
       preset: name,
@@ -29,6 +31,7 @@ export const DspStudioModal: React.FC<DspStudioModalProps> = ({
   };
 
   const handleBandChange = (index: number, value: number) => {
+    triggerHaptic('light', 45);
     const nextBands = [...dsp.bands] as EqBands;
     nextBands[index] = value;
     onUpdateDsp({
@@ -40,21 +43,27 @@ export const DspStudioModal: React.FC<DspStudioModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-[70] flex flex-col sm:items-center sm:justify-center bg-black/90 backdrop-blur-sm sm:p-6"
+      className="kago-modal-backdrop fixed inset-0 z-[70] flex flex-col sm:items-center sm:justify-center bg-black/90 backdrop-blur-sm sm:p-6"
       role="dialog"
       aria-modal="true"
       aria-labelledby="dsp-studio-heading"
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) {
+          triggerHaptic('light');
+          onClose();
+        }
       }}
     >
-      <div className="flex h-[100dvh] w-full flex-col bg-[#0D0E12] sm:h-auto sm:max-h-[90dvh] sm:max-w-3xl sm:rounded-xl sm:border sm:border-[#242732] overflow-hidden shadow-2xl">
+      <div className="kago-sheet-slide flex h-[100dvh] w-full flex-col bg-[#0D0E12] sm:h-auto sm:max-h-[90dvh] sm:max-w-3xl sm:rounded-xl sm:border sm:border-[#242732] overflow-hidden shadow-2xl">
         {/* Sticky Top Bar with Top-Left Back Button */}
         <div className="shrink-0 flex items-center justify-between gap-2 border-b border-[#1E2028] bg-[#090A0E] px-3 py-3 sm:px-6 pt-[max(0.75rem,env(safe-area-inset-top))] sm:pt-4">
           <div className="flex min-w-0 items-center gap-2.5 sm:gap-3">
             <button
               type="button"
-              onClick={onClose}
+              onClick={() => {
+                triggerHaptic('light');
+                onClose();
+              }}
               aria-label="Back from Equalizer Settings"
               className="inline-flex h-10 shrink-0 items-center gap-1.5 rounded-lg border border-[#2A2D39] bg-[#14161D] px-3 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
             >
@@ -82,7 +91,10 @@ export const DspStudioModal: React.FC<DspStudioModalProps> = ({
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={onResetFlat}
+              onClick={() => {
+                triggerHaptic('medium');
+                onResetFlat();
+              }}
               className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-[#2A2D39] bg-[#14161D] px-2.5 sm:px-3 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer whitespace-nowrap"
             >
               <RotateCcw className="h-3.5 w-3.5 text-[#E11D48]" />
@@ -92,7 +104,10 @@ export const DspStudioModal: React.FC<DspStudioModalProps> = ({
 
             <button
               type="button"
-              onClick={onClose}
+              onClick={() => {
+                triggerHaptic('light');
+                onClose();
+              }}
               aria-label="Close Hardware DSP Studio"
               className="hidden sm:flex h-10 w-10 items-center justify-center rounded-lg border border-[#2A2D39] bg-[#14161D] text-[#8E929B] hover:text-white transition-colors cursor-pointer"
             >
@@ -185,9 +200,10 @@ export const DspStudioModal: React.FC<DspStudioModalProps> = ({
                 </div>
                 <button
                   type="button"
-                  onClick={() =>
-                    onUpdateDsp({ ...dsp, bassBoostEnabled: !dsp.bassBoostEnabled })
-                  }
+                  onClick={() => {
+                    triggerHaptic('selection');
+                    onUpdateDsp({ ...dsp, bassBoostEnabled: !dsp.bassBoostEnabled });
+                  }}
                   aria-pressed={dsp.bassBoostEnabled}
                   className={`shrink-0 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
                     dsp.bassBoostEnabled
@@ -209,13 +225,14 @@ export const DspStudioModal: React.FC<DspStudioModalProps> = ({
                   step={1}
                   value={dsp.bassBoostDb}
                   aria-label="80 Hz Low-Shelf Bass Boost Gain"
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    triggerHaptic('light', 45);
                     onUpdateDsp({
                       ...dsp,
                       bassBoostDb: Number(e.target.value),
                       bassBoostEnabled: true,
-                    })
-                  }
+                    });
+                  }}
                   className="hardware-slider w-full"
                 />
                 <span className="font-mono-tabular text-xs text-[#F4F3F0] whitespace-nowrap shrink-0">
@@ -248,12 +265,13 @@ export const DspStudioModal: React.FC<DspStudioModalProps> = ({
                   step={0.5}
                   value={dsp.crossfadeSeconds}
                   aria-label="Channel Crossfader Duration in seconds"
-                  onChange={(e) =>
+                  onChange={(e) => {
+                    triggerHaptic('light', 45);
                     onUpdateDsp({
                       ...dsp,
                       crossfadeSeconds: Number(e.target.value),
-                    })
-                  }
+                    });
+                  }}
                   className="hardware-slider w-full"
                 />
                 <span className="font-mono-tabular text-xs text-[#F4F3F0]">12s</span>

@@ -16,6 +16,7 @@ import { CURATED_STREAM_BANK } from '../data/presetsAndStems';
 import { localDb } from '../db/localDb';
 import type { AudioEngineSnapshot, Track } from '../types/audio';
 import { formatDuration } from '../utils/lrcParser';
+import { triggerHaptic } from '../utils/haptics';
 import { pushRecentSearch } from '../utils/streamFilter';
 import { fetchMusicSuggestions, searchStreamsUnified } from '../utils/streamSearch';
 
@@ -187,17 +188,18 @@ export const SearchView: React.FC<SearchViewProps> = ({
               <div
                 role="listbox"
                 aria-label="Search suggestions"
-                className="absolute left-0 right-0 top-full z-40 mt-1.5 overflow-hidden rounded-lg border border-[#282B36] bg-[#101219] shadow-2xl"
+                className="kago-panel-enter absolute left-0 right-0 top-full z-40 mt-1.5 overflow-hidden rounded-lg border border-[#282B36] bg-[#101219] shadow-2xl"
               >
                 {suggestions.map((item) => (
                   <button
                     key={item}
                     type="button"
                     onClick={() => {
+                      triggerHaptic('selection');
                       setQuery(item);
                       void executeOnlineSearch(item);
                     }}
-                    className="flex w-full items-center gap-2.5 border-b border-[#1A1C24] px-3.5 py-2.5 text-left text-xs text-[#E5E7EB] last:border-b-0 hover:bg-[#1A1D27] hover:text-white cursor-pointer"
+                    className="kago-press-subtle flex w-full items-center gap-2.5 border-b border-[#1A1C24] px-3.5 py-2.5 text-left text-xs text-[#E5E7EB] last:border-b-0 hover:bg-[#1A1D27] hover:text-white cursor-pointer"
                   >
                     <Search className="h-3.5 w-3.5 shrink-0 text-[#E11D48]" />
                     <span className="truncate">{item}</span>
@@ -228,6 +230,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
               key={term}
               type="button"
               onClick={() => {
+                triggerHaptic('light');
                 setQuery(term);
                 void executeOnlineSearch(term);
               }}
@@ -247,6 +250,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
                 key={term}
                 type="button"
                 onClick={() => {
+                  triggerHaptic('light');
                   setQuery(term);
                   void executeOnlineSearch(term);
                 }}
@@ -257,7 +261,10 @@ export const SearchView: React.FC<SearchViewProps> = ({
             ))}
             <button
               type="button"
-              onClick={() => setRecentSearches([])}
+              onClick={() => {
+                triggerHaptic('light');
+                setRecentSearches([]);
+              }}
               className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-[#8E929B] hover:text-[#FF4D6D] cursor-pointer"
             >
               <Trash2 className="h-3 w-3" />
@@ -297,7 +304,11 @@ export const SearchView: React.FC<SearchViewProps> = ({
                   <div className="flex min-w-0 flex-1 items-center gap-3">
                     <button
                       type="button"
-                      onClick={() => (isCurrent ? onTogglePlay() : onPlayTrack(track))}
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        if (isCurrent) onTogglePlay();
+                        else onPlayTrack(track);
+                      }}
                       aria-label={isTrackPlaying ? `Pause ${track.title}` : `Play ${track.title}`}
                       className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border cursor-pointer ${
                         isCurrent
@@ -324,7 +335,10 @@ export const SearchView: React.FC<SearchViewProps> = ({
                     </span>
                     <button
                       type="button"
-                      onClick={() => onAddToQueue(track)}
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        onAddToQueue(track);
+                      }}
                       aria-label={`Queue ${track.title}`}
                       className="flex h-8 w-8 items-center justify-center rounded-md text-[#8E929B] hover:bg-[#1C1E27] hover:text-white cursor-pointer"
                     >
@@ -349,7 +363,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
           </span>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className="kago-panel-enter grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {streamResults.map((track) => {
             const isCurrent = engine.currentTrack?.id === track.id;
             const isTrackPlaying = isCurrent && engine.isPlaying;
@@ -398,6 +412,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
                   <button
                     type="button"
                     onClick={() => {
+                      triggerHaptic('selection');
                       onAddToQueue(track);
                       onSaveTrackToLibrary(track);
                     }}
@@ -408,7 +423,11 @@ export const SearchView: React.FC<SearchViewProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={() => (isCurrent ? onTogglePlay() : onPlayTrack(track))}
+                    onClick={() => {
+                      triggerHaptic('selection');
+                      if (isCurrent) onTogglePlay();
+                      else onPlayTrack(track);
+                    }}
                     className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
                   >
                     {isTrackPlaying ? (
