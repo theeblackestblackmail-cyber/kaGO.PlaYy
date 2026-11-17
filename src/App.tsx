@@ -417,6 +417,11 @@ export default function App() {
     };
   }, []);
 
+  // Keep AudioEngine's proactive 3-track pre-buffer synchronized with active queue updates
+  useEffect(() => {
+    audioEngine.setUpcomingQueue(queue);
+  }, [queue]);
+
   // Re-align YouTube viewport once page enter transition settles
   useEffect(() => {
     const timer = window.setTimeout(() => audioEngine.resyncYouTubeViewport(), 230);

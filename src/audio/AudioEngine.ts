@@ -19,9 +19,35 @@ import {
   isPrematureStreamEnded,
   shouldAutoResumePlaybackPause,
 } from '../utils/playbackStability';
+import {
+  computePreloadEvictions,
+  evaluateNetworkStability,
+  PRELOAD_SETTLE_DELAY_MS,
+  PROACTIVE_PRELOAD_COUNT,
+  selectUpcomingPreloadTracks,
+} from '../utils/proactiveBuffer';
 
 type Listener = (snapshot: AudioEngineSnapshot) => void;
 type TrackEndListener = () => void;
+
+interface NetworkConnectionLike {
+  saveData?: boolean;
+  effectiveType?: string;
+  downlink?: number;
+  rtt?: number;
+  addEventListener?: (type: string, listener: () => void) => void;
+}
+
+interface PreloadEntry {
+  trackId: string;
+  status: 'pending' | 'ready' | 'failed';
+  controller: AbortController;
+  blob?: Blob;
+  audioEl?: HTMLAudioElement;
+  resolvedStreamUrl?: string;
+  resolvedYoutubeId?: string;
+  updatedAt: number;
+}
 
 class SynthStemDriver {
   private ctx: AudioContext;
@@ -399,6 +425,13 @@ class DualChannelAudioEngine {
   private prematureEndRetries = 0;
   private audioReloadInFlight = false;
   private lastCompositorNudgeAt = 0;
+  private upcomingQueue: Track[] = [];
+  private preloadPool = new Map<string, PreloadEntry>();
+  private preloadTimer: number | null = null;
+  private preloadInFlight = false;
+  private trackStartedAtMs = 0;
+  private lastOnlineAtMs = 0;
+  private preloadRetryCooldown = new Map<string, number>();
 
   private listeners = new Set<Listener>();
   private endListeners = new Set<TrackEndListener>();
@@ -431,6 +464,11 @@ class DualChannelAudioEngine {
     window.addEventListener('pagehide', triggerKeepalive);
     window.addEventListener('blur', triggerKeepalive);
     window.addEventListener('online', () => {
+      this.lastOnlineAtMs = Date.now();
+      this.preloadRetryCooldown.clear();
+      if (this.isPlaying) {
+        this.scheduleProactivePreload(PRELOAD_SETTLE_DELAY_MS);
+      }
       if (!this.isPlaying || !this.currentTrack) return;
       if (this.currentTrack.source === 'stream') {
         this.watchdogNudgeCount = 0;
@@ -438,6 +476,13 @@ class DualChannelAudioEngine {
         this.watchdogLastRecoverAt = 0;
         this.ensurePlaybackAliveNow();
         window.setTimeout(() => this.runPlaybackWatchdogTick(), 600);
+      }
+    });
+
+    const netConn = (navigator as Navigator & { connection?: NetworkConnectionLike }).connection;
+    netConn?.addEventListener?.('change', () => {
+      if (this.isPlaying) {
+        this.scheduleProactivePreload(600);
       }
     });
     subscribeNativeKeepalive(() => triggerKeepalive());
@@ -773,6 +818,318 @@ class DualChannelAudioEngine {
 
   getAnalyserBinCount(): number {
     return this.analyser ? this.analyser.frequencyBinCount : 64;
+  }
+
+  setUpcomingQueue(queue: Track[]): void {
+    this.upcomingQueue = queue;
+    this.reconcilePreloadEvictions();
+    if (this.isPlaying || this.currentTrack) {
+      this.scheduleProactivePreload(650);
+    }
+  }
+
+  getPreloadSnapshot(): Array<{ trackId: string; status: PreloadEntry['status'] }> {
+    return Array.from(this.preloadPool.values()).map((entry) => ({
+      trackId: entry.trackId,
+      status: entry.status,
+    }));
+  }
+
+  private getNetworkStability() {
+    const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+    const conn = (nav as (Navigator & { connection?: NetworkConnectionLike }) | undefined)?.connection;
+    return evaluateNetworkStability({
+      isOnline: nav ? nav.onLine : true,
+      saveData: conn?.saveData,
+      effectiveType: conn?.effectiveType,
+      downlinkMbps: conn?.downlink,
+      rttMs: conn?.rtt,
+      isStreamingTrack: this.currentTrack?.source === 'stream',
+      isBuffering: this.isBuffering,
+      streamErrorCount: this.streamErrorCount,
+      nowMs: Date.now(),
+      trackStartedAtMs: this.trackStartedAtMs,
+      lastOnlineAtMs: this.lastOnlineAtMs,
+    });
+  }
+
+  private evictPreloadEntry(trackId: string) {
+    const entry = this.preloadPool.get(trackId);
+    if (!entry) return;
+    entry.controller.abort();
+    if (entry.audioEl) {
+      try {
+        entry.audioEl.pause();
+        entry.audioEl.removeAttribute('src');
+        entry.audioEl.load();
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+    this.preloadPool.delete(trackId);
+  }
+
+  private reconcilePreloadEvictions(): Track[] {
+    const targets = selectUpcomingPreloadTracks(
+      this.upcomingQueue,
+      this.currentTrack?.id,
+      PROACTIVE_PRELOAD_COUNT
+    );
+    const { toEvict } = computePreloadEvictions(this.preloadPool.keys(), targets);
+    for (const staleId of toEvict) {
+      this.evictPreloadEntry(staleId);
+    }
+    return targets;
+  }
+
+  private scheduleProactivePreload(delayMs = 500) {
+    if (typeof window === 'undefined') return;
+    if (this.preloadTimer !== null) {
+      window.clearTimeout(this.preloadTimer);
+      this.preloadTimer = null;
+    }
+    this.preloadTimer = window.setTimeout(() => {
+      this.preloadTimer = null;
+      void this.runProactivePreload();
+    }, delayMs);
+  }
+
+  private async warmLocalTrackPreload(track: Track, entry: PreloadEntry): Promise<void> {
+    if (entry.controller.signal.aborted) return;
+    try {
+      const blob = await localDb.getAudioBlob(track.id);
+      if (entry.controller.signal.aborted) return;
+      if (blob) {
+        entry.blob = blob;
+        entry.status = 'ready';
+        entry.updatedAt = Date.now();
+        return;
+      }
+      entry.status = 'failed';
+    } catch {
+      entry.status = 'failed';
+    }
+  }
+
+  private async verifyYouTubeOrResolveAlternate(
+    track: Track,
+    signal: AbortSignal
+  ): Promise<{ youtubeId?: string; streamUrl?: string }> {
+    const videoId = track.youtubeId;
+    if (!videoId) return {};
+
+    // Check lightweight oEmbed availability so broken/private videos are replaced before playback starts
+    let embedOk = false;
+    try {
+      const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(
+        `https://www.youtube.com/watch?v=${videoId}`
+      )}&format=json`;
+      if (hasNativeHttpBridge()) {
+        const res = await nativeFetchText(oembedUrl, 4500);
+        embedOk = Boolean(res?.ok);
+      } else {
+        const res = await fetch(oembedUrl, {
+          signal: AbortSignal.any
+            ? AbortSignal.any([signal, AbortSignal.timeout(4500)])
+            : signal,
+        });
+        embedOk = res.ok;
+      }
+    } catch {
+      // Transient timeout shouldn't discard valid ID immediately; assume OK unless 401/403/404
+      embedOk = !signal.aborted;
+    }
+
+    if (signal.aborted) return {};
+    if (embedOk) {
+      return { youtubeId: videoId };
+    }
+
+    // Proactively resolve working mirror ahead of time if primary YouTube video is unembeddable
+    try {
+      const recoverRes = await fetch(
+        `/api/stream/recover?title=${encodeURIComponent(track.title)}&artist=${encodeURIComponent(
+          track.artist
+        )}&genre=${encodeURIComponent(track.genre || '')}&excludeId=${encodeURIComponent(videoId)}`,
+        { signal }
+      );
+      if (recoverRes.ok && (recoverRes.headers.get('content-type') || '').includes('application/json')) {
+        const data = (await recoverRes.json()) as {
+          mode?: string;
+          youtubeId?: string;
+          streamUrl?: string;
+        };
+        if (data.mode === 'alternate-youtube' && data.youtubeId) {
+          return { youtubeId: data.youtubeId };
+        }
+        if (data.mode === 'alternate-stream' && data.streamUrl) {
+          return { streamUrl: data.streamUrl };
+        }
+      }
+    } catch {
+      // Ignore network errors during background preload
+    }
+
+    return { youtubeId: videoId };
+  }
+
+  private async warmDirectAudioStream(track: Track, entry: PreloadEntry): Promise<void> {
+    if (!track.streamUrl || entry.controller.signal.aborted) return;
+    const proxied =
+      track.streamUrl.startsWith('http') &&
+      typeof window !== 'undefined' &&
+      !track.streamUrl.startsWith(window.location.origin)
+        ? `/api/stream/proxy?url=${encodeURIComponent(track.streamUrl)}`
+        : track.streamUrl;
+
+    const candidates = proxied !== track.streamUrl ? [proxied, track.streamUrl] : [track.streamUrl];
+
+    for (const candidateUrl of candidates) {
+      if (entry.controller.signal.aborted) return;
+      try {
+        const res = await fetch(candidateUrl, {
+          method: 'GET',
+          headers: { Range: 'bytes=0-524287' },
+          signal: entry.controller.signal,
+        });
+        if (!res.ok && res.status !== 206) continue;
+        // Consume initial 512KB chunk so browser & proxy warm edge caches completely
+        await res.arrayBuffer().catch(() => {});
+        if (entry.controller.signal.aborted) return;
+
+        entry.resolvedStreamUrl = candidateUrl;
+        if (typeof Audio !== 'undefined') {
+          const preloader = new Audio();
+          preloader.preload = 'auto';
+          preloader.muted = true;
+          preloader.crossOrigin = 'anonymous';
+          preloader.src = candidateUrl;
+          preloader.load();
+          entry.audioEl = preloader;
+        }
+        entry.status = 'ready';
+        entry.updatedAt = Date.now();
+        return;
+      } catch {
+        if (entry.controller.signal.aborted) return;
+      }
+    }
+
+    entry.status = 'failed';
+  }
+
+  private async runProactivePreload(): Promise<void> {
+    if (this.preloadInFlight) return;
+    this.preloadInFlight = true;
+    try {
+      const targets = this.reconcilePreloadEvictions();
+      if (targets.length === 0) return;
+
+      const now = Date.now();
+      // 1. Always pre-warm local offline tracks from IndexedDB regardless of network status
+      for (const track of targets) {
+        if (track.source !== 'local') continue;
+        const existing = this.preloadPool.get(track.id);
+        if (existing && (existing.status === 'ready' || existing.status === 'pending')) continue;
+        const entry: PreloadEntry = {
+          trackId: track.id,
+          status: 'pending',
+          controller: new AbortController(),
+          updatedAt: now,
+        };
+        this.preloadPool.set(track.id, entry);
+        await this.warmLocalTrackPreload(track, entry);
+      }
+
+      // 2. Check network stability before proactively buffering upcoming streamed tracks
+      const streamTargets = targets.filter((t) => {
+        if (t.source !== 'stream') return false;
+        const cooldownUntil = this.preloadRetryCooldown.get(t.id) || 0;
+        if (now < cooldownUntil) return false;
+        const existing = this.preloadPool.get(t.id);
+        return !existing || (existing.status !== 'ready' && existing.status !== 'pending');
+      });
+
+      if (streamTargets.length === 0) return;
+
+      const stability = this.getNetworkStability();
+      if (!stability.isStable) {
+        if (this.isPlaying && stability.retryDelayMs > 0) {
+          this.scheduleProactivePreload(stability.retryDelayMs);
+        }
+        return;
+      }
+
+      const workQueue = [...streamTargets];
+      const workerCount = Math.min(stability.maxConcurrent, workQueue.length);
+
+      const processTrack = async (track: Track) => {
+        const entry: PreloadEntry = {
+          trackId: track.id,
+          status: 'pending',
+          controller: new AbortController(),
+          updatedAt: Date.now(),
+        };
+        this.preloadPool.set(track.id, entry);
+
+        try {
+          if (track.artworkUrl && typeof fetch !== 'undefined') {
+            void fetch(track.artworkUrl, {
+              mode: 'no-cors',
+              signal: entry.controller.signal,
+            }).catch(() => {});
+          }
+
+          if (track.streamUrl) {
+            await this.warmDirectAudioStream(track, entry);
+          } else if (track.youtubeId) {
+            const resolved = await this.verifyYouTubeOrResolveAlternate(
+              track,
+              entry.controller.signal
+            );
+            if (entry.controller.signal.aborted) return;
+            if (resolved.streamUrl) {
+              entry.resolvedStreamUrl = resolved.streamUrl;
+              entry.status = 'ready';
+            } else if (resolved.youtubeId) {
+              entry.resolvedYoutubeId = resolved.youtubeId;
+              entry.status = 'ready';
+            } else {
+              entry.status = 'failed';
+            }
+          } else {
+            entry.status = 'ready';
+          }
+          entry.updatedAt = Date.now();
+          if (entry.status === 'failed') {
+            this.preloadRetryCooldown.set(track.id, Date.now() + 25000);
+          }
+        } catch {
+          entry.status = 'failed';
+          this.preloadRetryCooldown.set(track.id, Date.now() + 25000);
+        }
+      };
+
+      const workers = Array.from({ length: workerCount }, async () => {
+        while (workQueue.length > 0) {
+          if (!this.getNetworkStability().isStable) break;
+          const nextTrack = workQueue.shift();
+          if (!nextTrack) break;
+          // Ensure target is still in upcoming 3-track pool before starting
+          const stillTargeted = selectUpcomingPreloadTracks(
+            this.upcomingQueue,
+            this.currentTrack?.id,
+            PROACTIVE_PRELOAD_COUNT
+          ).some((t) => t.id === nextTrack.id);
+          if (!stillTargeted) continue;
+          await processTrack(nextTrack);
+        }
+      });
+
+      await Promise.all(workers);
+    } finally {
+      this.preloadInFlight = false;
+    }
   }
 
   private emit() {
@@ -1548,6 +1905,7 @@ class DualChannelAudioEngine {
                   this.startYtTicker();
                   this.startBgKeepalive();
                   this.syncYouTubeHostGeometry();
+                  this.scheduleProactivePreload(PRELOAD_SETTLE_DELAY_MS);
                   this.emit();
                 } else if (ev.data === statePaused) {
                   this.isBuffering = false;
@@ -1790,9 +2148,31 @@ class DualChannelAudioEngine {
     this.emit();
   }
 
-  async playTrack(track: Track): Promise<void> {
+  async playTrack(inputTrack: Track): Promise<void> {
     const seq = ++this.playSeq;
     this.ytRecoveryAttempts = 0;
+    this.trackStartedAtMs = Date.now();
+
+    // Consume any pre-buffered stream mirror or local blob cached by the proactive preloader
+    const preloaded = this.preloadPool.get(inputTrack.id);
+    let track = inputTrack;
+    if (preloaded?.resolvedYoutubeId && track.youtubeId && preloaded.resolvedYoutubeId !== track.youtubeId) {
+      track = {
+        ...track,
+        youtubeId: preloaded.resolvedYoutubeId,
+        recoveredFrom: 'Pre-Buffered Verified Mirror',
+      };
+    } else if (preloaded?.resolvedStreamUrl && track.youtubeId && !track.streamUrl) {
+      track = {
+        ...track,
+        youtubeId: undefined,
+        streamUrl: preloaded.resolvedStreamUrl,
+        recoveredFrom: 'Pre-Buffered Stream Mirror',
+      };
+    }
+    const preloadedLocalBlob = preloaded?.blob;
+    const preloadedStreamUrl = preloaded?.resolvedStreamUrl;
+    this.evictPreloadEntry(inputTrack.id);
 
     const ctx = this.ensureContext();
     if (ctx.state === 'suspended') {
@@ -1832,6 +2212,7 @@ class DualChannelAudioEngine {
     this.resetWatchdog(track.id);
     localDb.pushHistory(track.id);
     localDb.incrementPlayCount(track.id);
+    this.reconcilePreloadEvictions();
 
     const now = ctx.currentTime;
     if (wasPlaying && crossfade > 0 && outgoingStrip && outgoingStrip !== incomingStrip) {
@@ -1920,7 +2301,7 @@ class DualChannelAudioEngine {
     } else if (track.source === 'local') {
       incomingStrip.audioEl.volume = 1.0;
       incomingStrip.audioEl.muted = false;
-      const blob = await localDb.getAudioBlob(track.id);
+      const blob = preloadedLocalBlob ?? (await localDb.getAudioBlob(track.id));
       if (seq !== this.playSeq) return;
       if (ctx.state === 'suspended') {
         await ctx.resume().catch(() => {});
@@ -1950,15 +2331,19 @@ class DualChannelAudioEngine {
         track.streamUrl.startsWith('http') && !track.streamUrl.startsWith(window.location.origin)
           ? `/api/stream/proxy?url=${encodeURIComponent(track.streamUrl)}`
           : track.streamUrl;
-      incomingStrip.audioEl.src = proxied;
+      const preferredUrl = preloadedStreamUrl || proxied;
+      incomingStrip.audioEl.src = preferredUrl;
       try {
         await incomingStrip.audioEl.play();
       } catch {
-        // Standalone APK fallback: try direct HTTPS stream if proxy route isn't mounted
-        if (proxied !== track.streamUrl) {
+        // Standalone APK fallback: try alternate direct/proxy HTTPS stream
+        const fallbackUrl = preferredUrl === track.streamUrl ? proxied : track.streamUrl;
+        if (fallbackUrl !== preferredUrl) {
           try {
-            incomingStrip.audioEl.src = track.streamUrl;
+            incomingStrip.audioEl.src = fallbackUrl;
             await incomingStrip.audioEl.play();
+            this.startBgKeepalive();
+            this.scheduleProactivePreload(PRELOAD_SETTLE_DELAY_MS);
             this.emit();
             return;
           } catch {
@@ -1972,6 +2357,7 @@ class DualChannelAudioEngine {
     }
 
     this.startBgKeepalive();
+    this.scheduleProactivePreload(PRELOAD_SETTLE_DELAY_MS);
     this.emit();
   }
 

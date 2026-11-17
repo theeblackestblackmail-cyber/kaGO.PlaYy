@@ -57,6 +57,13 @@ import {
   isPrematureStreamEnded,
   shouldAutoResumePlaybackPause,
 } from './playbackStability';
+import {
+  PRELOAD_SETTLE_DELAY_MS,
+  PROACTIVE_PRELOAD_COUNT,
+  computePreloadEvictions,
+  evaluateNetworkStability,
+  selectUpcomingPreloadTracks,
+} from './proactiveBuffer';
 import type { StudioQueueItem, Track } from '../types/audio';
 
 test('sanitizeFilename cleans noisy YouTube rip filenames and separates artist and title', () => {
@@ -1481,4 +1488,184 @@ test('evaluatePlaybackWatchdog heals suspended AudioContext, spurious pauses, an
   );
 });
 
+test('selectUpcomingPreloadTracks picks strictly the next 3 tracks and wraps cleanly without repeating current track', () => {
+  const mk = (id: string): Track => ({
+    id,
+    title: `Song ${id}`,
+    artist: 'Artist',
+    album: 'Queue',
+    duration: 190,
+    source: 'stream',
+    addedAt: 1,
+  });
 
+  const q5 = [mk('t1'), mk('t2'), mk('t3'), mk('t4'), mk('t5')];
+  assert.equal(PROACTIVE_PRELOAD_COUNT, 3);
+
+  // Mid-queue picks next 3 tracks in sequence
+  assert.deepEqual(
+    selectUpcomingPreloadTracks(q5, 't2').map((t) => t.id),
+    ['t3', 't4', 't5']
+  );
+
+  // Near end of queue wraps cleanly around to the start
+  assert.deepEqual(
+    selectUpcomingPreloadTracks(q5, 't4').map((t) => t.id),
+    ['t5', 't1', 't2']
+  );
+
+  // Short 2-track queue picks only the other track without duplicating
+  assert.deepEqual(
+    selectUpcomingPreloadTracks([mk('t1'), mk('t2')], 't1').map((t) => t.id),
+    ['t2']
+  );
+
+  // Single-track or empty queue returns []
+  assert.deepEqual(selectUpcomingPreloadTracks([mk('t1')], 't1'), []);
+  assert.deepEqual(selectUpcomingPreloadTracks([], null), []);
+});
+
+test('evaluateNetworkStability gates proactive pre-buffering on connection quality, active buffering, and settle delay', () => {
+  const now = 200_000;
+  const settled = now - PRELOAD_SETTLE_DELAY_MS - 200;
+
+  assert.equal(
+    evaluateNetworkStability({
+      isOnline: false,
+      isStreamingTrack: true,
+      isBuffering: false,
+      streamErrorCount: 0,
+      nowMs: now,
+      trackStartedAtMs: settled,
+      lastOnlineAtMs: settled,
+    }).reason,
+    'offline'
+  );
+
+  assert.equal(
+    evaluateNetworkStability({
+      isOnline: true,
+      saveData: true,
+      isStreamingTrack: true,
+      isBuffering: false,
+      streamErrorCount: 0,
+      nowMs: now,
+      trackStartedAtMs: settled,
+      lastOnlineAtMs: settled,
+    }).reason,
+    'save-data'
+  );
+
+  assert.equal(
+    evaluateNetworkStability({
+      isOnline: true,
+      effectiveType: '2g',
+      isStreamingTrack: true,
+      isBuffering: false,
+      streamErrorCount: 0,
+      nowMs: now,
+      trackStartedAtMs: settled,
+      lastOnlineAtMs: settled,
+    }).isStable,
+    false
+  );
+
+  assert.equal(
+    evaluateNetworkStability({
+      isOnline: true,
+      effectiveType: '4g',
+      rttMs: 1100,
+      isStreamingTrack: true,
+      isBuffering: false,
+      streamErrorCount: 0,
+      nowMs: now,
+      trackStartedAtMs: settled,
+      lastOnlineAtMs: settled,
+    }).isStable,
+    false
+  );
+
+  // Active buffering pauses background preloads to protect active song
+  assert.equal(
+    evaluateNetworkStability({
+      isOnline: true,
+      effectiveType: '4g',
+      isStreamingTrack: true,
+      isBuffering: true,
+      streamErrorCount: 0,
+      nowMs: now,
+      trackStartedAtMs: settled,
+      lastOnlineAtMs: settled,
+    }).reason,
+    'active-buffering'
+  );
+
+  // Within initial 1.8s settle period -> defers cleanly
+  const settling = evaluateNetworkStability({
+    isOnline: true,
+    effectiveType: '4g',
+    isStreamingTrack: true,
+    isBuffering: false,
+    streamErrorCount: 0,
+    nowMs: now,
+    trackStartedAtMs: now - 400,
+    lastOnlineAtMs: settled,
+  });
+  assert.equal(settling.isStable, false);
+  assert.equal(settling.reason, 'settling');
+  assert.ok(settling.retryDelayMs >= 1000);
+
+  // 3G caps concurrency at 1, 4G broadband allows 2
+  const stable3g = evaluateNetworkStability({
+    isOnline: true,
+    effectiveType: '3g',
+    downlinkMbps: 1.5,
+    rttMs: 180,
+    isStreamingTrack: true,
+    isBuffering: false,
+    streamErrorCount: 0,
+    nowMs: now,
+    trackStartedAtMs: settled,
+    lastOnlineAtMs: settled,
+  });
+  assert.equal(stable3g.isStable, true);
+  assert.equal(stable3g.maxConcurrent, 1);
+
+  const stable4g = evaluateNetworkStability({
+    isOnline: true,
+    effectiveType: '4g',
+    downlinkMbps: 18,
+    rttMs: 40,
+    isStreamingTrack: true,
+    isBuffering: false,
+    streamErrorCount: 0,
+    nowMs: now,
+    trackStartedAtMs: settled,
+    lastOnlineAtMs: settled,
+  });
+  assert.equal(stable4g.isStable, true);
+  assert.equal(stable4g.maxConcurrent, 2);
+});
+
+test('computePreloadEvictions bounds preload pool strictly to current next-3 window', () => {
+  const mk = (id: string): Track => ({
+    id,
+    title: `Song ${id}`,
+    artist: 'Artist',
+    album: 'Queue',
+    duration: 190,
+    source: 'stream',
+    addedAt: 1,
+  });
+
+  const cachedIds = ['t1', 't2', 't3', 't4'];
+  const nextThree = [mk('t3'), mk('t4'), mk('t5')];
+  const diff = computePreloadEvictions(cachedIds, nextThree);
+
+  assert.deepEqual(Array.from(diff.toKeep).sort(), ['t3', 't4']);
+  assert.deepEqual(diff.toEvict.sort(), ['t1', 't2']);
+  assert.deepEqual(
+    diff.toStart.map((t) => t.id),
+    ['t5']
+  );
+});
