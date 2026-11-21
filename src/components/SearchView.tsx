@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BadgeCheck,
   Disc3,
@@ -8,6 +8,7 @@ import {
   Music,
   Pause,
   Play,
+  RefreshCw,
   Search,
   Sparkles,
   Trash2,
@@ -17,6 +18,12 @@ import { localDb } from '../db/localDb';
 import type { AudioEngineSnapshot, Track } from '../types/audio';
 import { formatDuration } from '../utils/lrcParser';
 import { triggerHaptic } from '../utils/haptics';
+import {
+  nextDiscoveryVisitSeed,
+  pickDiscoveryFeedQuery,
+  pickDynamicPopularSearches,
+  rotateCuratedFallbackTracks,
+} from '../utils/streamDiscovery';
 import { pushRecentSearch } from '../utils/streamFilter';
 import { fetchMusicSuggestions, searchStreamsUnified } from '../utils/streamSearch';
 
@@ -31,13 +38,39 @@ interface SearchViewProps {
   onPickFolder: () => void;
 }
 
-const POPULAR_SEARCHES = [
-  'Drake Hotline Bling',
-  'Burna Boy Last Last',
-  'The Weeknd Blinding Lights',
-  'Kendrick Lamar Not Like Us',
-  'Tyla Water',
-];
+const SEARCH_POPULAR_STORAGE_KEY = 'kago_search_last_popular';
+const SEARCH_FEED_STORAGE_KEY = 'kago_search_last_feed_query';
+
+function readStoredArray(key: string): string[] {
+  try {
+    if (typeof sessionStorage === 'undefined') return [];
+    const raw = sessionStorage.getItem(key);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function readStoredText(key: string): string {
+  try {
+    if (typeof sessionStorage === 'undefined') return '';
+    return sessionStorage.getItem(key) || '';
+  } catch {
+    return '';
+  }
+}
+
+function writeSessionText(key: string, value: string): void {
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.setItem(key, value);
+    }
+  } catch {
+    // Ignore storage quota / privacy restrictions
+  }
+}
 
 export const SearchView: React.FC<SearchViewProps> = ({
   libraryTracks,
@@ -49,14 +82,22 @@ export const SearchView: React.FC<SearchViewProps> = ({
   onPickSong,
   onPickFolder,
 }) => {
+  const [visitSeed] = useState<number>(() => nextDiscoveryVisitSeed('kago_search_visit_seed'));
+  const [popularSearches, setPopularSearches] = useState<string[]>(() => {
+    const prev = readStoredArray(SEARCH_POPULAR_STORAGE_KEY);
+    const next = pickDynamicPopularSearches(5, visitSeed, ['Drake Hotline Bling', ...prev]);
+    writeSessionText(SEARCH_POPULAR_STORAGE_KEY, JSON.stringify(next));
+    return next;
+  });
+
   const [query, setQuery] = useState('');
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [recentSearches, setRecentSearches] = useState<string[]>(() =>
     localDb.loadRecentSearches()
   );
-  const [streamResults, setStreamResults] = useState<Track[]>(CURATED_STREAM_BANK);
-  const [isSearching, setIsSearching] = useState(false);
+  const [streamResults, setStreamResults] = useState<Track[]>([]);
+  const [isSearching, setIsSearching] = useState(true);
   const [hasSearchedOnline, setHasSearchedOnline] = useState(false);
 
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
@@ -74,6 +115,42 @@ export const SearchView: React.FC<SearchViewProps> = ({
     document.addEventListener('mousedown', onDocClick);
     return () => document.removeEventListener('mousedown', onDocClick);
   }, []);
+
+  // Load dynamic recommended discovery streams on mount
+  useEffect(() => {
+    let cancelled = false;
+    const prevQ = readStoredText(SEARCH_FEED_STORAGE_KEY);
+    const discoveryQuery = pickDiscoveryFeedQuery(visitSeed, prevQ);
+    writeSessionText(SEARCH_FEED_STORAGE_KEY, discoveryQuery);
+
+    const loadDiscovery = async () => {
+      setIsSearching(true);
+      try {
+        const { tracks: liveSongs } = await searchStreamsUnified({
+          query: discoveryQuery,
+          category: 'all',
+        });
+        if (cancelled) return;
+        setStreamResults(
+          liveSongs.length > 0
+            ? liveSongs
+            : rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed)
+        );
+      } catch {
+        if (cancelled) return;
+        setStreamResults(rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed));
+      } finally {
+        if (!cancelled) {
+          setIsSearching(false);
+        }
+      }
+    };
+
+    void loadDiscovery();
+    return () => {
+      cancelled = true;
+    };
+  }, [visitSeed]);
 
   // Live YouTube autocomplete suggestions
   useEffect(() => {
@@ -110,6 +187,16 @@ export const SearchView: React.FC<SearchViewProps> = ({
     );
   }, [libraryTracks, query]);
 
+  const handleRefreshPopular = useCallback(() => {
+    triggerHaptic('light');
+    const nextSeed = nextDiscoveryVisitSeed('kago_search_visit_seed');
+    setPopularSearches((prev) => {
+      const next = pickDynamicPopularSearches(5, nextSeed, prev);
+      writeSessionText(SEARCH_POPULAR_STORAGE_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
   const executeOnlineSearch = async (searchText: string) => {
     const cleanQ = searchText.trim();
     setShowSuggestions(false);
@@ -125,7 +212,11 @@ export const SearchView: React.FC<SearchViewProps> = ({
         query: cleanQ,
         category: 'all',
       });
-      setStreamResults(liveSongs.length > 0 ? liveSongs : CURATED_STREAM_BANK);
+      setStreamResults(
+        liveSongs.length > 0
+          ? liveSongs
+          : rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed)
+      );
     } finally {
       setIsSearching(false);
     }
@@ -219,13 +310,13 @@ export const SearchView: React.FC<SearchViewProps> = ({
           </button>
         </form>
 
-        {/* Popular Picks */}
+        {/* Dynamic Popular Picks */}
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <span className="inline-flex items-center gap-1 text-xs text-[#8E929B]">
             <Sparkles className="h-3 w-3 text-[#E11D48]" />
             Popular:
           </span>
-          {POPULAR_SEARCHES.map((term) => (
+          {popularSearches.map((term) => (
             <button
               key={term}
               type="button"
@@ -239,6 +330,15 @@ export const SearchView: React.FC<SearchViewProps> = ({
               {term}
             </button>
           ))}
+          <button
+            type="button"
+            onClick={handleRefreshPopular}
+            aria-label="Shuffle popular searches"
+            className="inline-flex items-center gap-1 rounded-md border border-[#252834] bg-[#101218] px-2 py-1 text-[11px] font-medium text-[#9CA3AF] hover:border-[#E11D48] hover:text-white transition-colors cursor-pointer"
+          >
+            <RefreshCw className="h-3 w-3" />
+            <span>Refresh</span>
+          </button>
         </div>
 
         {/* Recent Searches */}
@@ -287,7 +387,9 @@ export const SearchView: React.FC<SearchViewProps> = ({
 
         {localMatches.length === 0 ? (
           <div className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-5 text-center text-xs text-[#8E929B]">
-            No local tracks matched &ldquo;{query}&rdquo;. Search online streams below.
+            {query.trim()
+              ? `No local tracks matched "${query}". Search online streams below.`
+              : 'No offline songs saved yet. Pick a song or upload a folder to play offline.'}
           </div>
         ) : (
           <div className="divide-y divide-[#1A1C24] rounded-xl border border-[#1F2129] bg-[#0D0E12] overflow-hidden">
@@ -363,90 +465,105 @@ export const SearchView: React.FC<SearchViewProps> = ({
           </span>
         </div>
 
-        <div className="kago-panel-enter grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {streamResults.map((track) => {
-            const isCurrent = engine.currentTrack?.id === track.id;
-            const isTrackPlaying = isCurrent && engine.isPlaying;
-            return (
-              <article
-                key={track.id}
-                className={`flex flex-col justify-between rounded-xl border p-4 transition-colors ${
-                  isCurrent
-                    ? 'border-[#E11D48] bg-[#13090E]'
-                    : 'border-[#1F2129] bg-[#0D0E12] hover:border-[#303444]'
-                }`}
+        {isSearching && streamResults.length === 0 ? (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {[0, 1, 2, 3, 4, 5].map((idx) => (
+              <div
+                key={idx}
+                className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-4 space-y-3"
               >
-                <div>
-                  <div className="relative aspect-[16/10] w-full overflow-hidden rounded-lg border border-[#222530] bg-[#14161E]">
-                    {track.artworkUrl ? (
-                      <img
-                        src={track.artworkUrl}
-                        alt={track.title}
-                        referrerPolicy="no-referrer"
-                        className="h-full w-full object-cover"
-                      />
-                    ) : (
-                      <div className="flex h-full w-full items-center justify-center">
-                        <Disc3 className="h-9 w-9 text-[#E11D48]" />
-                      </div>
-                    )}
-                    <span className="absolute bottom-2 right-2 rounded border border-[#2B2E3A] bg-black/85 px-2 py-0.5 font-mono-tabular text-xs font-semibold text-[#F4F3F0]">
-                      {formatDuration(track.duration)}
-                    </span>
-                  </div>
-
-                  <div className="mt-3">
-                    <div className="flex items-center gap-1.5">
-                      <h3 className="truncate font-display text-sm sm:text-base font-bold text-[#F4F3F0]">
-                        {track.title}
-                      </h3>
-                      {track.isOfficial && (
-                        <BadgeCheck className="h-4 w-4 shrink-0 text-[#E11D48]" />
+                <div className="aspect-[16/10] w-full rounded-lg bg-[#161822]" />
+                <div className="h-4 w-3/4 rounded bg-[#1A1D28]" />
+                <div className="h-3 w-1/2 rounded bg-[#151821]" />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="kago-panel-enter grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {streamResults.map((track) => {
+              const isCurrent = engine.currentTrack?.id === track.id;
+              const isTrackPlaying = isCurrent && engine.isPlaying;
+              return (
+                <article
+                  key={track.id}
+                  className={`flex flex-col justify-between rounded-xl border p-4 transition-colors ${
+                    isCurrent
+                      ? 'border-[#E11D48] bg-[#13090E]'
+                      : 'border-[#1F2129] bg-[#0D0E12] hover:border-[#303444]'
+                  }`}
+                >
+                  <div>
+                    <div className="relative aspect-[16/10] w-full overflow-hidden rounded-lg border border-[#222530] bg-[#14161E]">
+                      {track.artworkUrl ? (
+                        <img
+                          src={track.artworkUrl}
+                          alt={track.title}
+                          referrerPolicy="no-referrer"
+                          className="h-full w-full object-cover"
+                        />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center">
+                          <Disc3 className="h-9 w-9 text-[#E11D48]" />
+                        </div>
                       )}
+                      <span className="absolute bottom-2 right-2 rounded border border-[#2B2E3A] bg-black/85 px-2 py-0.5 font-mono-tabular text-xs font-semibold text-[#F4F3F0]">
+                        {formatDuration(track.duration)}
+                      </span>
                     </div>
-                    <p className="mt-0.5 truncate text-xs text-[#8E929B]">{track.artist}</p>
-                  </div>
-                </div>
 
-                <div className="mt-4 flex items-center gap-2 border-t border-[#1A1C24] pt-3">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      triggerHaptic('selection');
-                      onAddToQueue(track);
-                      onSaveTrackToLibrary(track);
-                    }}
-                    className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-2 text-xs font-medium text-[#D1D5DB] hover:border-[#E11D48] hover:text-white cursor-pointer"
-                  >
-                    <ListPlus className="h-3.5 w-3.5" />
-                    <span>Queue</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      triggerHaptic('selection');
-                      if (isCurrent) onTogglePlay();
-                      else onPlayTrack(track);
-                    }}
-                    className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
-                  >
-                    {isTrackPlaying ? (
-                      <>
-                        <Pause className="h-3.5 w-3.5 fill-current" />
-                        <span>Pause</span>
-                      </>
-                    ) : (
-                      <>
-                        <Play className="h-3.5 w-3.5 fill-current" />
-                        <span>Play</span>
-                      </>
-                    )}
-                  </button>
-                </div>
-              </article>
-            );
-          })}
-        </div>
+                    <div className="mt-3">
+                      <div className="flex items-center gap-1.5">
+                        <h3 className="truncate font-display text-sm sm:text-base font-bold text-[#F4F3F0]">
+                          {track.title}
+                        </h3>
+                        {track.isOfficial && (
+                          <BadgeCheck className="h-4 w-4 shrink-0 text-[#E11D48]" />
+                        )}
+                      </div>
+                      <p className="mt-0.5 truncate text-xs text-[#8E929B]">{track.artist}</p>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 flex items-center gap-2 border-t border-[#1A1C24] pt-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        onAddToQueue(track);
+                        onSaveTrackToLibrary(track);
+                      }}
+                      className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-2 text-xs font-medium text-[#D1D5DB] hover:border-[#E11D48] hover:text-white cursor-pointer"
+                    >
+                      <ListPlus className="h-3.5 w-3.5" />
+                      <span>Queue</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        if (isCurrent) onTogglePlay();
+                        else onPlayTrack(track);
+                      }}
+                      className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
+                    >
+                      {isTrackPlaying ? (
+                        <>
+                          <Pause className="h-3.5 w-3.5 fill-current" />
+                          <span>Pause</span>
+                        </>
+                      ) : (
+                        <>
+                          <Play className="h-3.5 w-3.5 fill-current" />
+                          <span>Play</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
       </section>
     </div>
   );

@@ -1,7 +1,10 @@
 import React from 'react';
 import {
   ArrowLeftRight,
+  AudioLines,
+  Check,
   ChevronRight,
+  Disc3,
   FolderOpen,
   FolderSearch,
   HardDrive,
@@ -13,6 +16,7 @@ import {
   Sliders,
   Sun,
   Volume2,
+  Waves,
   Wifi,
   WifiOff,
 } from 'lucide-react';
@@ -20,6 +24,15 @@ import { EQ_PRESETS, EQ_PRESET_ORDER } from '../data/presetsAndStems';
 import type { ActiveTab, DspSettings, EqBands, EqPresetName } from '../types/audio';
 import type { ThemeMode, ThemePreferences } from '../utils/themeManager';
 import { triggerHaptic } from '../utils/haptics';
+import {
+  loadVisualizerMode,
+  saveVisualizerMode,
+  subscribeVisualizerMode,
+  VISUALIZER_PALETTES,
+  VISUALIZER_PALETTE_ORDER,
+  type VisualizerMode,
+  type VisualizerPaletteId,
+} from '../utils/visualizerUtils';
 import { AccentColorPicker } from './AccentColorPicker';
 import { PWAInstallButton } from './PWAInstallButton';
 
@@ -29,6 +42,8 @@ interface SettingsViewProps {
   isOnline: boolean;
   autoplayRadioEnabled: boolean;
   themePrefs: ThemePreferences;
+  visualizerPalette: VisualizerPaletteId;
+  onChangeVisualizerPalette: (paletteId: VisualizerPaletteId) => void;
   onChangeThemeMode: (mode: ThemeMode) => void;
   onChangeAccentColor: (accentHex: string, accentAlpha: number) => void;
   onResetAccentColor: () => void;
@@ -46,6 +61,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   isOnline,
   autoplayRadioEnabled,
   themePrefs,
+  visualizerPalette,
+  onChangeVisualizerPalette,
   onChangeThemeMode,
   onChangeAccentColor,
   onResetAccentColor,
@@ -56,6 +73,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onPickFolder,
   onNavigate,
 }) => {
+  const [visualizerMode, setVisualizerMode] = React.useState<VisualizerMode>(loadVisualizerMode);
+
+  React.useEffect(() => {
+    return subscribeVisualizerMode(setVisualizerMode);
+  }, []);
   const handlePresetQuick = (name: EqPresetName) => {
     triggerHaptic('selection');
     onUpdateDsp({
@@ -146,6 +168,129 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           onChange={onChangeAccentColor}
           onReset={onResetAccentColor}
         />
+      </section>
+
+      {/* Visualizer Settings: Preset Frequency Bar Color Palettes + Overlay Mode */}
+      <section
+        data-testid="visualizer-settings-section"
+        className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-4 sm:p-6 space-y-4"
+      >
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#2A2D39] bg-[#15171F] text-[#E11D48]">
+              <AudioLines className="h-5 w-5" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="font-display text-base sm:text-lg font-bold text-[#F4F3F0]">
+                Visualizer Settings
+              </h2>
+              <p className="text-xs text-[#8E929B]">
+                Choose a frequency bar color palette and display style for spectrum analyzers
+              </p>
+            </div>
+          </div>
+
+          <div
+            role="group"
+            aria-label="Default visualizer display mode"
+            className="inline-flex items-center gap-1 self-start sm:self-auto rounded-lg border border-[#222530] bg-[#090A0E] p-1"
+          >
+            {(
+              [
+                { id: 'bars', label: 'Bars', icon: AudioLines },
+                { id: 'mirror', label: 'Mirror', icon: Waves },
+                { id: 'radial', label: 'Radial', icon: Disc3 },
+              ] as const
+            ).map((opt) => {
+              const Icon = opt.icon;
+              const active = visualizerMode === opt.id;
+              return (
+                <button
+                  key={opt.id}
+                  type="button"
+                  data-testid={`settings-visualizer-mode-${opt.id}`}
+                  aria-pressed={active}
+                  onClick={() => {
+                    triggerHaptic('selection');
+                    setVisualizerMode(opt.id);
+                    saveVisualizerMode(opt.id);
+                  }}
+                  className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+                    active
+                      ? 'bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
+                      : 'text-[#8E929B] hover:text-[#F4F3F0]'
+                  }`}
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                  <span>{opt.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div
+          role="group"
+          aria-label="Visualizer color palette presets"
+          className="grid grid-cols-1 sm:grid-cols-3 gap-3"
+        >
+          {VISUALIZER_PALETTE_ORDER.map((id) => {
+            const preset = VISUALIZER_PALETTES[id];
+            const active = visualizerPalette === id;
+            const heights = [42, 78, 96, 66, 84];
+            return (
+              <button
+                key={id}
+                type="button"
+                data-testid={`settings-visualizer-palette-${id}`}
+                aria-pressed={active}
+                onClick={() => {
+                  triggerHaptic('selection');
+                  onChangeVisualizerPalette(id);
+                }}
+                className={`kago-press-subtle flex flex-col justify-between gap-3 rounded-xl border p-3.5 text-left transition-colors cursor-pointer ${
+                  active
+                    ? 'border-[#E11D48] bg-[#15090E]'
+                    : 'border-[#222530] bg-[#07080B] hover:border-[#3A3F50]'
+                }`}
+              >
+                {/* Live Swatch Bar Preview */}
+                <div className="flex h-12 w-full items-end gap-1.5 rounded-lg border border-[#1E2028] bg-[#050508] px-3 py-2">
+                  {preset.previewBars.map((barColor, idx) => (
+                    <span
+                      key={idx}
+                      aria-hidden="true"
+                      className="flex-1 rounded-t-sm transition-all duration-200"
+                      style={{
+                        height: `${heights[idx]}%`,
+                        background: `linear-gradient(to top, ${preset.previewBars[0]}, ${barColor})`,
+                      }}
+                    />
+                  ))}
+                </div>
+
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-[#F4F3F0]">{preset.name}</div>
+                    <div className="mt-0.5 text-xs leading-snug text-[#8E929B]">
+                      {preset.description}
+                    </div>
+                  </div>
+                  <span
+                    aria-hidden="true"
+                    className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${
+                      active
+                        ? 'border-[#E11D48] bg-[#E11D48] text-white'
+                        : 'border-[#2E3240] bg-transparent text-transparent'
+                    }`}
+                  >
+                    <Check className="h-3 w-3 stroke-[2.5]" />
+                  </span>
+                </div>
+              </button>
+            );
+          })}
+        </div>
       </section>
 
       {/* Equalizer & Audio DSP Card */}

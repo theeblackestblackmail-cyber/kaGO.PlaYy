@@ -160,13 +160,35 @@ public class MainActivity extends BridgeActivity {
         try {
             String treeDocId = DocumentsContract.getTreeDocumentId(treeUri);
             String rootFolder = "Picked Folder";
-            if (treeDocId != null) {
+            try {
+                Uri treeDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocId);
+                try (Cursor rootCursor = getContentResolver().query(
+                    treeDocUri,
+                    new String[]{DocumentsContract.Document.COLUMN_DISPLAY_NAME},
+                    null,
+                    null,
+                    null
+                )) {
+                    if (rootCursor != null && rootCursor.moveToFirst()) {
+                        String displayName = rootCursor.getString(0);
+                        if (displayName != null && !displayName.trim().isEmpty()) {
+                            rootFolder = displayName.trim();
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+
+            if ("Picked Folder".equals(rootFolder) && treeDocId != null) {
                 int colon = treeDocId.lastIndexOf(':');
                 String rel = colon >= 0 ? treeDocId.substring(colon + 1) : treeDocId;
                 if (!rel.isEmpty()) {
                     String[] segs = rel.split("/");
-                    if (segs.length > 0 && !segs[segs.length - 1].isEmpty()) {
-                        rootFolder = segs[segs.length - 1];
+                    for (int i = segs.length - 1; i >= 0; i--) {
+                        if (!segs[i].isEmpty()) {
+                            rootFolder = segs[i];
+                            break;
+                        }
                     }
                 }
             }
@@ -226,6 +248,7 @@ public class MainActivity extends BridgeActivity {
                         boolean isAudio =
                             lowerMime.startsWith("audio/") ||
                             "application/ogg".equals(lowerMime) ||
+                            "application/flac".equals(lowerMime) ||
                             AUDIO_EXT_PATTERN.matcher(name).find();
 
                         if (!isAudio) continue;
@@ -373,8 +396,16 @@ public class MainActivity extends BridgeActivity {
     private void dispatchJsEvent(final String eventName, final String detailJson) {
         if (getBridge() == null || getBridge().getWebView() == null) return;
         final WebView webView = getBridge().getWebView();
+        final String safeJson = detailJson
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029");
         webView.post(() -> {
-            String js = "window.dispatchEvent(new CustomEvent('" + eventName + "',{detail:" + detailJson + "}));";
+            try {
+                webView.onResume();
+                webView.resumeTimers();
+            } catch (Exception ignored) {
+            }
+            String js = "window.dispatchEvent(new CustomEvent('" + eventName + "',{detail:" + safeJson + "}));";
             webView.evaluateJavascript(js, null);
         });
     }
@@ -584,7 +615,7 @@ public class MainActivity extends BridgeActivity {
             if (uriString == null || !allowedDocumentUris.contains(uriString) || length <= 0) {
                 return "";
             }
-            int safeLength = Math.min(length, 2 * 1024 * 1024);
+            int safeLength = Math.min(length, 4 * 1024 * 1024);
             try (InputStream stream = getContentResolver().openInputStream(Uri.parse(uriString))) {
                 if (stream == null) return "";
 

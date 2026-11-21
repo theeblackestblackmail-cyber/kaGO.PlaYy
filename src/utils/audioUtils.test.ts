@@ -10,6 +10,7 @@ import {
 import {
   buildCategorySearchPlan,
   buildCollectionQueue,
+  buildInnertubeNextBody,
   buildInnertubeSearchBody,
   buildRadioSeedQuery,
   clampCrossfadeSeconds,
@@ -17,6 +18,7 @@ import {
   enqueueImportedOfflineTracks,
   extractYouTubeArtists,
   extractYouTubeCollections,
+  extractYouTubePlaylistInfo,
   extractYouTubePlaylistTracks,
   extractYouTubePodcasts,
   extractYouTubeRelatedResults,
@@ -28,6 +30,7 @@ import {
   mergeAutoplayQueue,
   parseYouTubeArtistAndTitle,
   parseYouTubeDuration,
+  parseYouTubePlaylistInput,
   parseYouTubeSuggestResponse,
   parseYouTubeViewCount,
   pushRecentSearch,
@@ -64,7 +67,17 @@ import {
   evaluateNetworkStability,
   selectUpcomingPreloadTracks,
 } from './proactiveBuffer';
-import type { StudioQueueItem, Track } from '../types/audio';
+import {
+  DEFAULT_VISUALIZER_PALETTE,
+  VISUALIZER_PALETTES,
+  VISUALIZER_PALETTE_ORDER,
+  computeBandEnergy,
+  computeSeedSignature,
+  getVisualizerPalette,
+  isVisualizerPaletteId,
+  sampleSpectrumBands,
+} from './visualizerUtils';
+import type { DspSettings, StudioQueueItem, Track } from '../types/audio';
 
 test('sanitizeFilename cleans noisy YouTube rip filenames and separates artist and title', () => {
   const res = sanitizeFilename('04 - Daft_Punk_-_Derezzed_(Official_Video)_[4K_HQ_320kbps].mp3');
@@ -1667,5 +1680,431 @@ test('computePreloadEvictions bounds preload pool strictly to current next-3 win
   assert.deepEqual(
     diff.toStart.map((t) => t.id),
     ['t5']
+  );
+});
+
+test('extractYouTubeRelatedResults parses modern lockupViewModel Watch Next cards and excludes seed track', () => {
+  const innertubeNextJson = JSON.stringify({
+    contents: {
+      twoColumnWatchNextResults: {
+        secondaryResults: {
+          secondaryResults: {
+            results: [
+              {
+                lockupViewModel: {
+                  contentId: 'seed9999999',
+                  metadata: {
+                    lockupMetadataViewModel: {
+                      title: { content: 'Sauti Sol - Suzanna' },
+                      metadata: {
+                        contentMetadataViewModel: {
+                          metadataRows: [{ metadataParts: [{ text: { content: 'Sauti Sol' } }] }],
+                        },
+                      },
+                    },
+                  },
+                  contentImage: {
+                    thumbnailViewModel: {
+                      overlays: [
+                        {
+                          thumbnailOverlayBadgeViewModel: {
+                            thumbnailBadges: [
+                              { thumbnailBadgeViewModel: { text: '3:51' } },
+                            ],
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+              {
+                lockupViewModel: {
+                  contentId: 'afro2222222',
+                  metadata: {
+                    lockupMetadataViewModel: {
+                      title: { content: 'Nyashinski - Malaika (Official Video)' },
+                      metadata: {
+                        contentMetadataViewModel: {
+                          metadataRows: [
+                            { metadataParts: [{ text: { content: 'Nyashinski Official' } }] },
+                            { metadataParts: [{ text: { content: '14M views' } }] },
+                          ],
+                        },
+                      },
+                    },
+                  },
+                  contentImage: {
+                    thumbnailViewModel: {
+                      overlays: [
+                        {
+                          thumbnailOverlayBadgeViewModel: {
+                            thumbnailBadges: [
+                              { thumbnailBadgeViewModel: { text: '4:05' } },
+                            ],
+                          },
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+  });
+
+  const nextBody = JSON.parse(buildInnertubeNextBody('seed9999999')) as { videoId: string };
+  assert.equal(nextBody.videoId, 'seed9999999');
+
+  const related = extractYouTubeRelatedResults(innertubeNextJson, 'seed9999999');
+  assert.equal(related.length, 1);
+  assert.equal(related[0].videoId, 'afro2222222');
+  assert.equal(related[0].artist, 'Nyashinski');
+  assert.equal(related[0].title, 'Malaika');
+  assert.equal(related[0].durationSeconds, 245);
+
+  // buildRadioSeedQuery strips generic channel placeholders cleanly
+  const genericSeed: Track = {
+    id: 'yt-gen',
+    youtubeId: 'gen1',
+    title: 'Malaika',
+    artist: 'YouTube Audio',
+    album: 'YouTube Music Stream',
+    duration: 245,
+    source: 'stream',
+    addedAt: 1,
+  };
+  const q = buildRadioSeedQuery(genericSeed);
+  assert.ok(!q.toLowerCase().includes('youtube audio'));
+  assert.ok(q.toLowerCase().includes('malaika'));
+});
+
+test('parseYouTubePlaylistInput & extractYouTubePlaylistInfo parse URLs, IDs, and titles accurately', () => {
+  assert.equal(
+    parseYouTubePlaylistInput('https://www.youtube.com/playlist?list=PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf'),
+    'PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf'
+  );
+  assert.equal(
+    parseYouTubePlaylistInput('https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RDCLAK5uy_nZiG9SDqGF452&index=2'),
+    'RDCLAK5uy_nZiG9SDqGF452'
+  );
+  assert.equal(
+    parseYouTubePlaylistInput('PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf'),
+    'PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf'
+  );
+  assert.equal(parseYouTubePlaylistInput('https://example.com/not-youtube'), null);
+
+  const ytPlaylistJson = JSON.stringify({
+    header: {
+      playlistHeaderRenderer: {
+        title: { simpleText: 'Nairobi Chill Classics' },
+      },
+    },
+    contents: {
+      twoColumnBrowseResultsRenderer: {
+        tabs: [
+          {
+            tabRenderer: {
+              content: {
+                sectionListRenderer: {
+                  contents: [
+                    {
+                      itemSectionRenderer: {
+                        contents: [
+                          {
+                            playlistVideoListRenderer: {
+                              contents: [
+                                {
+                                  playlistVideoRenderer: {
+                                    videoId: 'songA111111',
+                                    title: { runs: [{ text: 'Bien - Inauma (Official Audio)' }] },
+                                    shortBylineText: { runs: [{ text: 'Bien - Topic' }] },
+                                    lengthText: { simpleText: '3:12' },
+                                  },
+                                },
+                              ],
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      },
+    },
+  });
+
+  const info = extractYouTubePlaylistInfo(ytPlaylistJson, 'Fallback');
+  assert.equal(info.title, 'Nairobi Chill Classics');
+  assert.equal(info.tracks.length, 1);
+  assert.equal(info.tracks[0].title, 'Inauma');
+  assert.equal(info.tracks[0].artist, 'Bien');
+});
+
+test('resolveFolderPathFromRelativePath and mergeImportedTracks organize named folder uploads cleanly', async () => {
+  const { mergeImportedTracks, resolveFolderPathFromRelativePath } = await import('./folderImporter');
+
+  assert.equal(resolveFolderPathFromRelativePath('muziq/song1.mp3'), 'muziq');
+  assert.equal(resolveFolderPathFromRelativePath('muziq/afro/song2.mp3'), 'muziq/afro');
+  assert.equal(resolveFolderPathFromRelativePath('song3.mp3', 'Picked Folder'), 'Picked Folder');
+
+  const earlierSinglePick: Track = {
+    id: 'local-song1_mp3-100-1',
+    title: 'Song 1',
+    artist: 'Artist A',
+    album: 'Picked Songs',
+    duration: 180,
+    source: 'local',
+    folderPath: 'Picked Songs',
+    addedAt: 100,
+  };
+  const folderTrack1: Track = {
+    ...earlierSinglePick,
+    album: 'muziq',
+    folderPath: 'muziq',
+    addedAt: 200,
+  };
+  const folderTrack2: Track = {
+    id: 'local-song2_mp3-200-2',
+    title: 'Song 2',
+    artist: 'Artist B',
+    album: 'muziq',
+    duration: 195,
+    source: 'local',
+    folderPath: 'muziq',
+    addedAt: 201,
+  };
+
+  const merged = mergeImportedTracks([earlierSinglePick], [folderTrack1, folderTrack2]);
+  assert.equal(merged.length, 2);
+  assert.equal(merged.find((t) => t.id === folderTrack1.id)?.folderPath, 'muziq');
+  assert.equal(merged.find((t) => t.id === folderTrack2.id)?.folderPath, 'muziq');
+});
+
+test('PROCEDURAL_STEMS starts empty and streamDiscovery rotates popular picks and feed queries dynamically', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const {
+    pickDiscoveryFeedQuery,
+    pickDynamicPopularSearches,
+    rotateCuratedFallbackTracks,
+    shuffleWithSeed,
+  } = await import('./streamDiscovery');
+
+  const presetsSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'src/data/presetsAndStems.ts'),
+    'utf8'
+  );
+  assert.match(presetsSrc, /export const PROCEDURAL_STEMS:\s*Track\[\]\s*=\s*\[\];/);
+
+  const picksA = pickDynamicPopularSearches(5, 101, ['Drake Hotline Bling']);
+  const picksB = pickDynamicPopularSearches(5, 202, picksA);
+  assert.equal(picksA.length, 5);
+  assert.equal(picksB.length, 5);
+  assert.equal(new Set(picksA).size, 5);
+  assert.ok(!picksA.includes('Drake Hotline Bling'));
+  assert.ok(picksB.every((p) => !picksA.includes(p)));
+
+  const feed1 = pickDiscoveryFeedQuery(101);
+  const feed2 = pickDiscoveryFeedQuery(101, feed1);
+  assert.notEqual(feed2.toLowerCase(), feed1.toLowerCase());
+
+  const mkTrack = (id: string): Track => ({
+    id,
+    title: `Song ${id}`,
+    artist: 'Artist',
+    album: 'Discovery',
+    duration: 200,
+    source: 'stream',
+    addedAt: 1,
+  });
+  const sampleBank = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'].map(mkTrack);
+  const rotated1 = rotateCuratedFallbackTracks(sampleBank, 111);
+  const rotated2 = rotateCuratedFallbackTracks(sampleBank, 999);
+  assert.equal(rotated1.length, sampleBank.length);
+  assert.notDeepEqual(
+    rotated1.map((t) => t.id),
+    rotated2.map((t) => t.id)
+  );
+
+  // Determinism check for identical seeds
+  assert.deepEqual(shuffleWithSeed(['a', 'b', 'c', 'd'], 42), shuffleWithSeed(['a', 'b', 'c', 'd'], 42));
+});
+
+test('extractYouTubePlaylistInfo extracts tracks from modern YouTube lockupViewModel playlist payloads', () => {
+  const modernPlaylistJson = JSON.stringify({
+    header: {
+      pageHeaderRenderer: {
+        pageTitle: 'Take Care (Deluxe)',
+      },
+    },
+    contents: {
+      twoColumnBrowseResultsRenderer: {
+        tabs: [
+          {
+            tabRenderer: {
+              content: {
+                sectionListRenderer: {
+                  contents: [
+                    {
+                      itemSectionRenderer: {
+                        contents: [
+                          {
+                            lockupViewModel: {
+                              contentId: 'PMk8L9FNqnY',
+                              contentType: 'LOCKUP_CONTENT_TYPE_VIDEO',
+                              metadata: {
+                                lockupMetadataViewModel: {
+                                  title: { content: 'Drake - Over My Dead Body' },
+                                  metadata: {
+                                    contentMetadataViewModel: {
+                                      metadataRows: [
+                                        { metadataParts: [{ text: { content: 'Drake - Topic' } }] },
+                                      ],
+                                    },
+                                  },
+                                },
+                              },
+                              contentImage: {
+                                thumbnailViewModel: {
+                                  overlays: [
+                                    {
+                                      thumbnailBottomOverlayViewModel: {
+                                        badges: [{ thumbnailBadgeViewModel: { text: '4:33' } }],
+                                      },
+                                    },
+                                  ],
+                                },
+                              },
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      },
+    },
+  });
+
+  const info = extractYouTubePlaylistInfo(modernPlaylistJson, 'Fallback Album');
+  assert.equal(info.title, 'Take Care (Deluxe)');
+  assert.equal(info.tracks.length, 1);
+  assert.equal(info.tracks[0].youtubeId, 'PMk8L9FNqnY');
+  assert.equal(info.tracks[0].artist, 'Drake');
+  assert.equal(info.tracks[0].title, 'Over My Dead Body');
+  assert.equal(info.tracks[0].duration, 273);
+});
+
+test('sampleSpectrumBands maps live AnalyserNode FFT signal, rests cleanly when paused, and reacts to DSP bass boost', () => {
+  const flatDsp: DspSettings = {
+    preset: 'Flat',
+    bands: [0, 0, 0, 0, 0],
+    bassBoostEnabled: false,
+    bassBoostDb: 0,
+    crossfadeSeconds: 2,
+  };
+  const boostedDsp: DspSettings = {
+    ...flatDsp,
+    bassBoostEnabled: true,
+    bassBoostDb: 12,
+  };
+
+  const emptyFreq = new Uint8Array(64);
+  const paused = sampleSpectrumBands({
+    bandCount: 32,
+    isPlaying: false,
+    hasLiveSignal: false,
+    freqBuffer: emptyFreq,
+    dsp: flatDsp,
+    nowSec: 1.5,
+  });
+  assert.equal(paused.length, 32);
+  assert.ok(paused.every((v) => v === 0.02));
+
+  const liveFreq = new Uint8Array(64);
+  liveFreq[1] = 220;
+  liveFreq[2] = 200;
+  liveFreq[45] = 40;
+  const liveBands = sampleSpectrumBands({
+    bandCount: 32,
+    isPlaying: true,
+    hasLiveSignal: true,
+    freqBuffer: liveFreq,
+    dsp: flatDsp,
+    nowSec: 2.0,
+  });
+  assert.ok(liveBands[1] > liveBands[28]);
+  assert.ok(liveBands.every((v) => v >= 0.03 && v <= 1));
+
+  const flatFallback = sampleSpectrumBands({
+    bandCount: 32,
+    isPlaying: true,
+    hasLiveSignal: false,
+    freqBuffer: emptyFreq,
+    dsp: flatDsp,
+    nowSec: 4.2,
+    currentTime: 18,
+    trackSeed: computeSeedSignature('yt-1', 'Hotline Bling'),
+  });
+  const boostedFallback = sampleSpectrumBands({
+    bandCount: 32,
+    isPlaying: true,
+    hasLiveSignal: false,
+    freqBuffer: emptyFreq,
+    dsp: boostedDsp,
+    nowSec: 4.2,
+    currentTime: 18,
+    trackSeed: computeSeedSignature('yt-1', 'Hotline Bling'),
+  });
+  const flatEnergy = computeBandEnergy(flatFallback);
+  const boostedEnergy = computeBandEnergy(boostedFallback);
+  assert.ok(boostedEnergy.bass > flatEnergy.bass);
+});
+
+test('visualizer palette presets define Neon Pulse, Monochrome Noir, and Vibrant Synth with valid hex stops', () => {
+  assert.deepEqual(VISUALIZER_PALETTE_ORDER, [
+    'neon-pulse',
+    'monochrome-noir',
+    'vibrant-synth',
+  ]);
+  assert.equal(VISUALIZER_PALETTES['neon-pulse'].name, 'Neon Pulse');
+  assert.equal(VISUALIZER_PALETTES['monochrome-noir'].name, 'Monochrome Noir');
+  assert.equal(VISUALIZER_PALETTES['vibrant-synth'].name, 'Vibrant Synth');
+
+  assert.equal(isVisualizerPaletteId('neon-pulse'), true);
+  assert.equal(isVisualizerPaletteId('monochrome-noir'), true);
+  assert.equal(isVisualizerPaletteId('vibrant-synth'), true);
+  assert.equal(isVisualizerPaletteId('unknown-style'), false);
+
+  const hexRe = /^#[0-9a-f]{6}$/i;
+  for (const id of VISUALIZER_PALETTE_ORDER) {
+    const palette = getVisualizerPalette(id);
+    const darkLow = palette.getStops(0, false);
+    const darkHigh = palette.getStops(1, false);
+    const lightMid = palette.getStops(0.5, true);
+    assert.match(darkLow.base, hexRe);
+    assert.match(darkLow.mid, hexRe);
+    assert.match(darkLow.tip, hexRe);
+    assert.match(darkHigh.tip, hexRe);
+    assert.match(lightMid.tip, hexRe);
+    assert.notEqual(darkLow.tip, darkHigh.tip);
+  }
+
+  // Invalid ID falls back cleanly to default palette
+  assert.equal(
+    getVisualizerPalette('invalid' as never).id,
+    DEFAULT_VISUALIZER_PALETTE
   );
 });

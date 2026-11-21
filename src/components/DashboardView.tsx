@@ -11,7 +11,6 @@ import {
   Sliders,
   Video,
 } from 'lucide-react';
-import { PROCEDURAL_STEMS } from '../data/presetsAndStems';
 import type { ActiveTab, AudioEngineSnapshot, DspSettings, Track } from '../types/audio';
 import { triggerHaptic } from '../utils/haptics';
 import { SpectrumVisualizer } from './SpectrumVisualizer';
@@ -22,6 +21,7 @@ interface DashboardViewProps {
   engine: AudioEngineSnapshot;
   dsp: DspSettings;
   storedTrackCount: number;
+  recentTracks: Track[];
   isInAppPip: boolean;
   onToggleInAppPip: () => void;
   onQuickPlay: () => void;
@@ -37,6 +37,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   engine,
   dsp,
   storedTrackCount,
+  recentTracks,
   isInAppPip,
   onToggleInAppPip,
   onQuickPlay,
@@ -345,91 +346,144 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </section>
 
-      {/* Built-In Offline Synthesizer Stems */}
+      {/* Quick Library Tracks */}
       <section>
         <div className="mb-3.5 flex items-center justify-between">
           <div>
             <h2 className="font-display text-lg font-bold text-[#F4F3F0]">
-              Built-In Offline Synthesizer Stems
+              Your Offline &amp; Saved Music
             </h2>
             <p className="text-xs text-[#8E929B]">
-              Procedural kick, snare, bassline, and pad synthesis generated live with zero network dependency
+              {recentTracks.length > 0
+                ? 'Jump back into your imported songs, folders, or saved playlists'
+                : 'Import your own songs or folders, or explore live music in the Stream tab'}
             </p>
           </div>
+          {recentTracks.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                triggerHaptic('light');
+                onNavigate('library');
+              }}
+              className="text-xs font-semibold text-[#FF4D6D] hover:underline cursor-pointer whitespace-nowrap"
+            >
+              Open Library
+            </button>
+          )}
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-          {PROCEDURAL_STEMS.map((stem) => {
-            const isCurrent = engine.currentTrack?.id === stem.id;
-            const isStemPlaying = isCurrent && engine.isPlaying;
-
-            return (
-              <div
-                key={stem.id}
-                className={`flex flex-col justify-between rounded-xl border p-4 transition-colors ${
-                  isCurrent
-                    ? 'border-[#E11D48] bg-[#13090E]'
-                    : 'border-[#1F2129] bg-[#0D0E12] hover:border-[#323646]'
-                }`}
-              >
-                <div>
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2 font-mono-tabular text-xs text-[#8E929B]">
-                      <span>{stem.bpm} BPM</span>
-                      <span aria-hidden="true">·</span>
-                      <span>{stem.rootFreq} Hz</span>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        triggerHaptic('selection');
-                        if (isCurrent) {
-                          onTogglePlay();
-                        } else {
-                          onPlayTrack(stem);
-                        }
-                      }}
-                      aria-label={isStemPlaying ? `Pause ${stem.title}` : `Play ${stem.title}`}
-                      className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors cursor-pointer ${
-                        isStemPlaying
-                          ? 'bg-[#E11D48] text-white shadow-[0_0_14px_rgba(225,29,72,0.55)]'
-                          : 'border border-[#2A2D39] bg-[#161820] text-[#F4F3F0] hover:border-[#E11D48]'
-                      }`}
-                    >
-                      {isStemPlaying ? (
-                        <Pause className="h-4 w-4 fill-current" />
-                      ) : (
-                        <Play className="h-4 w-4 fill-current ml-0.5" />
-                      )}
-                    </button>
-                  </div>
-
-                  <div className="mt-3 flex items-center gap-3">
-                    {stem.artworkUrl ? (
-                      <img
-                        src={stem.artworkUrl}
-                        alt={stem.title}
-                        referrerPolicy="no-referrer"
-                        className="h-11 w-11 rounded-md object-cover border border-[#252834]"
-                      />
-                    ) : (
-                      <div className="flex h-11 w-11 items-center justify-center rounded-md bg-[#161820]">
-                        <Disc className="h-5 w-5 text-[#E11D48]" />
-                      </div>
-                    )}
-                    <h3 className="font-display text-base font-bold text-[#F4F3F0] truncate">
-                      {stem.title}
-                    </h3>
-                  </div>
-
-                  <p className="mt-3 text-xs leading-relaxed text-[#8E929B]">
-                    {stem.synthProfile?.description}
-                  </p>
-                </div>
+        {recentTracks.length === 0 ? (
+          <div className="flex flex-col items-start justify-between gap-4 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-5 sm:flex-row sm:items-center">
+            <div className="flex items-center gap-3.5">
+              <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[#252834] bg-[#14161E] text-[#E11D48]">
+                <Music className="h-5 w-5" />
               </div>
-            );
-          })}
-        </div>
+              <div>
+                <h3 className="font-display text-sm font-bold text-[#F4F3F0]">
+                  Library is ready for your songs
+                </h3>
+                <p className="mt-0.5 text-xs text-[#8E929B]">
+                  No preloaded sample tracks. Upload a music folder, pick songs, or stream online.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  triggerHaptic('light');
+                  onPickFolder();
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3.5 py-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer whitespace-nowrap"
+              >
+                <FolderOpen className="h-3.5 w-3.5 text-[#E11D48]" />
+                <span>Upload Folder</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  triggerHaptic('light');
+                  onNavigate('stream');
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer whitespace-nowrap"
+              >
+                <Radio className="h-3.5 w-3.5" />
+                <span>Explore Stream</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            {recentTracks.slice(0, 4).map((track) => {
+              const isCurrent = engine.currentTrack?.id === track.id;
+              const isTrackPlaying = isCurrent && engine.isPlaying;
+
+              return (
+                <div
+                  key={track.id}
+                  className={`flex flex-col justify-between rounded-xl border p-4 transition-colors ${
+                    isCurrent
+                      ? 'border-[#E11D48] bg-[#13090E]'
+                      : 'border-[#1F2129] bg-[#0D0E12] hover:border-[#323646]'
+                  }`}
+                >
+                  <div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate font-mono-tabular text-xs text-[#8E929B]">
+                        {track.folderPath || track.album || 'Saved Track'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          triggerHaptic('selection');
+                          if (isCurrent) {
+                            onTogglePlay();
+                          } else {
+                            onPlayTrack(track);
+                          }
+                        }}
+                        aria-label={isTrackPlaying ? `Pause ${track.title}` : `Play ${track.title}`}
+                        className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors cursor-pointer ${
+                          isTrackPlaying
+                            ? 'bg-[#E11D48] text-white shadow-[0_0_14px_rgba(225,29,72,0.55)]'
+                            : 'border border-[#2A2D39] bg-[#161820] text-[#F4F3F0] hover:border-[#E11D48]'
+                        }`}
+                      >
+                        {isTrackPlaying ? (
+                          <Pause className="h-4 w-4 fill-current" />
+                        ) : (
+                          <Play className="h-4 w-4 fill-current ml-0.5" />
+                        )}
+                      </button>
+                    </div>
+
+                    <div className="mt-3 flex items-center gap-3">
+                      {track.artworkUrl ? (
+                        <img
+                          src={track.artworkUrl}
+                          alt={track.title}
+                          referrerPolicy="no-referrer"
+                          className="h-11 w-11 shrink-0 rounded-md object-cover border border-[#252834]"
+                        />
+                      ) : (
+                        <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-md bg-[#161820]">
+                          <Disc className="h-5 w-5 text-[#E11D48]" />
+                        </div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <h3 className="font-display text-sm font-bold text-[#F4F3F0] truncate">
+                          {track.title}
+                        </h3>
+                        <p className="text-xs text-[#8E929B] truncate">{track.artist}</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </section>
     </div>
   );

@@ -29,6 +29,57 @@ export function createFileFromNativeEntry(entry: NativeFolderFileEntry): File | 
   });
 }
 
+export function resolveFolderPathFromRelativePath(
+  relativePath?: string,
+  fallback = 'Picked Folder'
+): string {
+  if (!relativePath) return fallback;
+  const segments = relativePath.split('/').filter(Boolean);
+  if (segments.length <= 1) return fallback;
+  return segments.slice(0, -1).join('/');
+}
+
+const GENERIC_FOLDER_LABELS = new Set([
+  'Picked Songs',
+  'Picked Folder',
+  'Local Import',
+  'Imported Files',
+]);
+
+export function mergeImportedTracks(
+  existingTracks: Track[],
+  incomingTracks: Track[]
+): Track[] {
+  if (incomingTracks.length === 0) return existingTracks;
+
+  const incomingById = new Map<string, Track>();
+  for (const t of incomingTracks) {
+    incomingById.set(t.id, t);
+  }
+
+  const seenIds = new Set<string>();
+  const updatedExisting = existingTracks.map((prev) => {
+    seenIds.add(prev.id);
+    const next = incomingById.get(prev.id);
+    if (!next) return prev;
+    const nextFolder = next.folderPath?.trim() || '';
+    const prevFolder = prev.folderPath?.trim() || '';
+    const shouldAdoptIncomingFolder =
+      nextFolder.length > 0 &&
+      (!prevFolder ||
+        GENERIC_FOLDER_LABELS.has(prevFolder) ||
+        !GENERIC_FOLDER_LABELS.has(nextFolder));
+    return {
+      ...prev,
+      ...next,
+      folderPath: shouldAdoptIncomingFolder ? nextFolder : prevFolder || 'Picked Folder',
+    };
+  });
+
+  const brandNew = incomingTracks.filter((t) => !seenIds.has(t.id));
+  return [...brandNew, ...updatedExisting];
+}
+
 export async function buildTracksFromFilePairs(
   filePairs: Array<{ file: File; folderPath: string }>,
   onProgress?: (progress: FolderScanProgress) => void
@@ -55,7 +106,7 @@ export async function buildTracksFromFilePairs(
       trackNumber: meta.trackNumber,
       duration: 180,
       source: 'local',
-      folderPath: folderPath || 'Local Files',
+      folderPath: folderPath || 'Picked Folder',
       addedAt: Date.now(),
     };
 

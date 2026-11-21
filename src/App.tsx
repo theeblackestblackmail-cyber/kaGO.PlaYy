@@ -22,6 +22,7 @@ import type {
   ActiveTab,
   AudioEngineSnapshot,
   DspSettings,
+  LibrarySubTab,
   Playlist,
   StoredLyrics,
   Track,
@@ -30,7 +31,10 @@ import { readAudioFileTags } from './utils/audioMetadata';
 import {
   buildTracksFromFilePairs,
   importFromNativeFolderPicker,
+  mergeImportedTracks,
+  resolveFolderPathFromRelativePath,
 } from './utils/folderImporter';
+import { fetchYouTubePlaylistByUrlOrId } from './utils/youtubePlaylist';
 import {
   hasNativeFolderPicker,
   requestNativeNotificationPermission,
@@ -63,6 +67,11 @@ import {
   type ThemeMode,
   type ThemePreferences,
 } from './utils/themeManager';
+import {
+  loadVisualizerPalette,
+  saveVisualizerPalette,
+  type VisualizerPaletteId,
+} from './utils/visualizerUtils';
 
 export default function App() {
   const isOnline = useOnlineStatus();
@@ -74,7 +83,7 @@ export default function App() {
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [favoriteIds, setFavoriteIds] = useState<string[]>(() => localDb.loadFavorites());
   const [lyricsMap, setLyricsMap] = useState<Record<string, StoredLyrics>>({});
-  const [queue, setQueue] = useState<Track[]>(PROCEDURAL_STEMS);
+  const [queue, setQueue] = useState<Track[]>([]);
 
   const [isDspOpen, setIsDspOpen] = useState(false);
   const [isFullscreenOpen, setIsFullscreenOpen] = useState(false);
@@ -99,11 +108,27 @@ export default function App() {
   const [isFetchingLyrics, setIsFetchingLyrics] = useState(false);
   const [lyricsHydrated, setLyricsHydrated] = useState(false);
   const [themePrefs, setThemePrefs] = useState<ThemePreferences>(() => loadThemePreferences());
+  const [visualizerPalette, setVisualizerPalette] = useState<VisualizerPaletteId>(() =>
+    loadVisualizerPalette()
+  );
+  const [libraryFocusRequest, setLibraryFocusRequest] = useState<{
+    subTab: LibrarySubTab;
+    groupName?: string | null;
+    nonce: number;
+  } | null>(null);
+  const folderStatusTimerRef = useRef<number | null>(null);
+  const playlistsRef = useRef<Playlist[]>(playlists);
+  playlistsRef.current = playlists;
 
   useEffect(() => {
     applyThemeToDocument(themePrefs);
     saveThemePreferences(themePrefs);
   }, [themePrefs]);
+
+  const handleChangeVisualizerPalette = useCallback((nextId: VisualizerPaletteId) => {
+    setVisualizerPalette(nextId);
+    saveVisualizerPalette(nextId);
+  }, []);
 
   const songPickerRef = useRef<HTMLInputElement | null>(null);
   const folderPickerRef = useRef<HTMLInputElement | null>(null);
@@ -121,7 +146,7 @@ export default function App() {
   const badConnSinceRef = useRef<number | null>(null);
   const dismissedBadSinceRef = useRef<number | null>(null);
 
-  // Hydrate offline DB on startup
+  // Hydrate offline DB on startup (excluding removed built-in demo synth tracks)
   useEffect(() => {
     let active = true;
     (async () => {
@@ -131,16 +156,24 @@ export default function App() {
         localDb.loadAllLyrics(),
       ]);
       if (!active) return;
-      setSavedTracks(dbTracks);
+
+      const legacyStemIds = new Set([
+        'stem-cyber-resonance',
+        'stem-neon-drive',
+        'stem-midnight-drift',
+        'stem-tokyo-2099',
+        ...PROCEDURAL_STEMS.map((s) => s.id),
+      ]);
+      const cleanedTracks = dbTracks.filter((t) => !legacyStemIds.has(t.id));
+
+      setSavedTracks(cleanedTracks);
       setPlaylists(dbPlaylists);
       setLyricsMap(dbLyrics);
       setLyricsHydrated(true);
 
-      // Seed saved offline songs into the queue on startup so Quick Play & Next play them automatically
-      const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
-      const offlineTracks = dbTracks.filter((t) => !stemIds.has(t.id));
-      if (offlineTracks.length > 0 && !audioEngine.getSnapshot().currentTrack) {
-        setQueue((prev) => enqueueImportedOfflineTracks(prev, offlineTracks, stemIds));
+      // Seed saved user songs into the queue on startup so Quick Play & Next play them automatically
+      if (cleanedTracks.length > 0 && !audioEngine.getSnapshot().currentTrack) {
+        setQueue((prev) => enqueueImportedOfflineTracks(prev, cleanedTracks, legacyStemIds));
       }
     })();
     return () => {
@@ -148,12 +181,8 @@ export default function App() {
     };
   }, []);
 
-  // Combined track catalog (Procedural Stems + Local/Saved Library)
-  const allLibraryTracks = useMemo(() => {
-    const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
-    const userTracks = savedTracks.filter((t) => !stemIds.has(t.id));
-    return [...PROCEDURAL_STEMS, ...userTracks];
-  }, [savedTracks]);
+  // Combined user track catalog
+  const allLibraryTracks = useMemo(() => savedTracks, [savedTracks]);
 
   const studioCandidateTracks = useMemo(() => {
     const seen = new Set(allLibraryTracks.map((t) => t.id));
@@ -699,8 +728,13 @@ export default function App() {
   }, [engine.currentTrack?.id, engine.isPlaying, engine.currentTime, engine.duration]);
 
   const handleQuickPlay = () => {
-    const first = queue[0] || PROCEDURAL_STEMS[0];
-    if (first) playTrack(first);
+    const first = queue[0] || allLibraryTracks[0];
+    if (first) {
+      playTrack(first);
+    } else {
+      triggerHaptic('light');
+      setActiveTab('stream');
+    }
   };
 
   const handleToggleFavorite = (trackId: string) => {
@@ -730,17 +764,21 @@ export default function App() {
   };
 
   const handleImportTracks = async (entries: Array<{ track: Track; file: File }>) => {
+    if (entries.length === 0) return;
+
+    // Prime memory blob cache & update React state immediately so songs/folders appear at once
+    const importedTracks = entries.map((e) => {
+      localDb.primeAudioBlob(e.track.id, e.file);
+      return e.track;
+    });
+    setSavedTracks((prev) => mergeImportedTracks(prev, importedTracks));
+    const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
+    setQueue((prev) => enqueueImportedOfflineTracks(prev, importedTracks, stemIds));
+
+    await localDb.saveTracksBatch(importedTracks);
     for (const { track, file } of entries) {
       await localDb.saveTrack(track, file);
     }
-    const importedTracks = entries.map((e) => e.track);
-    setSavedTracks((prev) => {
-      const existingIds = new Set(prev.map((t) => t.id));
-      const newOnes = importedTracks.filter((t) => !existingIds.has(t.id));
-      return [...newOnes, ...prev];
-    });
-    const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
-    setQueue((prev) => enqueueImportedOfflineTracks(prev, importedTracks, stemIds));
   };
 
   const handlePickSongFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -773,28 +811,67 @@ export default function App() {
 
   const [folderImportStatus, setFolderImportStatus] = useState<string>('');
 
+  const showTimedFolderStatus = useCallback((message: string, durationMs = 3800) => {
+    if (folderStatusTimerRef.current !== null) {
+      window.clearTimeout(folderStatusTimerRef.current);
+    }
+    setFolderImportStatus(message);
+    if (message) {
+      folderStatusTimerRef.current = window.setTimeout(() => {
+        setFolderImportStatus('');
+        folderStatusTimerRef.current = null;
+      }, durationMs);
+    }
+  }, []);
+
+  const finalizeFolderImport = useCallback(
+    async (imported: Array<{ track: Track; file: File }>) => {
+      if (imported.length === 0) {
+        showTimedFolderStatus(
+          'No audio files (.mp3, .flac, .wav, .m4a, .ogg) found in that folder.',
+          4200
+        );
+        return;
+      }
+      await handleImportTracks(imported);
+      const topFolder = imported[0].track.folderPath || 'Picked Folder';
+      setLibraryFocusRequest({
+        subTab: 'folders',
+        groupName: topFolder,
+        nonce: Date.now(),
+      });
+      setActiveTab('library');
+      triggerHaptic('success');
+      showTimedFolderStatus(
+        `Imported ${imported.length} ${imported.length === 1 ? 'song' : 'songs'} from "${topFolder}".`
+      );
+      if (!engine.currentTrack || !engine.isPlaying || engine.currentTrack.source === 'synth') {
+        playTrack(imported[0].track);
+      }
+    },
+    [engine.currentTrack, engine.isPlaying, playTrack, showTimedFolderStatus]
+  );
+
   const handlePickFolderInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
-    if (files.length === 0) return;
+    if (files.length === 0) {
+      e.target.value = '';
+      return;
+    }
     setFolderImportStatus(`Scanning 0 / ${files.length} files...`);
     try {
       const pairs = files.map((file) => {
         const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || '';
-        const folderPath = rel ? rel.split('/').slice(0, -1).join('/') : 'Picked Folder';
+        const folderPath = resolveFolderPathFromRelativePath(rel, 'Picked Folder');
         return { file, folderPath };
       });
       const imported = await buildTracksFromFilePairs(pairs, (p) => {
         setFolderImportStatus(`Importing ${p.scanned} / ${p.found}: ${p.currentFile}`);
       });
-      if (imported.length > 0) {
-        await handleImportTracks(imported);
-        setActiveTab('library');
-        if (!engine.currentTrack || !engine.isPlaying || engine.currentTrack.source === 'synth') {
-          playTrack(imported[0].track);
-        }
-      }
+      await finalizeFolderImport(imported);
+    } catch {
+      showTimedFolderStatus('Could not import files from that folder.', 4000);
     } finally {
-      setFolderImportStatus('');
       e.target.value = '';
     }
   };
@@ -806,15 +883,17 @@ export default function App() {
         const result = await importFromNativeFolderPicker((p) => {
           setFolderImportStatus(`Importing ${p.scanned} / ${p.found}: ${p.currentFile}`);
         });
-        if (!result.cancelled && !result.error && result.entries.length > 0) {
-          await handleImportTracks(result.entries);
-          setActiveTab('library');
-          if (!engine.currentTrack || !engine.isPlaying || engine.currentTrack.source === 'synth') {
-            playTrack(result.entries[0].track);
-          }
+        if (result.cancelled) {
+          setFolderImportStatus('');
+          return;
         }
-      } finally {
-        setFolderImportStatus('');
+        if (result.error) {
+          showTimedFolderStatus(result.error, 4200);
+          return;
+        }
+        await finalizeFolderImport(result.entries);
+      } catch {
+        showTimedFolderStatus('Could not read the selected Android folder.', 4200);
       }
       return;
     }
@@ -852,14 +931,7 @@ export default function App() {
         const imported = await buildTracksFromFilePairs(collected, (p) => {
           setFolderImportStatus(`Importing ${p.scanned} / ${p.found}: ${p.currentFile}`);
         });
-        if (imported.length > 0) {
-          await handleImportTracks(imported);
-          setActiveTab('library');
-          if (!engine.currentTrack || !engine.isPlaying || engine.currentTrack.source === 'synth') {
-            playTrack(imported[0].track);
-          }
-        }
-        setFolderImportStatus('');
+        await finalizeFolderImport(imported);
         return;
       } catch (err) {
         setFolderImportStatus('');
@@ -868,7 +940,7 @@ export default function App() {
     }
 
     folderPickerRef.current?.click();
-  }, [engine.currentTrack, engine.isPlaying, playTrack]);
+  }, [finalizeFolderImport, showTimedFolderStatus]);
 
   const handleCreatePlaylist = async (name: string, description: string) => {
     const pl: Playlist = {
@@ -887,29 +959,149 @@ export default function App() {
     await localDb.deletePlaylist(playlistId);
   };
 
-  const handleAddTrackToPlaylist = async (playlistId: string, trackId: string) => {
-    let updated: Playlist | null = null;
-    setPlaylists((prev) =>
-      prev.map((pl) => {
-        if (pl.id !== playlistId) return pl;
-        if (pl.trackIds.includes(trackId)) {
-          updated = pl;
-          return pl;
-        }
-        updated = { ...pl, trackIds: [...pl.trackIds, trackId] };
-        return updated;
-      })
-    );
-    if (updated) {
-      await localDb.savePlaylist(updated);
+  const handleDeletePlaylists = useCallback(async (playlistIds: string[]) => {
+    if (playlistIds.length === 0) return;
+    const idSet = new Set(playlistIds);
+    setPlaylists((prev) => prev.filter((p) => !idSet.has(p.id)));
+    for (const pid of playlistIds) {
+      await localDb.deletePlaylist(pid);
     }
+  }, []);
+
+  const handleAddTrackToPlaylist = async (playlistId: string, trackId: string) => {
+    const target = playlistsRef.current.find((pl) => pl.id === playlistId);
+    if (!target || target.trackIds.includes(trackId)) return;
+    const updated: Playlist = { ...target, trackIds: [...target.trackIds, trackId] };
+    setPlaylists((prev) => prev.map((pl) => (pl.id === playlistId ? updated : pl)));
+    await localDb.savePlaylist(updated);
   };
 
-  const handleDeleteTrack = async (trackId: string) => {
-    setSavedTracks((prev) => prev.filter((t) => t.id !== trackId));
-    setQueue((prev) => prev.filter((t) => t.id !== trackId));
-    await localDb.deleteTrack(trackId);
-  };
+  const handleAddMultipleTracksToPlaylist = useCallback(
+    async (playlistId: string, trackIds: string[]) => {
+      if (trackIds.length === 0) return;
+      const target = playlistsRef.current.find((pl) => pl.id === playlistId);
+      if (!target) return;
+      const existing = new Set(target.trackIds);
+      const additions = trackIds.filter((id) => !existing.has(id));
+      if (additions.length === 0) return;
+      const updated: Playlist = {
+        ...target,
+        trackIds: [...target.trackIds, ...additions],
+      };
+      setPlaylists((prev) => prev.map((pl) => (pl.id === playlistId ? updated : pl)));
+      await localDb.savePlaylist(updated);
+      triggerHaptic('success');
+    },
+    []
+  );
+
+  const handleCreatePlaylistWithTracks = useCallback(
+    async (name: string, description: string, tracksToAdd: Track[]) => {
+      const cleanName = name.trim();
+      if (!cleanName) return;
+      if (tracksToAdd.length > 0) {
+        setSavedTracks((prev) => mergeImportedTracks(prev, tracksToAdd));
+        await localDb.saveTracksBatch(tracksToAdd);
+      }
+      const pl: Playlist = {
+        id: `pl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+        name: cleanName,
+        description: description.trim(),
+        trackIds: Array.from(new Set(tracksToAdd.map((t) => t.id))),
+        createdAt: Date.now(),
+      };
+      setPlaylists((prev) => [pl, ...prev]);
+      await localDb.savePlaylist(pl);
+      triggerHaptic('success');
+    },
+    []
+  );
+
+  const handleAddMultipleToQueue = useCallback((tracksToAdd: Track[]) => {
+    if (tracksToAdd.length === 0) return;
+    triggerHaptic('selection');
+    setQueue((prev) => {
+      const existing = new Set(prev.map((q) => q.id));
+      const additions = tracksToAdd.filter((t) => !existing.has(t.id));
+      return additions.length > 0 ? [...prev, ...additions] : prev;
+    });
+  }, []);
+
+  const handleDeleteTracks = useCallback(async (trackIds: string[]) => {
+    if (trackIds.length === 0) return;
+    const idSet = new Set(trackIds);
+
+    const activeId = audioEngine.getSnapshot().currentTrack?.id;
+    if (activeId && idSet.has(activeId)) {
+      audioEngine.pause();
+    }
+
+    setSavedTracks((prev) => prev.filter((t) => !idSet.has(t.id)));
+    setQueue((prev) => prev.filter((t) => !idSet.has(t.id)));
+    setFavoriteIds((prev) => {
+      const next = prev.filter((id) => !idSet.has(id));
+      if (next.length !== prev.length) {
+        localDb.saveFavorites(next);
+      }
+      return next;
+    });
+
+    const modifiedPlaylists = playlistsRef.current
+      .map((pl) => {
+        const nextIds = pl.trackIds.filter((id) => !idSet.has(id));
+        if (nextIds.length === pl.trackIds.length) return null;
+        return { ...pl, trackIds: nextIds };
+      })
+      .filter((pl): pl is Playlist => pl !== null);
+
+    if (modifiedPlaylists.length > 0) {
+      const updatedById = new Map(modifiedPlaylists.map((pl) => [pl.id, pl]));
+      setPlaylists((prev) => prev.map((pl) => updatedById.get(pl.id) || pl));
+    }
+
+    await localDb.deleteTracksBatch(trackIds);
+    for (const pl of modifiedPlaylists) {
+      await localDb.savePlaylist(pl);
+    }
+  }, []);
+
+  const handleDeleteTrack = useCallback(
+    async (trackId: string) => {
+      await handleDeleteTracks([trackId]);
+    },
+    [handleDeleteTracks]
+  );
+
+  const handleImportYouTubePlaylist = useCallback(
+    async (
+      urlOrId: string,
+      customName?: string
+    ): Promise<{ ok: boolean; trackCount?: number; error?: string }> => {
+      const res = await fetchYouTubePlaylistByUrlOrId(urlOrId, customName);
+      if (!res.ok || res.tracks.length === 0) {
+        return {
+          ok: false,
+          error: res.error || 'Could not import that YouTube playlist.',
+        };
+      }
+
+      setSavedTracks((prev) => mergeImportedTracks(prev, res.tracks));
+      await localDb.saveTracksBatch(res.tracks);
+
+      const pl: Playlist = {
+        id: `yt-pl-${res.listId || Date.now().toString(36)}-${Date.now().toString(36)}`,
+        name: res.title || customName?.trim() || 'YouTube Playlist',
+        description: `Imported from YouTube (${res.tracks.length} songs)`,
+        trackIds: res.tracks.map((t) => t.id),
+        createdAt: Date.now(),
+      };
+      setPlaylists((prev) => [pl, ...prev]);
+      await localDb.savePlaylist(pl);
+      triggerHaptic('success');
+      return { ok: true, trackCount: res.tracks.length };
+    },
+    []
+  );
 
   const handleSaveLyrics = useCallback(async (entry: StoredLyrics) => {
     setLyricsMap((prev) => ({ ...prev, [entry.trackId]: entry }));
@@ -986,9 +1178,9 @@ export default function App() {
         ref={folderPickerRef}
         type="file"
         multiple
-        // @ts-expect-error webkitdirectory is standard in Chromium/WebKit
-        webkitdirectory="true"
-        accept="audio/*"
+        // @ts-expect-error webkitdirectory & directory enable folder picking across browsers
+        webkitdirectory=""
+        directory=""
         onChange={handlePickFolderInput}
         className="hidden"
       />
@@ -1005,6 +1197,7 @@ export default function App() {
             engine={engine}
             dsp={dsp}
             storedTrackCount={allLibraryTracks.length}
+            recentTracks={allLibraryTracks}
             isInAppPip={isInAppPip}
             onToggleInAppPip={() => setIsInAppPip((prev) => !prev)}
             onQuickPlay={handleQuickPlay}
@@ -1021,12 +1214,17 @@ export default function App() {
           <StreamView
             engine={engine}
             onPlayTrack={playTrack}
+            onPlayCollection={playCollection}
             onTogglePlay={() => void audioEngine.togglePlay()}
             onAddToQueue={(t) => {
               triggerHaptic('selection');
               setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]));
             }}
+            onAddMultipleToQueue={handleAddMultipleToQueue}
             onSaveTrackToLibrary={(t) => void handleSaveTrackToLibrary(t)}
+            onSaveCollectionAsPlaylist={(name, desc, trs) =>
+              void handleCreatePlaylistWithTracks(name, desc, trs)
+            }
           />
         )}
 
@@ -1036,6 +1234,7 @@ export default function App() {
             playlists={playlists}
             favoriteIds={favoriteIds}
             engine={engine}
+            libraryFocusRequest={libraryFocusRequest}
             onPlayTrack={playTrack}
             onPlayCollection={playCollection}
             onTogglePlay={() => void audioEngine.togglePlay()}
@@ -1043,14 +1242,24 @@ export default function App() {
               triggerHaptic('selection');
               setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]));
             }}
+            onAddMultipleToQueue={handleAddMultipleToQueue}
             onToggleFavorite={handleToggleFavorite}
             onPickSong={() => songPickerRef.current?.click()}
             onPickFolder={() => void handlePickFolder()}
             onOpenLiveStudio={() => setIsLiveStudioOpen(true)}
             onCreatePlaylist={(name, desc) => void handleCreatePlaylist(name, desc)}
+            onCreatePlaylistWithTracks={(name, desc, trs) =>
+              void handleCreatePlaylistWithTracks(name, desc, trs)
+            }
+            onImportYouTubePlaylist={handleImportYouTubePlaylist}
             onDeletePlaylist={(id) => void handleDeletePlaylist(id)}
+            onDeletePlaylists={(ids) => void handleDeletePlaylists(ids)}
             onAddTrackToPlaylist={(plId, trId) => void handleAddTrackToPlaylist(plId, trId)}
+            onAddMultipleTracksToPlaylist={(plId, trIds) =>
+              void handleAddMultipleTracksToPlaylist(plId, trIds)
+            }
             onDeleteTrack={(id) => void handleDeleteTrack(id)}
+            onDeleteTracks={(ids) => void handleDeleteTracks(ids)}
           />
         )}
 
@@ -1061,6 +1270,8 @@ export default function App() {
             isOnline={isOnline}
             autoplayRadioEnabled={autoplayRadioEnabled}
             themePrefs={themePrefs}
+            visualizerPalette={visualizerPalette}
+            onChangeVisualizerPalette={handleChangeVisualizerPalette}
             onChangeThemeMode={(mode: ThemeMode) =>
               setThemePrefs((prev) => ({ ...prev, mode }))
             }
@@ -1147,6 +1358,8 @@ export default function App() {
         duration={engine.duration}
         queue={queue}
         dsp={dsp}
+        visualizerPalette={visualizerPalette}
+        onChangeVisualizerPalette={handleChangeVisualizerPalette}
         isFavorite={engine.currentTrack ? favoriteIds.includes(engine.currentTrack.id) : false}
         storedLyrics={engine.currentTrack ? lyricsMap[engine.currentTrack.id] : undefined}
         isInAppPip={isInAppPip}

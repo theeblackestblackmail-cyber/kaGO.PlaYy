@@ -816,6 +816,12 @@ class DualChannelAudioEngine {
     return true;
   }
 
+  getTimeDomainData(target: Uint8Array): boolean {
+    if (!this.analyser) return false;
+    this.analyser.getByteTimeDomainData(target as Uint8Array<ArrayBuffer>);
+    return true;
+  }
+
   getAnalyserBinCount(): number {
     return this.analyser ? this.analyser.frequencyBinCount : 64;
   }

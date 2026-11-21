@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  AudioLines,
   Check,
   ChevronDown,
   ChevronUp,
@@ -30,6 +31,8 @@ import { formatDuration, parseLrc, findActiveLyricIndex } from '../utils/lrcPars
 import { sanitizeTrackForLyrics } from '../utils/lyricsFetcher';
 import { triggerHaptic } from '../utils/haptics';
 import { fetchRelatedRadioTracks } from '../utils/streamRadio';
+import type { VisualizerPaletteId } from '../utils/visualizerUtils';
+import { AudioVisualizerOverlay } from './AudioVisualizerOverlay';
 import { SpectrumVisualizer } from './SpectrumVisualizer';
 import { VinylTurntable } from './VinylTurntable';
 import { WatchVideoViewport } from './WatchVideoViewport';
@@ -45,6 +48,8 @@ interface FullscreenPlayerProps {
   duration: number;
   queue: Track[];
   dsp: DspSettings;
+  visualizerPalette?: VisualizerPaletteId;
+  onChangeVisualizerPalette?: (paletteId: VisualizerPaletteId) => void;
   isFavorite: boolean;
   storedLyrics?: StoredLyrics;
   isInAppPip: boolean;
@@ -87,6 +92,8 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   duration,
   queue,
   dsp,
+  visualizerPalette,
+  onChangeVisualizerPalette,
   isFavorite,
   storedLyrics,
   isInAppPip,
@@ -116,8 +123,19 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   onToggleAutoplayRadio,
 }) => {
   const [subTab, setSubTab] = useState<FullscreenSubTab>('turntable');
-  const [fallbackRelated, setFallbackRelated] = useState<Track[]>([]);
+  const [isVisualizerOverlayOpen, setIsVisualizerOverlayOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('kago-visualizer-overlay-open') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [watchRelated, setWatchRelated] = useState<{ seedTrackId: string; tracks: Track[] }>({
+    seedTrackId: '',
+    tracks: [],
+  });
   const [loadingWatchRelated, setLoadingWatchRelated] = useState(false);
+  const relatedCacheRef = useRef<Map<string, Track[]>>(new Map());
   const [lyricSearchQuery, setLyricSearchQuery] = useState('');
   const [selectedQueueIds, setSelectedQueueIds] = useState<Set<string>>(() => new Set());
   const [dragIdx, setDragIdx] = useState<number | null>(null);
@@ -128,6 +146,37 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   const htmlDragGroupRef = useRef<{ indices: number[]; anchorIdx: number } | null>(null);
   const queueScrollRef = useRef<HTMLDivElement | null>(null);
   const activeLineRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('kago-visualizer-overlay-open', String(isVisualizerOverlayOpen));
+    } catch {
+      // Ignore storage failures
+    }
+  }, [isVisualizerOverlayOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.key.toLowerCase() === 'v' && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        e.preventDefault();
+        triggerHaptic('selection');
+        setIsVisualizerOverlayOpen((prev) => !prev);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen]);
 
   const rawLrc = storedLyrics?.rawLrc ?? track?.lrcLyrics ?? '';
   const offsetSeconds = storedLyrics?.offsetSeconds ?? 0;
@@ -151,55 +200,75 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
     }
   }, [activeIdx, subTab]);
 
-  // Build horizontally scrollable related video suggestions from live queue (+ fallback fetch)
-  const queueRelated = useMemo(() => {
-    if (!track) return [];
-    const seen = new Set<string>([track.id]);
-    const list: Track[] = [];
-    for (const q of queue) {
-      if (seen.has(q.id)) continue;
-      if (q.autoQueued || Boolean(q.youtubeId) || q.source === 'stream') {
-        seen.add(q.id);
-        list.push(q);
-      }
-    }
-    return list;
-  }, [queue, track?.id]);
-
+  // Always fetch fresh related videos tailored to the currently playing track
   useEffect(() => {
-    setFallbackRelated([]);
-  }, [track?.id]);
-
-  useEffect(() => {
-    if (!isOpen || subTab !== 'video' || !track) return;
-    if (queueRelated.length >= 3) {
+    if (!track) {
+      setWatchRelated({ seedTrackId: '', tracks: [] });
+      setLoadingWatchRelated(false);
       return;
     }
+
+    const seedId = track.id;
+    const cached = relatedCacheRef.current.get(seedId);
+    if (cached && cached.length > 0) {
+      setWatchRelated({ seedTrackId: seedId, tracks: cached });
+      setLoadingWatchRelated(false);
+      return;
+    }
+
+    setWatchRelated({ seedTrackId: seedId, tracks: [] });
+
+    if (!isOpen || subTab !== 'video' || track.source === 'synth') {
+      return;
+    }
+
     let cancelled = false;
     setLoadingWatchRelated(true);
-    void fetchRelatedRadioTracks(track, [track.id, ...queueRelated.map((t) => t.id)])
+    void fetchRelatedRadioTracks(track, [seedId])
       .then((fetched) => {
-        if (!cancelled) setFallbackRelated(fetched);
+        if (cancelled) return;
+        const filtered = fetched.filter(
+          (item) =>
+            item.id !== seedId &&
+            (!track.youtubeId || item.youtubeId !== track.youtubeId)
+        );
+        if (filtered.length > 0) {
+          relatedCacheRef.current.set(seedId, filtered);
+        }
+        setWatchRelated({ seedTrackId: seedId, tracks: filtered });
       })
       .finally(() => {
         if (!cancelled) setLoadingWatchRelated(false);
       });
+
     return () => {
       cancelled = true;
     };
-  }, [isOpen, subTab, track?.id, queueRelated.length]);
+  }, [isOpen, subTab, track?.id, track?.youtubeId, track?.title, track?.artist, track?.source]);
 
   const relatedSuggestions = useMemo(() => {
     if (!track) return [];
+    const liveForTrack =
+      watchRelated.seedTrackId === track.id ? watchRelated.tracks : [];
+    const autoQueueFallback =
+      liveForTrack.length === 0 && !loadingWatchRelated
+        ? queue.filter(
+            (q) =>
+              q.autoQueued &&
+              q.id !== track.id &&
+              (!track.youtubeId || q.youtubeId !== track.youtubeId)
+          )
+        : [];
     const merged: Track[] = [];
     const seen = new Set<string>([track.id]);
-    for (const item of [...queueRelated, ...fallbackRelated]) {
+    for (const item of [...liveForTrack, ...autoQueueFallback]) {
       if (seen.has(item.id)) continue;
+      if (track.youtubeId && item.youtubeId === track.youtubeId) continue;
       seen.add(item.id);
       merged.push(item);
     }
     return merged.slice(0, 12);
-  }, [queueRelated, fallbackRelated, track?.id]);
+  }, [watchRelated, loadingWatchRelated, queue, track?.id, track?.youtubeId]);
 
   // Prune any selected queue IDs that are no longer in the active queue
   useEffect(() => {
@@ -331,22 +400,53 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
           })}
         </div>
 
-        <button
-          type="button"
-          onClick={() => {
-            triggerHaptic('light');
-            onOpenDsp();
-          }}
-          aria-label="Open Hardware DSP Studio"
-          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#111319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
-        >
-          <Sliders className="h-4 w-4" />
-        </button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            data-testid="fullscreen-visualizer-toggle"
+            aria-pressed={isVisualizerOverlayOpen}
+            aria-label={
+              isVisualizerOverlayOpen
+                ? 'Hide audio visualizer overlay'
+                : 'Show audio visualizer overlay'
+            }
+            title={
+              isVisualizerOverlayOpen
+                ? 'Turn off visualizer overlay (V)'
+                : 'Real-time audio visualizer overlay (V)'
+            }
+            onClick={() => {
+              triggerHaptic('selection');
+              setIsVisualizerOverlayOpen((prev) => !prev);
+            }}
+            className={`flex h-10 w-10 sm:w-auto sm:px-3 shrink-0 items-center justify-center gap-1.5 rounded-lg border text-xs font-semibold transition-colors whitespace-nowrap cursor-pointer ${
+              isVisualizerOverlayOpen
+                ? 'border-[#E11D48] bg-[#E11D48] text-white shadow-[0_0_12px_rgba(225,29,72,0.4)]'
+                : 'border-[#242732] bg-[#111319] text-[#F4F3F0] hover:border-[#E11D48]'
+            }`}
+          >
+            <AudioLines className="h-4 w-4" />
+            <span className="hidden md:inline">Visualizer</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              triggerHaptic('light');
+              onOpenDsp();
+            }}
+            aria-label="Open Hardware DSP Studio"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#111319] text-[#F4F3F0] hover:border-[#E11D48] transition-colors cursor-pointer"
+          >
+            <Sliders className="h-4 w-4" />
+          </button>
+        </div>
       </div>
 
-      {/* Main Content Stage */}
-      <div ref={queueScrollRef} className="flex-1 overflow-y-auto px-4 py-6 sm:px-8">
-        <div className="mx-auto max-w-3xl">
+      {/* Main Content Stage + Optional Real-Time Visualizer Overlay */}
+      <div className="relative flex flex-1 flex-col overflow-hidden">
+        <div ref={queueScrollRef} className="flex-1 overflow-y-auto px-4 py-6 sm:px-8">
+          <div className="mx-auto max-w-3xl">
           {subTab === 'turntable' && (
             <div className="kago-panel-enter space-y-6">
               <VinylTurntable
@@ -358,7 +458,12 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
                 }}
                 size="lg"
               />
-              <SpectrumVisualizer isPlaying={isPlaying} dsp={dsp} compact />
+              <SpectrumVisualizer
+                isPlaying={isPlaying}
+                dsp={dsp}
+                compact
+                paletteId={visualizerPalette}
+              />
             </div>
           )}
 
@@ -455,7 +560,12 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
               </div>
 
               {/* Shorter Spectrum Visualizer directly below Next Video Suggestions */}
-              <SpectrumVisualizer isPlaying={isPlaying} dsp={dsp} height={52} />
+              <SpectrumVisualizer
+                isPlaying={isPlaying}
+                dsp={dsp}
+                height={52}
+                paletteId={visualizerPalette}
+              />
             </div>
           )}
 
@@ -1042,6 +1152,19 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
             </div>
           )}
         </div>
+      </div>
+
+        <AudioVisualizerOverlay
+          isOpen={isVisualizerOverlayOpen}
+          onClose={() => setIsVisualizerOverlayOpen(false)}
+          track={track}
+          isPlaying={isPlaying}
+          currentTime={currentTime}
+          dsp={dsp}
+          activeSubTab={subTab}
+          paletteId={visualizerPalette}
+          onChangePalette={onChangeVisualizerPalette}
+        />
       </div>
 
       {/* Bottom Transport Deck */}

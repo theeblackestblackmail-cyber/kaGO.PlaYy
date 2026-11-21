@@ -567,6 +567,34 @@ export function buildInnertubeSearchBody(query: string, sp?: string): string {
   return JSON.stringify(payload);
 }
 
+export function buildInnertubeNextBody(videoId: string): string {
+  return JSON.stringify({
+    context: {
+      client: {
+        clientName: 'WEB',
+        clientVersion: '2.20250218.01.00',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    videoId,
+  });
+}
+
+export function buildInnertubeBrowseBody(browseId: string): string {
+  return JSON.stringify({
+    context: {
+      client: {
+        clientName: 'WEB',
+        clientVersion: '2.20250218.01.00',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    browseId,
+  });
+}
+
 export function rankYouTubeSearchResults(
   results: ParsedYouTubeVideo[],
   query: string,
@@ -751,7 +779,7 @@ export function parseYouTubeSuggestResponse(rawText: string, userQuery = ''): st
 }
 
 function collectCompactRenderers(node: unknown, out: YouTubeVideoRenderer[], depth = 0): void {
-  if (!node || typeof node !== 'object' || depth > 24) return;
+  if (!node || typeof node !== 'object' || depth > 28) return;
   if (Array.isArray(node)) {
     for (const item of node) collectCompactRenderers(item, out, depth + 1);
     return;
@@ -759,6 +787,9 @@ function collectCompactRenderers(node: unknown, out: YouTubeVideoRenderer[], dep
   const obj = node as Record<string, unknown>;
   if (obj.compactVideoRenderer && typeof obj.compactVideoRenderer === 'object') {
     out.push(obj.compactVideoRenderer as YouTubeVideoRenderer);
+  }
+  if (obj.playlistPanelVideoRenderer && typeof obj.playlistPanelVideoRenderer === 'object') {
+    out.push(obj.playlistPanelVideoRenderer as YouTubeVideoRenderer);
   }
   for (const val of Object.values(obj)) {
     if (val && typeof val === 'object') {
@@ -768,21 +799,29 @@ function collectCompactRenderers(node: unknown, out: YouTubeVideoRenderer[], dep
 }
 
 export function extractYouTubeRelatedResults(
-  html: string,
+  htmlOrJson: string,
   excludeVideoId?: string
 ): ParsedYouTubeVideo[] {
-  const data = extractYtInitialDataJson(html);
+  const data = extractYtInitialDataJson(htmlOrJson);
   if (!data) return [];
 
-  const secondary = (
+  const contentsRoot = (
     data as {
       contents?: {
         twoColumnWatchNextResults?: {
           secondaryResults?: unknown;
         };
+        singleColumnWatchNextResults?: {
+          results?: unknown;
+        };
       };
     }
-  )?.contents?.twoColumnWatchNextResults?.secondaryResults;
+  )?.contents;
+
+  const secondary =
+    contentsRoot?.twoColumnWatchNextResults?.secondaryResults ??
+    contentsRoot?.singleColumnWatchNextResults?.results ??
+    data;
 
   if (!secondary) return [];
 
@@ -826,28 +865,53 @@ export function extractYouTubeRelatedResults(
     });
   }
 
+  // Modern YouTube Watch Next secondaryResults render related cards via lockupViewModel
+  const lockups: YouTubeLockupVideoCard[] = [];
+  collectNodesByKey(secondary, 'lockupViewModel', lockups as unknown[]);
+  for (const lk of lockups) {
+    const parsed = extractVideoFromLockup(lk, seenIds);
+    if (parsed) results.push(parsed);
+  }
+
   return results;
 }
 
 export function buildRadioSeedQuery(track: Pick<Track, 'title' | 'artist' | 'genre'>): string {
-  const cleanArtist = (track.artist || '')
-    .replace(/\b(youTube\s*audio|official|topic|vevo)\b/gi, '')
+  const rawArtist = (track.artist || '')
+    .replace(/\b(youtube\s*(audio|music)|official|topic|vevo|unknown\s*artist|various\s*artists|audius\s*artist|kago\s*synth\s*engine)\b/gi, '')
+    .replace(/^[-–—\s]+|[-–—\s]+$/g, '')
+    .trim();
+  const cleanTitle = (track.title || '')
+    .replace(
+      /\s*[\[(](official\s*(music\s*)?(video|audio|lyric\s*video)|lyrics?|hq|4k|hd|visualizer|audio\s*only)[\])]/gi,
+      ''
+    )
     .trim();
   const cleanGenre =
-    track.genre && track.genre.toLowerCase() !== 'youtube' && track.genre.toLowerCase() !== 'stream'
+    track.genre &&
+    !['youtube', 'stream', 'radio', 'local'].includes(track.genre.toLowerCase())
       ? track.genre.trim()
       : '';
 
-  if (cleanArtist && cleanGenre) {
-    return `${cleanArtist} ${cleanGenre} songs`;
+  if (rawArtist && cleanGenre) {
+    return `${rawArtist} ${cleanGenre} songs`;
   }
-  if (cleanArtist) {
-    return `${cleanArtist} similar songs music`;
+  if (rawArtist && cleanTitle) {
+    return `${rawArtist} ${cleanTitle} songs`;
+  }
+  if (rawArtist) {
+    return `${rawArtist} songs`;
+  }
+  if (cleanTitle && cleanGenre) {
+    return `${cleanTitle} ${cleanGenre} songs`;
+  }
+  if (cleanTitle) {
+    return `${cleanTitle} songs`;
   }
   if (cleanGenre) {
     return `${cleanGenre} popular songs`;
   }
-  return `${track.title} similar songs`;
+  return 'popular music hits';
 }
 
 export function mergeAutoplayQueue(
@@ -1263,31 +1327,125 @@ export function extractYouTubePodcasts(html: string, genre = ''): Track[] {
   return out.slice(0, 12);
 }
 
-export function extractYouTubePlaylistTracks(html: string, albumLabel = 'Album'): Track[] {
-  const data = extractYtInitialDataJson(html);
-  if (!data) return [];
+export function parseYouTubePlaylistInput(rawInput: string): string | null {
+  const trimmed = rawInput.trim();
+  if (!trimmed) return null;
+
+  // Match full URLs containing ?list=... or &list=...
+  try {
+    const candidateUrl = /^https?:\/\//i.test(trimmed)
+      ? trimmed
+      : trimmed.includes('youtube.com/') || trimmed.includes('youtu.be/')
+      ? `https://${trimmed}`
+      : '';
+    if (candidateUrl) {
+      const parsed = new URL(candidateUrl);
+      const listParam = parsed.searchParams.get('list')?.trim();
+      if (listParam && /^[a-zA-Z0-9_-]{10,}$/.test(listParam)) {
+        return listParam;
+      }
+    }
+  } catch {
+    // Fall back to direct query/ID matching
+  }
+
+  const listParamMatch = trimmed.match(/[?&]list=([a-zA-Z0-9_-]{10,})/);
+  if (listParamMatch?.[1]) {
+    return listParamMatch[1];
+  }
+
+  if (/^[a-zA-Z0-9_-]{10,}$/.test(trimmed) && !trimmed.includes('.')) {
+    return trimmed;
+  }
+
+  return null;
+}
+
+export function extractYouTubePlaylistInfo(
+  htmlOrJson: string,
+  fallbackTitle = 'YouTube Playlist'
+): { title: string; tracks: Track[] } {
+  const data = extractYtInitialDataJson(htmlOrJson);
+  if (!data) return { title: fallbackTitle, tracks: [] };
+
+  const metaTitle =
+    (
+      data as {
+        metadata?: { playlistMetadataRenderer?: { title?: string } };
+        header?: {
+          playlistHeaderRenderer?: { title?: YouTubeTextContainer };
+          pageHeaderRenderer?: {
+            pageTitle?: string;
+            content?: {
+              pageHeaderViewModel?: {
+                title?: { dynamicTextViewModel?: { text?: { content?: string } } };
+              };
+            };
+          };
+        };
+      }
+    )?.metadata?.playlistMetadataRenderer?.title ||
+    readYtText(
+      (
+        data as {
+          header?: { playlistHeaderRenderer?: { title?: YouTubeTextContainer } };
+        }
+      )?.header?.playlistHeaderRenderer?.title
+    ) ||
+    (
+      data as {
+        header?: {
+          pageHeaderRenderer?: {
+            pageTitle?: string;
+            content?: {
+              pageHeaderViewModel?: {
+                title?: { dynamicTextViewModel?: { text?: { content?: string } } };
+              };
+            };
+          };
+        };
+      }
+    )?.header?.pageHeaderRenderer?.content?.pageHeaderViewModel?.title?.dynamicTextViewModel?.text
+      ?.content ||
+    (
+      data as {
+        header?: { pageHeaderRenderer?: { pageTitle?: string } };
+      }
+    )?.header?.pageHeaderRenderer?.pageTitle;
+
+  const htmlTitleMatch = htmlOrJson.match(/<title>([^<]+)<\/title>/i);
+  const cleanedHtmlTitle = htmlTitleMatch?.[1]?.replace(/\s*-\s*YouTube\s*$/i, '').trim();
+  const resolvedTitle = (metaTitle || cleanedHtmlTitle || fallbackTitle).trim() || fallbackTitle;
 
   const renderers: Array<{
     videoId?: string;
-    title?: { runs?: YouTubeTextRun[]; simpleText?: string };
-    shortBylineText?: { runs?: YouTubeTextRun[] };
-    lengthText?: { simpleText?: string };
+    title?: YouTubeTextContainer;
+    shortBylineText?: YouTubeTextContainer;
+    longBylineText?: YouTubeTextContainer;
+    ownerText?: YouTubeTextContainer;
+    lengthText?: YouTubeTextContainer;
     lengthSeconds?: string;
   }> = [];
   collectNodesByKey(data, 'playlistVideoRenderer', renderers as unknown[]);
+  if (renderers.length === 0) {
+    collectNodesByKey(data, 'playlistPanelVideoRenderer', renderers as unknown[]);
+  }
 
   const seen = new Set<string>();
   const out: Track[] = [];
   for (const v of renderers) {
     if (!v.videoId || seen.has(v.videoId)) continue;
-    const rawTitle =
-      v.title?.runs?.map((r) => r.text || '').join('') || v.title?.simpleText || '';
-    const channelName = v.shortBylineText?.runs?.[0]?.text || 'YouTube Music';
+    const rawTitle = readYtText(v.title);
+    const channelName =
+      readYtText(v.shortBylineText) ||
+      readYtText(v.longBylineText) ||
+      readYtText(v.ownerText) ||
+      'YouTube Music';
     const durationSeconds =
-      parseYouTubeDuration(v.lengthText?.simpleText) ||
+      parseYouTubeDuration(readYtText(v.lengthText)) ||
       (v.lengthSeconds ? parseInt(v.lengthSeconds, 10) : 180) ||
       180;
-    if (!rawTitle || durationSeconds < 45) continue;
+    if (!rawTitle || durationSeconds < 30) continue;
 
     seen.add(v.videoId);
     const { artist, title } = parseYouTubeArtistAndTitle(rawTitle, channelName);
@@ -1297,7 +1455,7 @@ export function extractYouTubePlaylistTracks(html: string, albumLabel = 'Album')
       streamProvider: 'youtube',
       title,
       artist,
-      album: albumLabel,
+      album: resolvedTitle,
       duration: durationSeconds,
       resultType: 'song',
       source: 'stream',
@@ -1308,7 +1466,112 @@ export function extractYouTubePlaylistTracks(html: string, albumLabel = 'Album')
     });
   }
 
-  return out.slice(0, 25);
+  // Modern YouTube playlist pages render tracks inside lockupViewModel cards
+  if (out.length === 0) {
+    interface LockupPlaylistOverlayBadge {
+      thumbnailBadgeViewModel?: { text?: string };
+    }
+    interface LockupPlaylistItem {
+      contentId?: string;
+      contentType?: string;
+      metadata?: {
+        lockupMetadataViewModel?: {
+          title?: { content?: string };
+          metadata?: {
+            contentMetadataViewModel?: {
+              metadataRows?: Array<{
+                metadataParts?: Array<{ text?: { content?: string } }>;
+              }>;
+            };
+          };
+        };
+      };
+      contentImage?: {
+        thumbnailViewModel?: {
+          overlays?: Array<{
+            thumbnailOverlayBadgeViewModel?: { thumbnailBadges?: LockupPlaylistOverlayBadge[] };
+            thumbnailBottomOverlayViewModel?: { badges?: LockupPlaylistOverlayBadge[] };
+          }>;
+        };
+      };
+      rendererContext?: {
+        commandContext?: {
+          onTap?: {
+            innertubeCommand?: {
+              watchEndpoint?: { videoId?: string };
+            };
+          };
+        };
+      };
+    }
+
+    const lockups: LockupPlaylistItem[] = [];
+    collectNodesByKey(data, 'lockupViewModel', lockups as unknown[]);
+    for (const item of lockups) {
+      if (item.contentType && item.contentType !== 'LOCKUP_CONTENT_TYPE_VIDEO') continue;
+      const videoId =
+        item.contentId ||
+        item.rendererContext?.commandContext?.onTap?.innertubeCommand?.watchEndpoint?.videoId;
+      if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId) || seen.has(videoId)) continue;
+
+      const meta = item.metadata?.lockupMetadataViewModel;
+      const rawTitle = meta?.title?.content?.trim() || '';
+      if (!rawTitle) continue;
+
+      const rows = meta?.metadata?.contentMetadataViewModel?.metadataRows || [];
+      const rowTexts = rows
+        .map((r) =>
+          (r.metadataParts || [])
+            .map((p) => p.text?.content || '')
+            .filter(Boolean)
+            .join(' ')
+            .trim()
+        )
+        .filter(Boolean);
+      const channelName =
+        rowTexts.find((txt) => !/views|watching|ago|playlist/i.test(txt)) ||
+        resolvedTitle ||
+        'YouTube Music';
+
+      const overlays = item.contentImage?.thumbnailViewModel?.overlays || [];
+      let durationText = '';
+      for (const ov of overlays) {
+        const badgeText =
+          ov.thumbnailOverlayBadgeViewModel?.thumbnailBadges?.[0]?.thumbnailBadgeViewModel?.text ||
+          ov.thumbnailBottomOverlayViewModel?.badges?.[0]?.thumbnailBadgeViewModel?.text;
+        if (badgeText && /\d+:\d+/.test(badgeText)) {
+          durationText = badgeText;
+          break;
+        }
+      }
+      const durationSeconds = parseYouTubeDuration(durationText) || 180;
+      if (durationSeconds < 30) continue;
+
+      seen.add(videoId);
+      const { artist, title } = parseYouTubeArtistAndTitle(rawTitle, channelName);
+      out.push({
+        id: `yt-${videoId}`,
+        youtubeId: videoId,
+        streamProvider: 'youtube',
+        title,
+        artist,
+        album: resolvedTitle,
+        duration: durationSeconds,
+        resultType: 'song',
+        source: 'stream',
+        artworkUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+        genre: 'YouTube',
+        addedAt: Date.now(),
+        isOfficial: true,
+      });
+    }
+  }
+
+  return { title: resolvedTitle, tracks: out.slice(0, 100) };
+}
+
+export function extractYouTubePlaylistTracks(html: string, albumLabel = 'Album'): Track[] {
+  return extractYouTubePlaylistInfo(html, albumLabel).tracks;
 }
 
 export const MAX_RECENT_SEARCHES = 5;

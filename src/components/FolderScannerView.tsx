@@ -5,6 +5,7 @@ import { SAMPLE_FILENAMES, sanitizeFilename } from '../utils/filenameSanitizer';
 import {
   buildTracksFromFilePairs,
   importFromNativeFolderPicker,
+  resolveFolderPathFromRelativePath,
 } from '../utils/folderImporter';
 import { hasNativeFolderPicker } from '../utils/nativeMediaBridge';
 
@@ -185,7 +186,7 @@ export const FolderScannerView: React.FC<FolderScannerViewProps> = ({
     if (files.length === 0) return;
     const pairs = files.map((file) => {
       const rel = (file as File & { webkitRelativePath?: string }).webkitRelativePath || '';
-      const folderPath = rel ? rel.split('/').slice(0, -1).join('/') : 'Picked Songs';
+      const folderPath = resolveFolderPathFromRelativePath(rel, 'Picked Folder');
       return { file, folderPath };
     });
     await processFiles(pairs);
@@ -248,9 +249,9 @@ export const FolderScannerView: React.FC<FolderScannerViewProps> = ({
           ref={folderInputRef}
           type="file"
           multiple
-          // @ts-expect-error webkitdirectory is standard in Chromium/WebKit
-          webkitdirectory="true"
-          accept="audio/*"
+          // @ts-expect-error webkitdirectory & directory are standard in Chromium/WebKit
+          webkitdirectory=""
+          directory=""
           onChange={handleFileInputChange}
           className="hidden"
         />

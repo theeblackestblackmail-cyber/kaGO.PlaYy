@@ -151,6 +151,10 @@ export const localDb = {
     return hydrated;
   },
 
+  primeAudioBlob(trackId: string, audioBlob: Blob): void {
+    memoryBlobCache.set(trackId, audioBlob);
+  },
+
   async saveTrack(track: Track, audioBlob?: Blob): Promise<void> {
     await putInStore(STORES.TRACKS, track);
     if (audioBlob) {
@@ -192,6 +196,29 @@ export const localDb = {
     memoryBlobCache.delete(trackId);
     await deleteByKey(STORES.TRACKS, trackId);
     await deleteByKey(STORES.BLOBS, trackId);
+  },
+
+  async deleteTracksBatch(trackIds: string[]): Promise<void> {
+    if (trackIds.length === 0) return;
+    for (const id of trackIds) {
+      memoryBlobCache.delete(id);
+    }
+    try {
+      const db = await openDb();
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction([STORES.TRACKS, STORES.BLOBS], 'readwrite');
+        const trackStore = tx.objectStore(STORES.TRACKS);
+        const blobStore = tx.objectStore(STORES.BLOBS);
+        for (const id of trackIds) {
+          trackStore.delete(id);
+          blobStore.delete(id);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch {
+      // Ignore
+    }
   },
 
   async loadPlaylists(): Promise<Playlist[]> {

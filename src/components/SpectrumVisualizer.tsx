@@ -1,12 +1,19 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { audioEngine } from '../audio/AudioEngine';
 import type { DspSettings } from '../types/audio';
+import {
+  getVisualizerPalette,
+  loadVisualizerPalette,
+  subscribeVisualizerPalette,
+  type VisualizerPaletteId,
+} from '../utils/visualizerUtils';
 
 interface SpectrumVisualizerProps {
   isPlaying: boolean;
   dsp: DspSettings;
   height?: number;
   compact?: boolean;
+  paletteId?: VisualizerPaletteId;
 }
 
 export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
@@ -14,7 +21,17 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
   dsp,
   height,
   compact = false,
+  paletteId,
 }) => {
+  const [storedPalette, setStoredPalette] = useState<VisualizerPaletteId>(() =>
+    loadVisualizerPalette()
+  );
+
+  useEffect(() => {
+    return subscribeVisualizerPalette(setStoredPalette);
+  }, []);
+
+  const activePaletteId = paletteId ?? storedPalette;
   const resolvedHeight = typeof height === 'number' ? height : compact ? 104 : 148;
   const isMini = resolvedHeight <= 68;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -30,6 +47,7 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
     let rafId = 0;
     const freqBuffer = new Uint8Array(64);
     const barCount = 44;
+    const palette = getVisualizerPalette(activePaletteId);
 
     const renderFrame = () => {
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -46,11 +64,6 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
       ctx.clearRect(0, 0, width, h);
 
       const rootEl = document.documentElement;
-      const rootStyle = getComputedStyle(rootEl);
-      const accentDark = rootStyle.getPropertyValue('--kago-accent-dark').trim() || '#9F1239';
-      const accentBase = rootStyle.getPropertyValue('--kago-accent').trim() || '#E11D48';
-      const accentLight = rootStyle.getPropertyValue('--kago-accent-light').trim() || '#FF5A5F';
-      const accentSoft = rootStyle.getPropertyValue('--kago-accent-soft').trim() || '#FDA4AF';
       const isLightMode = rootEl.classList.contains('light');
 
       // Subtle reference grid lines
@@ -75,11 +88,8 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
         if (isPlaying && hasLiveSignal) {
           const binIdx = Math.min(freqBuffer.length - 1, Math.floor((i / barCount) * 48));
           const rawVal = freqBuffer[binIdx] / 255;
-          // Shape subtle floor + responsive peaks
           targetNorm = Math.min(1, rawVal * 1.08);
         } else if (isPlaying) {
-          // Cross-origin iframe streams (YouTube) cannot expose raw PCM to AnalyserNode:
-          // drive smooth multi-harmonic bars shaped by the active 5-band EQ & 80 Hz Bass Boost
           const bandFloat = (i / (barCount - 1)) * 4;
           const b0 = Math.floor(bandFloat);
           const b1 = Math.min(4, b0 + 1);
@@ -99,12 +109,10 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
           targetNorm = 0.03;
         }
 
-        // Smooth interpolation
         const prev = barsRef.current[i] || 0;
         const nextVal = targetNorm > prev ? prev + (targetNorm - prev) * 0.45 : prev * 0.86;
         barsRef.current[i] = Math.max(0.025, nextVal);
 
-        // Falling peak cap physics
         if (barsRef.current[i] >= peaksRef.current[i]) {
           peaksRef.current[i] = barsRef.current[i];
         } else {
@@ -114,18 +122,25 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
         const barH = Math.max(2, barsRef.current[i] * Math.max(16, h - 10));
         const x = i * (barW + gap);
         const y = h - barH;
+        const stops = palette.getStops(i / Math.max(1, barCount - 1), isLightMode);
 
         const grad = ctx.createLinearGradient(x, h, x, y);
-        grad.addColorStop(0, accentDark);
-        grad.addColorStop(0.55, accentBase);
-        grad.addColorStop(1, accentLight);
+        grad.addColorStop(0, stops.base);
+        grad.addColorStop(0.55, stops.mid);
+        grad.addColorStop(1, stops.tip);
 
         ctx.fillStyle = grad;
         ctx.fillRect(x, y, barW, barH);
 
         // Falling peak cap
         const peakY = Math.max(1, h - peaksRef.current[i] * Math.max(16, h - 10) - 3);
-        ctx.fillStyle = isPlaying ? accentSoft : isLightMode ? '#94A3B8' : '#3E4251';
+        ctx.fillStyle = isPlaying
+          ? isLightMode
+            ? palette.peakColorLight
+            : palette.peakColor
+          : isLightMode
+          ? '#94A3B8'
+          : '#3E4251';
         ctx.fillRect(x, peakY, barW, 2);
       }
 
@@ -143,7 +158,9 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
     };
-  }, [isPlaying, resolvedHeight, dsp]);
+  }, [isPlaying, resolvedHeight, dsp, activePaletteId]);
+
+  const paletteMeta = getVisualizerPalette(activePaletteId);
 
   return (
     <div
@@ -158,6 +175,8 @@ export const SpectrumVisualizer: React.FC<SpectrumVisualizerProps> = ({
       >
         <span className="font-mono-tabular">20 Hz – 20 kHz Spectrum</span>
         <div className="flex items-center gap-3 font-mono-tabular">
+          <span className="hidden min-[420px]:inline">{paletteMeta.name}</span>
+          <span aria-hidden="true" className="hidden min-[420px]:inline">·</span>
           <span>EQ: {dsp.preset}</span>
           <span aria-hidden="true">·</span>
           <span className={dsp.bassBoostEnabled ? 'text-[#FF4D6D]' : ''}>

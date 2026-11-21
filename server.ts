@@ -8,11 +8,13 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import {
   buildCategorySearchPlan,
+  buildInnertubeBrowseBody,
+  buildInnertubeNextBody,
   buildInnertubeSearchBody,
   buildRadioSeedQuery,
   extractYouTubeArtists,
   extractYouTubeCollections,
-  extractYouTubePlaylistTracks,
+  extractYouTubePlaylistInfo,
   extractYouTubePodcasts,
   extractYouTubeRelatedResults,
   extractYouTubeSearchResults,
@@ -309,14 +311,44 @@ async function searchYouTubeTracks(
 
 async function fetchYouTubeWatchRelated(youtubeId: string, genre?: string): Promise<Track[]> {
   try {
-    const url = `https://www.youtube.com/watch?v=${encodeURIComponent(youtubeId)}`;
+    const nextRes = await fetch('https://www.youtube.com/youtubei/v1/next?prettyPrint=false', {
+      method: 'POST',
+      signal: AbortSignal.timeout(6500),
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Origin: 'https://www.youtube.com',
+        Referer: `https://www.youtube.com/watch?v=${encodeURIComponent(youtubeId)}`,
+        Cookie: YT_COOKIE_HEADER,
+      },
+      body: buildInnertubeNextBody(youtubeId),
+    });
+    if (nextRes.ok) {
+      const jsonText = await nextRes.text();
+      const parsed = extractYouTubeRelatedResults(jsonText, youtubeId).slice(0, 12);
+      if (parsed.length > 0) {
+        return toYouTubeTracks(parsed, genre, {
+          autoQueued: true,
+          albumLabel: 'YouTube Radio Up Next',
+        });
+      }
+    }
+  } catch {
+    // Fall back to watch HTML scrape
+  }
+
+  try {
+    const url = `https://www.youtube.com/watch?v=${encodeURIComponent(youtubeId)}&gl=US&hl=en&persist_gl=1&persist_hl=1`;
     const response = await fetch(url, {
       signal: AbortSignal.timeout(6500),
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
-        Cookie: 'SOCS=CAI',
+        Cookie: YT_COOKIE_HEADER,
       },
     });
     if (!response.ok) return [];
@@ -564,26 +596,55 @@ async function startServer() {
 
   app.get('/api/stream/playlist', async (req, res) => {
     const listId = String(req.query.list || '').trim();
-    const title = String(req.query.title || 'Album').trim();
+    const title = String(req.query.title || 'YouTube Playlist').trim();
     if (!listId || !/^[a-zA-Z0-9_-]{8,}$/.test(listId)) {
-      return res.json({ tracks: [] });
+      return res.json({ title, tracks: [] });
     }
+
     try {
-      const url = `https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}`;
+      const browseRes = await fetch('https://www.youtube.com/youtubei/v1/browse?prettyPrint=false', {
+        method: 'POST',
+        signal: AbortSignal.timeout(7000),
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Origin: 'https://www.youtube.com',
+          Referer: 'https://www.youtube.com/',
+          Cookie: YT_COOKIE_HEADER,
+        },
+        body: buildInnertubeBrowseBody(listId.startsWith('VL') ? listId : `VL${listId}`),
+      });
+      if (browseRes.ok) {
+        const jsonText = await browseRes.text();
+        const info = extractYouTubePlaylistInfo(jsonText, title);
+        if (info.tracks.length > 0) {
+          return res.json({ listId, title: info.title, tracks: info.tracks });
+        }
+      }
+    } catch {
+      // Fall back to playlist HTML page
+    }
+
+    try {
+      const url = `https://www.youtube.com/playlist?list=${encodeURIComponent(listId)}&gl=US&hl=en&persist_gl=1&persist_hl=1`;
       const response = await fetch(url, {
         signal: AbortSignal.timeout(7000),
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
           'Accept-Language': 'en-US,en;q=0.9',
-          Cookie: 'SOCS=CAI',
+          Cookie: YT_COOKIE_HEADER,
         },
       });
-      if (!response.ok) return res.json({ tracks: [] });
+      if (!response.ok) return res.json({ listId, title, tracks: [] });
       const html = await response.text();
-      return res.json({ tracks: extractYouTubePlaylistTracks(html, title) });
+      const info = extractYouTubePlaylistInfo(html, title);
+      return res.json({ listId, title: info.title, tracks: info.tracks });
     } catch {
-      return res.json({ tracks: [] });
+      return res.json({ listId, title, tracks: [] });
     }
   });
 

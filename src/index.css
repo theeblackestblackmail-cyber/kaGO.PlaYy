@@ -456,11 +456,11 @@ html.light .text-\[\#FDA4AF\] {
 }
 
 .kago-page-enter {
-  animation: kago-page-enter 210ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: kago-page-enter 210ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
 }
 
 .kago-panel-enter {
-  animation: kago-panel-enter 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  animation: kago-panel-enter 180ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
 }
 
 .kago-modal-backdrop {

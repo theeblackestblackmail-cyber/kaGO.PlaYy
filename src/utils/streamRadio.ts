@@ -1,7 +1,13 @@
 import { CURATED_STREAM_BANK } from '../data/presetsAndStems';
 import type { Track } from '../types/audio';
-import { hasNativeHttpBridge, nativeFetchText } from './nativeMediaBridge';
 import {
+  hasNativeHttpBridge,
+  hasNativeHttpPostBridge,
+  nativeFetchText,
+  nativePostJson,
+} from './nativeMediaBridge';
+import {
+  buildInnertubeNextBody,
   buildRadioSeedQuery,
   extractYouTubeRelatedResults,
   isIndividualSong,
@@ -16,7 +22,7 @@ export async function fetchRelatedRadioTracks(
   const excluded = new Set(excludeTrackIds);
   excluded.add(seedTrack.id);
 
-  // 1. Try backend /api/stream/related (YouTube Watch Next + Artist/Genre Radio)
+  // 1. Try backend /api/stream/related (YouTube Watch Next + Artist/Title/Genre Radio)
   try {
     const params = new URLSearchParams();
     if (seedTrack.youtubeId) params.set('youtubeId', seedTrack.youtubeId);
@@ -28,7 +34,12 @@ export async function fetchRelatedRadioTracks(
     if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
       const data = (await res.json()) as { results?: Track[] };
       const tracks = (data.results || [])
-        .filter((t) => !excluded.has(t.id) && isIndividualSong(t.title, t.album, t.duration))
+        .filter(
+          (t) =>
+            !excluded.has(t.id) &&
+            (!seedTrack.youtubeId || t.youtubeId !== seedTrack.youtubeId) &&
+            isIndividualSong(t.title, t.album, t.duration)
+        )
         .map((t) => ({ ...t, autoQueued: true }));
       if (tracks.length > 0) {
         return tracks;
@@ -38,14 +49,34 @@ export async function fetchRelatedRadioTracks(
     // Fall through to native Android YouTube bridge / Audius fallback
   }
 
-  // 2. Native Android APK YouTube Watch Next & Artist/Genre Radio
+  // 2. Native Android APK YouTube Watch Next (/youtubei/v1/next + watch HTML) & Radio
   if (hasNativeHttpBridge()) {
     const collected: Track[] = [];
     const seenIds = new Set(excluded);
 
-    if (seedTrack.youtubeId) {
+    if (seedTrack.youtubeId && hasNativeHttpPostBridge()) {
+      const nextRes = await nativePostJson(
+        'https://www.youtube.com/youtubei/v1/next?prettyPrint=false',
+        buildInnertubeNextBody(seedTrack.youtubeId),
+        8500
+      );
+      if (nextRes?.ok && nextRes.text) {
+        const parsed = extractYouTubeRelatedResults(nextRes.text, seedTrack.youtubeId);
+        for (const t of toYouTubeTracks(parsed, seedTrack.genre, {
+          autoQueued: true,
+          albumLabel: 'YouTube Radio Up Next',
+        })) {
+          if (!seenIds.has(t.id)) {
+            seenIds.add(t.id);
+            collected.push(t);
+          }
+        }
+      }
+    }
+
+    if (seedTrack.youtubeId && collected.length < 4) {
       const watchRes = await nativeFetchText(
-        `https://www.youtube.com/watch?v=${encodeURIComponent(seedTrack.youtubeId)}`,
+        `https://www.youtube.com/watch?v=${encodeURIComponent(seedTrack.youtubeId)}&gl=US&hl=en&persist_gl=1&persist_hl=1`,
         8500
       );
       if (watchRes?.ok && watchRes.text) {
@@ -66,7 +97,7 @@ export async function fetchRelatedRadioTracks(
       const radioQuery = buildRadioSeedQuery(seedTrack);
       const nativeRelated = await searchYouTubeNatively(
         radioQuery,
-        seedTrack.genre || '',
+        seedTrack.genre && seedTrack.genre !== 'YouTube' ? seedTrack.genre : '',
         'songs',
         seedTrack.youtubeId
       );
@@ -131,11 +162,13 @@ export async function fetchRelatedRadioTracks(
     // Offline fallback below
   }
 
-  // 4. Offline curated bank fallback matching genre/energy
+  // 4. Offline curated bank fallback matching specific genre only (never mix unrelated genres)
   const seedGenre = (seedTrack.genre || '').toLowerCase();
-  const matched = CURATED_STREAM_BANK.filter(
-    (t) => !excluded.has(t.id) && (!seedGenre || (t.genre || '').toLowerCase() === seedGenre)
-  );
-  const pool = matched.length > 0 ? matched : CURATED_STREAM_BANK.filter((t) => !excluded.has(t.id));
-  return pool.slice(0, 6).map((t) => ({ ...t, autoQueued: true }));
+  if (seedGenre && !['youtube', 'stream', 'radio', 'local'].includes(seedGenre)) {
+    const matched = CURATED_STREAM_BANK.filter(
+      (t) => !excluded.has(t.id) && (t.genre || '').toLowerCase() === seedGenre
+    );
+    return matched.slice(0, 6).map((t) => ({ ...t, autoQueued: true }));
+  }
+  return [];
 }

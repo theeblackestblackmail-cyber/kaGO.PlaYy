@@ -235,7 +235,7 @@ export function readNativeDocumentBytes(uri: string, expectedSize = 0): Uint8Arr
   if (typeof reader !== 'function') return null;
 
   const MAX_IMPORT_BYTES = 35 * 1024 * 1024;
-  const CHUNK_SIZE = 512 * 1024;
+  const CHUNK_SIZE = 1024 * 1024;
   const limit = expectedSize > 0 ? Math.min(expectedSize, MAX_IMPORT_BYTES) : MAX_IMPORT_BYTES;
 
   const chunks: Uint8Array[] = [];
