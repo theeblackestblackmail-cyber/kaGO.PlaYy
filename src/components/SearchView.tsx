@@ -19,13 +19,23 @@ import type { AudioEngineSnapshot, Track } from '../types/audio';
 import { formatDuration } from '../utils/lrcParser';
 import { triggerHaptic } from '../utils/haptics';
 import {
+  analyzeTrackContentProfile,
   nextDiscoveryVisitSeed,
-  pickDiscoveryFeedQuery,
-  pickDynamicPopularSearches,
+  pickContentBasedPopularSearches,
+  rankContentBasedCandidates,
+  readDiscoveryHistory,
+  readDiscoveryText,
+  readSessionSeenSongKeys,
   rotateCuratedFallbackTracks,
+  writeDiscoveryHistory,
+  writeDiscoveryText,
 } from '../utils/streamDiscovery';
 import { pushRecentSearch } from '../utils/streamFilter';
-import { fetchMusicSuggestions, searchStreamsUnified } from '../utils/streamSearch';
+import {
+  fetchDiverseDiscoveryFeed,
+  fetchMusicSuggestions,
+  searchStreamsUnified,
+} from '../utils/streamSearch';
 
 interface SearchViewProps {
   libraryTracks: Track[];
@@ -40,37 +50,8 @@ interface SearchViewProps {
 
 const SEARCH_POPULAR_STORAGE_KEY = 'kago_search_last_popular';
 const SEARCH_FEED_STORAGE_KEY = 'kago_search_last_feed_query';
-
-function readStoredArray(key: string): string[] {
-  try {
-    if (typeof sessionStorage === 'undefined') return [];
-    const raw = sessionStorage.getItem(key);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
-  } catch {
-    return [];
-  }
-}
-
-function readStoredText(key: string): string {
-  try {
-    if (typeof sessionStorage === 'undefined') return '';
-    return sessionStorage.getItem(key) || '';
-  } catch {
-    return '';
-  }
-}
-
-function writeSessionText(key: string, value: string): void {
-  try {
-    if (typeof sessionStorage !== 'undefined') {
-      sessionStorage.setItem(key, value);
-    }
-  } catch {
-    // Ignore storage quota / privacy restrictions
-  }
-}
+const SEARCH_SEEDS_STORAGE_KEY = 'kago_search_last_seeds';
+const SEARCH_SESSION_SEEN_KEY = 'kago_search_session_seen';
 
 export const SearchView: React.FC<SearchViewProps> = ({
   libraryTracks,
@@ -83,10 +64,21 @@ export const SearchView: React.FC<SearchViewProps> = ({
   onPickFolder,
 }) => {
   const [visitSeed] = useState<number>(() => nextDiscoveryVisitSeed('kago_search_visit_seed'));
+  const currentContentProfile = useMemo(
+    () => analyzeTrackContentProfile(engine.currentTrack),
+    [engine.currentTrack]
+  );
+
   const [popularSearches, setPopularSearches] = useState<string[]>(() => {
-    const prev = readStoredArray(SEARCH_POPULAR_STORAGE_KEY);
-    const next = pickDynamicPopularSearches(5, visitSeed, ['Drake Hotline Bling', ...prev]);
-    writeSessionText(SEARCH_POPULAR_STORAGE_KEY, JSON.stringify(next));
+    const prev = readDiscoveryHistory(SEARCH_POPULAR_STORAGE_KEY);
+    const initialProfile = analyzeTrackContentProfile(engine.currentTrack);
+    const next = pickContentBasedPopularSearches(
+      5,
+      visitSeed,
+      ['Drake Hotline Bling', ...prev],
+      initialProfile
+    );
+    writeDiscoveryHistory(SEARCH_POPULAR_STORAGE_KEY, next);
     return next;
   });
 
@@ -101,6 +93,12 @@ export const SearchView: React.FC<SearchViewProps> = ({
   const [hasSearchedOnline, setHasSearchedOnline] = useState(false);
 
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
+  const searchRequestIdRef = useRef(0);
+  const streamResultsRef = useRef<Track[]>([]);
+  streamResultsRef.current = streamResults;
+  const loadedAnchorTrackIdRef = useRef<string | null | undefined>(undefined);
+  const currentTrackRef = useRef<Track | null>(engine.currentTrack);
+  currentTrackRef.current = engine.currentTrack;
 
   useEffect(() => {
     localDb.saveRecentSearches(recentSearches);
@@ -116,41 +114,82 @@ export const SearchView: React.FC<SearchViewProps> = ({
     return () => document.removeEventListener('mousedown', onDocClick);
   }, []);
 
-  // Load dynamic recommended discovery streams on mount
-  useEffect(() => {
-    let cancelled = false;
-    const prevQ = readStoredText(SEARCH_FEED_STORAGE_KEY);
-    const discoveryQuery = pickDiscoveryFeedQuery(visitSeed, prevQ);
-    writeSessionText(SEARCH_FEED_STORAGE_KEY, discoveryQuery);
-
-    const loadDiscovery = async () => {
+  const loadDiverseRecommendations = useCallback(
+    async (seed: number, anchorTrack: Track | null = currentTrackRef.current) => {
+      const reqId = ++searchRequestIdRef.current;
+      loadedAnchorTrackIdRef.current = anchorTrack?.id ?? null;
       setIsSearching(true);
-      try {
-        const { tracks: liveSongs } = await searchStreamsUnified({
-          query: discoveryQuery,
-          category: 'all',
+
+      const fallbackForAnchor = () => {
+        const profile = analyzeTrackContentProfile(anchorTrack);
+        const seenKeys = readSessionSeenSongKeys(SEARCH_SESSION_SEEN_KEY);
+        const rankedFallback = rankContentBasedCandidates(CURATED_STREAM_BANK, profile, {
+          seenSongKeys: seenKeys,
+          visitSeed: seed,
+          maxResults: 9,
         });
-        if (cancelled) return;
-        setStreamResults(
-          liveSongs.length > 0
-            ? liveSongs
-            : rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed)
-        );
+        return rankedFallback.length > 0
+          ? rankedFallback
+          : rotateCuratedFallbackTracks(CURATED_STREAM_BANK, seed);
+      };
+
+      try {
+        const prevFeedQuery = readDiscoveryText(SEARCH_FEED_STORAGE_KEY);
+        const prevSeeds = readDiscoveryHistory(SEARCH_SEEDS_STORAGE_KEY);
+        const feed = await fetchDiverseDiscoveryFeed({
+          visitSeed: seed,
+          currentTrack: anchorTrack,
+          previousSeeds: prevSeeds,
+          previousFeedQuery: prevFeedQuery,
+          targetCount: 12,
+          sessionSeenStorageKey: SEARCH_SESSION_SEEN_KEY,
+        });
+        if (searchRequestIdRef.current !== reqId) return;
+        if (feed.usedFeedQuery) {
+          writeDiscoveryText(SEARCH_FEED_STORAGE_KEY, feed.usedFeedQuery);
+        }
+        if (feed.usedSeeds.length > 0) {
+          writeDiscoveryHistory(SEARCH_SEEDS_STORAGE_KEY, feed.usedSeeds);
+        }
+        setStreamResults(feed.tracks.length > 0 ? feed.tracks : fallbackForAnchor());
       } catch {
-        if (cancelled) return;
-        setStreamResults(rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed));
+        if (searchRequestIdRef.current !== reqId) return;
+        setStreamResults(fallbackForAnchor());
       } finally {
-        if (!cancelled) {
+        if (searchRequestIdRef.current === reqId) {
           setIsSearching(false);
         }
       }
-    };
+    },
+    []
+  );
 
-    void loadDiscovery();
-    return () => {
-      cancelled = true;
-    };
-  }, [visitSeed]);
+  // Load content-based recommendations on mount and when playback switches externally
+  useEffect(() => {
+    const activeId = engine.currentTrack?.id ?? null;
+    if (loadedAnchorTrackIdRef.current === activeId) return;
+    if (query.trim() || hasSearchedOnline) return;
+
+    // Avoid shuffling cards out from under the user's finger when they tap Play inside this grid
+    const playedFromGrid =
+      activeId !== null && streamResultsRef.current.some((t) => t.id === activeId);
+    if (loadedAnchorTrackIdRef.current !== undefined && playedFromGrid) {
+      loadedAnchorTrackIdRef.current = activeId;
+      return;
+    }
+
+    const nextSeed =
+      loadedAnchorTrackIdRef.current === undefined
+        ? visitSeed
+        : nextDiscoveryVisitSeed('kago_search_visit_seed');
+    const profile = analyzeTrackContentProfile(engine.currentTrack);
+    setPopularSearches((prev) => {
+      const next = pickContentBasedPopularSearches(5, nextSeed, prev, profile);
+      writeDiscoveryHistory(SEARCH_POPULAR_STORAGE_KEY, next);
+      return next;
+    });
+    void loadDiverseRecommendations(nextSeed, engine.currentTrack);
+  }, [engine.currentTrack, hasSearchedOnline, loadDiverseRecommendations, query, visitSeed]);
 
   // Live YouTube autocomplete suggestions
   useEffect(() => {
@@ -191,17 +230,28 @@ export const SearchView: React.FC<SearchViewProps> = ({
     triggerHaptic('light');
     const nextSeed = nextDiscoveryVisitSeed('kago_search_visit_seed');
     setPopularSearches((prev) => {
-      const next = pickDynamicPopularSearches(5, nextSeed, prev);
-      writeSessionText(SEARCH_POPULAR_STORAGE_KEY, JSON.stringify(next));
+      const next = pickContentBasedPopularSearches(
+        5,
+        nextSeed,
+        prev,
+        currentContentProfile
+      );
+      writeDiscoveryHistory(SEARCH_POPULAR_STORAGE_KEY, next);
       return next;
     });
-  }, []);
+  }, [currentContentProfile]);
 
   const executeOnlineSearch = async (searchText: string) => {
     const cleanQ = searchText.trim();
     setShowSuggestions(false);
-    if (!cleanQ) return;
+    if (!cleanQ) {
+      setHasSearchedOnline(false);
+      const nextSeed = nextDiscoveryVisitSeed('kago_search_visit_seed');
+      await loadDiverseRecommendations(nextSeed, engine.currentTrack);
+      return;
+    }
 
+    const reqId = ++searchRequestIdRef.current;
     setRecentSearches((prev) => pushRecentSearch(prev, cleanQ));
 
     setIsSearching(true);
@@ -212,13 +262,16 @@ export const SearchView: React.FC<SearchViewProps> = ({
         query: cleanQ,
         category: 'all',
       });
+      if (searchRequestIdRef.current !== reqId) return;
       setStreamResults(
         liveSongs.length > 0
           ? liveSongs
           : rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed)
       );
     } finally {
-      setIsSearching(false);
+      if (searchRequestIdRef.current === reqId) {
+        setIsSearching(false);
+      }
     }
   };
 
@@ -456,13 +509,42 @@ export const SearchView: React.FC<SearchViewProps> = ({
 
       {/* Online YouTube & Stream Results */}
       <section className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h2 className="font-display text-base sm:text-lg font-bold text-[#F4F3F0]">
-            {hasSearchedOnline ? 'YouTube & Stream Matches' : 'Recommended Streams'}
-          </h2>
-          <span className="font-mono-tabular text-xs text-[#8E929B]">
-            {streamResults.length} results
-          </span>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="min-w-0">
+            <h2 className="font-display text-base sm:text-lg font-bold text-[#F4F3F0]">
+              {hasSearchedOnline
+                ? 'YouTube & Stream Matches'
+                : currentContentProfile
+                  ? `Recommended for "${engine.currentTrack?.title}"`
+                  : 'Recommended Streams'}
+            </h2>
+            {!hasSearchedOnline && currentContentProfile?.resolvedGenre && (
+              <p className="mt-0.5 text-[11px] text-[#8E929B] truncate">
+                Content-matched {currentContentProfile.resolvedGenre} picks · unique every session
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-2.5">
+            {!hasSearchedOnline && (
+              <button
+                type="button"
+                data-testid="search-refresh-recommendations"
+                disabled={isSearching}
+                onClick={() => {
+                  triggerHaptic('light');
+                  const nextSeed = nextDiscoveryVisitSeed('kago_search_visit_seed');
+                  void loadDiverseRecommendations(nextSeed, engine.currentTrack);
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-[#252834] bg-[#14161D] px-2.5 py-1 text-xs font-semibold text-[#D1D5DB] hover:border-[#E11D48] hover:text-white disabled:opacity-50 transition-colors whitespace-nowrap cursor-pointer"
+              >
+                <RefreshCw className={`h-3 w-3 ${isSearching ? 'animate-spin' : ''}`} />
+                <span>Refresh Mix</span>
+              </button>
+            )}
+            <span className="font-mono-tabular text-xs text-[#8E929B]">
+              {streamResults.length} results
+            </span>
+          </div>
         </div>
 
         {isSearching && streamResults.length === 0 ? (

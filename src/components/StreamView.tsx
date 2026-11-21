@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   BadgeCheck,
@@ -29,14 +29,21 @@ import { formatDuration } from '../utils/lrcParser';
 import { triggerHaptic } from '../utils/haptics';
 import { hasNativeHttpBridge } from '../utils/nativeMediaBridge';
 import {
+  analyzeTrackContentProfile,
   nextDiscoveryVisitSeed,
-  pickDiscoveryFeedQuery,
-  pickDynamicPopularSearches,
+  pickContentBasedPopularSearches,
+  rankContentBasedCandidates,
+  readDiscoveryHistory,
+  readDiscoveryText,
+  readSessionSeenSongKeys,
   rotateCuratedFallbackTracks,
+  writeDiscoveryHistory,
+  writeDiscoveryText,
 } from '../utils/streamDiscovery';
 import { pushRecentSearch } from '../utils/streamFilter';
 import { fetchYouTubePlaylistByUrlOrId } from '../utils/youtubePlaylist';
 import {
+  fetchDiverseDiscoveryFeed,
   fetchMusicSuggestions,
   searchStreamsUnified,
   searchYouTubeNatively,
@@ -66,37 +73,8 @@ const STREAM_CATEGORIES: Array<{ id: StreamSearchCategory; label: string }> = [
 
 const POPULAR_PICKS_STORAGE_KEY = 'kago_last_popular_picks';
 const FEED_QUERY_STORAGE_KEY = 'kago_last_stream_feed_query';
-
-function readStoredStringArray(key: string): string[] {
-  try {
-    if (typeof sessionStorage === 'undefined') return [];
-    const raw = sessionStorage.getItem(key);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
-  } catch {
-    return [];
-  }
-}
-
-function readStoredString(key: string): string {
-  try {
-    if (typeof sessionStorage === 'undefined') return '';
-    return sessionStorage.getItem(key) || '';
-  } catch {
-    return '';
-  }
-}
-
-function writeSessionValue(key: string, value: string): void {
-  try {
-    if (typeof sessionStorage !== 'undefined') {
-      sessionStorage.setItem(key, value);
-    }
-  } catch {
-    // Ignore storage quota / privacy restrictions
-  }
-}
+const STREAM_SEEDS_STORAGE_KEY = 'kago_last_stream_seeds';
+const STREAM_SESSION_SEEN_KEY = 'kago_stream_session_seen';
 
 function formatCompactViews(views?: number): string {
   if (!views || views <= 0) return '';
@@ -117,19 +95,27 @@ export const StreamView: React.FC<StreamViewProps> = ({
   onSaveCollectionAsPlaylist,
 }) => {
   const [visitSeed] = useState<number>(() => nextDiscoveryVisitSeed('kago_stream_visit_seed'));
-  const [popularPicks, setPopularPicks] = useState<string[]>(() => {
-    const previousPicks = readStoredStringArray(POPULAR_PICKS_STORAGE_KEY);
-    const next = pickDynamicPopularSearches(5, visitSeed, [
-      'Drake Hotline Bling',
-      ...previousPicks,
-    ]);
-    writeSessionValue(POPULAR_PICKS_STORAGE_KEY, JSON.stringify(next));
-    return next;
-  });
-
   const [query, setQuery] = useState('');
   const [selectedGenre, setSelectedGenre] = useState<string>('');
   const [selectedCategory, setSelectedCategory] = useState<StreamSearchCategory>('all');
+  const currentContentProfile = useMemo(
+    () => analyzeTrackContentProfile(engine.currentTrack, selectedGenre),
+    [engine.currentTrack, selectedGenre]
+  );
+
+  const [popularPicks, setPopularPicks] = useState<string[]>(() => {
+    const previousPicks = readDiscoveryHistory(POPULAR_PICKS_STORAGE_KEY);
+    const initialProfile = analyzeTrackContentProfile(engine.currentTrack);
+    const next = pickContentBasedPopularSearches(
+      5,
+      visitSeed,
+      ['Drake Hotline Bling', ...previousPicks],
+      initialProfile
+    );
+    writeDiscoveryHistory(POPULAR_PICKS_STORAGE_KEY, next);
+    return next;
+  });
+
   const [recentSearches, setRecentSearches] = useState<string[]>(() =>
     localDb.loadRecentSearches()
   );
@@ -147,6 +133,9 @@ export const StreamView: React.FC<StreamViewProps> = ({
   const [statusNote, setStatusNote] = useState<string>('');
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
   const searchRequestIdRef = useRef(0);
+  const resultsRef = useRef<Track[]>([]);
+  resultsRef.current = results;
+  const loadedAnchorTrackIdRef = useRef<string | null | undefined>(undefined);
 
   useEffect(() => {
     localDb.saveRecentSearches(recentSearches);
@@ -162,33 +151,83 @@ export const StreamView: React.FC<StreamViewProps> = ({
     return () => document.removeEventListener('mousedown', onDocClick);
   }, []);
 
-  // Load a fresh discovery feed on mount instead of showing static default cards
+  // Load content-based discovery feed on mount and when playback switches externally
   useEffect(() => {
+    const activeId = engine.currentTrack?.id ?? null;
+    if (loadedAnchorTrackIdRef.current === activeId) return;
+    if (query.trim() || inspectedCollection) return;
+
+    // Preserve visible cards when user plays directly from this grid
+    const playedFromGrid =
+      activeId !== null && resultsRef.current.some((t) => t.id === activeId);
+    if (loadedAnchorTrackIdRef.current !== undefined && playedFromGrid) {
+      loadedAnchorTrackIdRef.current = activeId;
+      return;
+    }
+    if (loadedAnchorTrackIdRef.current !== undefined && (selectedGenre || selectedCategory !== 'all')) {
+      return;
+    }
+
+    const isInitialMount = loadedAnchorTrackIdRef.current === undefined;
+    loadedAnchorTrackIdRef.current = activeId;
+
+    const effectiveSeed = isInitialMount
+      ? visitSeed
+      : nextDiscoveryVisitSeed('kago_stream_visit_seed');
+
+    if (!isInitialMount) {
+      const profile = analyzeTrackContentProfile(engine.currentTrack, selectedGenre);
+      setPopularPicks((prev) => {
+        const next = pickContentBasedPopularSearches(5, effectiveSeed, prev, profile);
+        writeDiscoveryHistory(POPULAR_PICKS_STORAGE_KEY, next);
+        return next;
+      });
+    }
+
     const reqId = ++searchRequestIdRef.current;
-    const prevFeedQuery = readStoredString(FEED_QUERY_STORAGE_KEY);
-    const discoveryQuery = pickDiscoveryFeedQuery(visitSeed, prevFeedQuery);
-    writeSessionValue(FEED_QUERY_STORAGE_KEY, discoveryQuery);
+    const prevFeedQuery = readDiscoveryText(FEED_QUERY_STORAGE_KEY);
+    const prevSeeds = readDiscoveryHistory(STREAM_SEEDS_STORAGE_KEY);
 
     const loadInitialFeed = async () => {
       setIsLoading(true);
+      const buildFallback = () => {
+        const profile = analyzeTrackContentProfile(engine.currentTrack, selectedGenre);
+        const seenKeys = readSessionSeenSongKeys(STREAM_SESSION_SEEN_KEY);
+        const ranked = rankContentBasedCandidates(CURATED_STREAM_BANK, profile, {
+          seenSongKeys: seenKeys,
+          visitSeed: effectiveSeed,
+          maxResults: 9,
+        });
+        return ranked.length > 0
+          ? ranked
+          : rotateCuratedFallbackTracks(CURATED_STREAM_BANK, effectiveSeed);
+      };
+
       try {
-        const { tracks: liveSongs, artists: liveArtists } = await searchStreamsUnified({
-          query: discoveryQuery,
-          genre: '',
-          category: 'all',
+        const feed = await fetchDiverseDiscoveryFeed({
+          visitSeed: effectiveSeed,
+          currentTrack: engine.currentTrack,
+          genre: selectedGenre,
+          category: selectedCategory,
+          previousSeeds: prevSeeds,
+          previousFeedQuery: prevFeedQuery,
+          targetCount: 15,
+          sessionSeenStorageKey: STREAM_SESSION_SEEN_KEY,
         });
         if (searchRequestIdRef.current !== reqId) return;
-        setArtistResults(liveArtists);
-        if (liveSongs.length > 0) {
-          setResults(liveSongs);
-        } else {
-          setResults(rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed));
+        if (feed.usedFeedQuery) {
+          writeDiscoveryText(FEED_QUERY_STORAGE_KEY, feed.usedFeedQuery);
         }
+        if (feed.usedSeeds.length > 0) {
+          writeDiscoveryHistory(STREAM_SEEDS_STORAGE_KEY, feed.usedSeeds);
+        }
+        setArtistResults(feed.artists);
+        setResults(feed.tracks.length > 0 ? feed.tracks : buildFallback());
       } catch {
         if (searchRequestIdRef.current !== reqId) return;
         setArtistResults([]);
-        setResults(rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed));
-        setStatusNote('Offline fallback active — rotating local discovery mix.');
+        setResults(buildFallback());
+        setStatusNote('Offline fallback active — rotating content-matched mix.');
       } finally {
         if (searchRequestIdRef.current === reqId) {
           setIsLoading(false);
@@ -197,7 +236,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
     };
 
     void loadInitialFeed();
-  }, [visitSeed]);
+  }, [engine.currentTrack, inspectedCollection, query, selectedCategory, selectedGenre, visitSeed]);
 
   // Debounced YouTube popular search suggestions (works both on server and natively inside Android APK)
   useEffect(() => {
@@ -225,11 +264,16 @@ export const StreamView: React.FC<StreamViewProps> = ({
     triggerHaptic('light');
     const freshSeed = nextDiscoveryVisitSeed('kago_stream_visit_seed');
     setPopularPicks((prev) => {
-      const next = pickDynamicPopularSearches(5, freshSeed, prev);
-      writeSessionValue(POPULAR_PICKS_STORAGE_KEY, JSON.stringify(next));
+      const next = pickContentBasedPopularSearches(
+        5,
+        freshSeed,
+        prev,
+        currentContentProfile
+      );
+      writeDiscoveryHistory(POPULAR_PICKS_STORAGE_KEY, next);
       return next;
     });
-  }, []);
+  }, [currentContentProfile]);
 
   const executeSearch = async (
     searchText: string,
@@ -251,14 +295,50 @@ export const StreamView: React.FC<StreamViewProps> = ({
     setStatusNote('');
 
     try {
-      const effectiveQuery =
-        cleanQ || genreFilter
-          ? cleanQ
-          : pickDiscoveryFeedQuery(nextDiscoveryVisitSeed('kago_stream_visit_seed'));
+      const freshSeed = nextDiscoveryVisitSeed('kago_stream_visit_seed');
+      const rotatedFallback = rotateCuratedFallbackTracks(CURATED_STREAM_BANK, freshSeed);
+
+      if (!cleanQ) {
+        const prevFeedQuery = readDiscoveryText(FEED_QUERY_STORAGE_KEY);
+        const prevSeeds = readDiscoveryHistory(STREAM_SEEDS_STORAGE_KEY);
+        const feed = await fetchDiverseDiscoveryFeed({
+          visitSeed: freshSeed,
+          currentTrack: engine.currentTrack,
+          genre: genreFilter,
+          category,
+          previousSeeds: prevSeeds,
+          previousFeedQuery: prevFeedQuery,
+          targetCount: 15,
+          sessionSeenStorageKey: STREAM_SESSION_SEEN_KEY,
+        });
+        if (searchRequestIdRef.current !== reqId) return;
+        if (feed.usedFeedQuery) {
+          writeDiscoveryText(FEED_QUERY_STORAGE_KEY, feed.usedFeedQuery);
+        }
+        if (feed.usedSeeds.length > 0) {
+          writeDiscoveryHistory(STREAM_SEEDS_STORAGE_KEY, feed.usedSeeds);
+        }
+        setArtistResults(feed.artists);
+        const profile = analyzeTrackContentProfile(engine.currentTrack, genreFilter);
+        const seenKeys = readSessionSeenSongKeys(STREAM_SESSION_SEEN_KEY);
+        const localMatches = rankContentBasedCandidates(
+          CURATED_STREAM_BANK.filter(
+            (item) => !genreFilter || item.genre?.toLowerCase() === genreFilter.toLowerCase()
+          ),
+          profile,
+          { seenSongKeys: seenKeys, visitSeed: freshSeed, maxResults: 9 }
+        );
+        const merged = feed.tracks.length > 0 ? feed.tracks : localMatches;
+        setResults(merged.length > 0 ? merged : category === 'artists' ? [] : rotatedFallback);
+        if (feed.source === 'fallback' && feed.tracks.length === 0 && feed.artists.length === 0) {
+          setStatusNote('Showing rotated offline sound bank tracks.');
+        }
+        return;
+      }
 
       const { tracks: liveSongs, artists: liveArtists, source: sourceFlag } =
         await searchStreamsUnified({
-          query: effectiveQuery,
+          query: cleanQ,
           genre: genreFilter,
           category,
         });
@@ -267,7 +347,6 @@ export const StreamView: React.FC<StreamViewProps> = ({
 
       setArtistResults(liveArtists);
 
-      const rotatedFallback = rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed);
       const localMatches = rotatedFallback.filter((item) => {
         const matchesGenre = !genreFilter || item.genre?.toLowerCase() === genreFilter.toLowerCase();
         const matchesQuery =
@@ -282,9 +361,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
       setResults(merged.length > 0 ? merged : category === 'artists' ? [] : rotatedFallback);
       if (sourceFlag === 'fallback' && liveSongs.length === 0 && liveArtists.length === 0) {
         setStatusNote(
-          cleanQ
-            ? `No official stream matched "${cleanQ}". Showing rotated offline sound bank.`
-            : 'Showing rotated offline sound bank tracks.'
+          `No official stream matched "${cleanQ}". Showing rotated offline sound bank.`
         );
       }
     } catch {
@@ -998,7 +1075,47 @@ export const StreamView: React.FC<StreamViewProps> = ({
 
       {/* 3-Column Stream Results Grid */}
       {!inspectedCollection && results.length > 0 && (
-        <section className="kago-panel-enter grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <section className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="min-w-0">
+              <h2 className="font-display text-sm font-bold uppercase tracking-wider text-[#9CA3AF]">
+                {query.trim()
+                  ? 'Stream Results'
+                  : selectedGenre
+                    ? `${selectedGenre} Discovery Mix`
+                    : engine.currentTrack
+                      ? `Tailored to "${engine.currentTrack.title}"`
+                      : 'Discover Streams'}
+              </h2>
+              {!query.trim() && !selectedGenre && currentContentProfile?.resolvedGenre && (
+                <p className="mt-0.5 text-[11px] text-[#8E929B] truncate">
+                  Content-matched {currentContentProfile.resolvedGenre} recommendations · unique every session
+                </p>
+              )}
+            </div>
+            <div className="flex items-center gap-2.5">
+              {!query.trim() && (
+                <button
+                  type="button"
+                  data-testid="stream-refresh-recommendations"
+                  disabled={isLoading}
+                  onClick={() => {
+                    triggerHaptic('light');
+                    void executeSearch('', selectedGenre, selectedCategory);
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-[#252834] bg-[#14161D] px-2.5 py-1 text-xs font-semibold text-[#D1D5DB] hover:border-[#E11D48] hover:text-white disabled:opacity-50 transition-colors whitespace-nowrap cursor-pointer"
+                >
+                  <RefreshCw className={`h-3 w-3 ${isLoading ? 'animate-spin' : ''}`} />
+                  <span>Refresh Mix</span>
+                </button>
+              )}
+              <span className="font-mono-tabular text-xs text-[#6B7280]">
+                {results.length} {results.length === 1 ? 'result' : 'results'}
+              </span>
+            </div>
+          </div>
+
+          <div className="kago-panel-enter grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {results.map((track) => {
             const isCurrent = engine.currentTrack?.id === track.id;
             const isTrackPlaying = isCurrent && engine.isPlaying;
@@ -1240,6 +1357,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
               </article>
             );
           })}
+          </div>
         </section>
       )}
     </div>

@@ -6,11 +6,22 @@ import {
   nativePostJson,
 } from './nativeMediaBridge';
 import {
+  analyzeTrackContentProfile,
+  buildContentBasedQueries,
+  deduplicateDiverseTracks,
+  markSessionSeenSongs,
+  rankContentBasedCandidates,
+  readSessionSeenSongKeys,
+  type TrackContentProfile,
+} from './streamDiscovery';
+import {
   buildCategorySearchPlan,
+  buildInnertubeNextBody,
   buildInnertubeSearchBody,
   extractYouTubeArtists,
   extractYouTubeCollections,
   extractYouTubePodcasts,
+  extractYouTubeRelatedResults,
   extractYouTubeSearchResults,
   filterMusicSuggestions,
   filterRelevantAudiusTracks,
@@ -328,3 +339,200 @@ export async function searchStreamsUnified(params: {
     provider,
   };
 }
+
+async function fetchRelatedApiCandidates(seedTrack: Track): Promise<Track[]> {
+  // 1. Server /api/stream/related (YouTube Watch Next + Radio)
+  try {
+    const qs = new URLSearchParams();
+    if (seedTrack.youtubeId) qs.set('youtubeId', seedTrack.youtubeId);
+    if (seedTrack.title) qs.set('title', seedTrack.title);
+    if (seedTrack.artist) qs.set('artist', seedTrack.artist);
+    if (seedTrack.genre) qs.set('genre', seedTrack.genre);
+
+    const res = await fetch(`/api/stream/related?${qs.toString()}`);
+    if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
+      const data = (await res.json()) as { results?: Track[] };
+      const valid = (data.results || []).filter((t) =>
+        isIndividualSong(t.title, t.album, t.duration)
+      );
+      if (valid.length > 0) return valid;
+    }
+  } catch {
+    // Fall through to native bridge
+  }
+
+  // 2. Native Android APK Watch Next fallback
+  if (seedTrack.youtubeId && hasNativeHttpBridge() && hasNativeHttpPostBridge()) {
+    try {
+      const nextRes = await nativePostJson(
+        'https://www.youtube.com/youtubei/v1/next?prettyPrint=false',
+        buildInnertubeNextBody(seedTrack.youtubeId),
+        8000
+      );
+      if (nextRes?.ok && nextRes.text) {
+        const parsed = extractYouTubeRelatedResults(nextRes.text, seedTrack.youtubeId);
+        return toYouTubeTracks(parsed, seedTrack.genre, {
+          albumLabel: 'Recommended Radio',
+        });
+      }
+    } catch {
+      // Ignore native bridge error
+    }
+  }
+
+  return [];
+}
+
+export async function fetchDiverseDiscoveryFeed(params: {
+  visitSeed: number;
+  currentTrack?: Track | null;
+  genre?: string;
+  category?: StreamSearchCategory;
+  previousSeeds?: readonly string[];
+  previousFeedQuery?: string;
+  targetCount?: number;
+  sessionSeenStorageKey?: string;
+}): Promise<{
+  tracks: Track[];
+  artists: StreamArtistResult[];
+  source: 'live' | 'fallback';
+  usedSeeds: string[];
+  usedFeedQuery: string;
+  profile: TrackContentProfile | null;
+}> {
+  const genre = (params.genre || '').trim();
+  const category: StreamSearchCategory = params.category || 'all';
+  const targetCount = params.targetCount ?? 12;
+  const sessionKey = params.sessionSeenStorageKey || 'kago_session_seen_songs';
+
+  const profile = analyzeTrackContentProfile(params.currentTrack, genre);
+  const effectiveGenre = genre || profile?.resolvedGenre || '';
+  const seenSongKeys = readSessionSeenSongKeys(sessionKey);
+
+  const { seeds, broadQuery } = buildContentBasedQueries(
+    profile,
+    params.visitSeed,
+    params.previousSeeds || [],
+    params.previousFeedQuery,
+    genre
+  );
+
+  const isCollectionOrPodcast =
+    category === 'albums' ||
+    category === 'playlists' ||
+    category === 'featured_playlists' ||
+    category === 'podcasts';
+
+  if (isCollectionOrPodcast || category === 'artists') {
+    const res = await searchStreamsUnified({
+      query: broadQuery,
+      genre: effectiveGenre,
+      category,
+    });
+    const uniqueCollections = deduplicateDiverseTracks(
+      res.tracks.filter((t) => {
+        if (!profile) return true;
+        return t.id !== profile.trackId;
+      }),
+      {
+        maxPerSong: 1,
+        maxPerArtist: 2,
+        maxResults: targetCount,
+      }
+    );
+    return {
+      tracks: uniqueCollections,
+      artists: res.artists,
+      source: res.source,
+      usedSeeds: [],
+      usedFeedQuery: broadQuery,
+      profile,
+    };
+  }
+
+  const queryCategory: StreamSearchCategory = category === 'videos' ? 'videos' : 'songs';
+
+  const relatedPromise: Promise<Track[]> =
+    params.currentTrack && category !== 'videos'
+      ? fetchRelatedApiCandidates(params.currentTrack)
+      : Promise.resolve([]);
+
+  const [relatedSettled, broadResult, ...seedResults] = await Promise.allSettled([
+    relatedPromise,
+    searchStreamsUnified({
+      query: broadQuery,
+      genre: effectiveGenre,
+      category,
+    }),
+    ...seeds.map((seedQuery) =>
+      searchStreamsUnified({
+        query: seedQuery,
+        genre: effectiveGenre,
+        category: queryCategory,
+      })
+    ),
+  ]);
+
+  const collectedTracks: Track[] = [];
+  const collectedArtists: StreamArtistResult[] = [];
+  const seenArtists = new Set<string>();
+  let anyLive = false;
+
+  // 1. Add content-matched Watch Next / related API results from currentTrack metadata
+  if (relatedSettled.status === 'fulfilled' && relatedSettled.value.length > 0) {
+    anyLive = true;
+    collectedTracks.push(...relatedSettled.value);
+  }
+
+  // 2. From each distinct content-based seed query, pick up to 2 top non-duplicate tracks
+  for (const settled of seedResults) {
+    if (settled.status !== 'fulfilled') continue;
+    const val = settled.value;
+    if (val.source === 'live' && val.tracks.length > 0) anyLive = true;
+    if (val.tracks.length > 0) {
+      collectedTracks.push(...val.tracks.slice(0, 2));
+    }
+    for (const a of val.artists) {
+      const k = a.name.toLowerCase();
+      if (!seenArtists.has(k)) {
+        seenArtists.add(k);
+        collectedArtists.push(a);
+      }
+    }
+  }
+
+  // 3. Append broad multi-artist chart/genre search matches
+  if (broadResult.status === 'fulfilled') {
+    const val = broadResult.value;
+    if (val.source === 'live' && val.tracks.length > 0) anyLive = true;
+    collectedTracks.push(...val.tracks);
+    for (const a of val.artists) {
+      const k = a.name.toLowerCase();
+      if (!seenArtists.has(k)) {
+        seenArtists.add(k);
+        collectedArtists.push(a);
+      }
+    }
+  }
+
+  // Score by content similarity + novelty (unseen this session), then enforce 1 song / 1 artist
+  const rankedTracks = rankContentBasedCandidates(collectedTracks, profile, {
+    seenSongKeys,
+    visitSeed: params.visitSeed,
+    maxResults: targetCount,
+  });
+
+  if (rankedTracks.length > 0) {
+    markSessionSeenSongs(rankedTracks, sessionKey);
+  }
+
+  return {
+    tracks: rankedTracks,
+    artists: collectedArtists,
+    source: anyLive && rankedTracks.length > 0 ? 'live' : 'fallback',
+    usedSeeds: seeds,
+    usedFeedQuery: broadQuery,
+    profile,
+  };
+}
+

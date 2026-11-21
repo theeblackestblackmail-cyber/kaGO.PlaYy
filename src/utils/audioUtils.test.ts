@@ -2108,3 +2108,202 @@ test('visualizer palette presets define Neon Pulse, Monochrome Noir, and Vibrant
     DEFAULT_VISUALIZER_PALETTE
   );
 });
+
+test('deduplicateDiverseTracks and canonicalSongKey collapse duplicate uploads of the same song and rotate seeds across visits', async () => {
+  const {
+    canonicalSongKey,
+    deduplicateDiverseTracks,
+    normalizeDiscoveryTitle,
+    pickDiscoveryFeedQuery,
+    pickDiverseDiscoverySeeds,
+  } = await import('./streamDiscovery');
+
+  assert.equal(
+    normalizeDiscoveryTitle('Lonely At The Top (Official Visualizer) [HD]'),
+    'lonely at the top'
+  );
+  assert.equal(
+    canonicalSongKey('Lonely At The Top (Acoustic)', 'Asake, H.E.R.'),
+    canonicalSongKey('Lonely At The Top (Official Video)', 'Asake - Topic')
+  );
+  assert.equal(
+    canonicalSongKey('Espresso (Official Audio)', 'Sabrina Carpenter'),
+    canonicalSongKey('Espresso [4K Music Video]', 'SabrinaCarpenterVEVO')
+  );
+  assert.equal(
+    canonicalSongKey('Espresso', 'Sabrina Carpenter'),
+    canonicalSongKey('Sabrina Carpenter - Espresso (Lyrics)', 'Sabrina Carpenter')
+  );
+
+  // Broad discovery feed queries must stay multi-artist charts/genres, never single songs
+  const singleSongsLower = new Set(['sabrina carpenter espresso', 'asake lonely at the top']);
+  for (let s = 1; s <= 12; s++) {
+    const q = pickDiscoveryFeedQuery(s * 97).toLowerCase();
+    assert.equal(singleSongsLower.has(q), false);
+  }
+
+  // Simulating YouTube returning 6 versions of "Espresso" + 6 versions of "Lonely At The Top" + other songs
+  const mkVariant = (id: string, title: string, artist: string): Track => ({
+    id,
+    youtubeId: id,
+    title,
+    artist,
+    album: 'YouTube Music Stream',
+    duration: 185,
+    source: 'stream',
+    addedAt: 1,
+  });
+
+  const duplicateHeavyPool: Track[] = [
+    mkVariant('yt-esp1', 'Espresso', 'Sabrina Carpenter'),
+    mkVariant('yt-esp2', 'Espresso (Official Audio)', 'Sabrina Carpenter'),
+    mkVariant('yt-esp3', 'Espresso (Lyric Video)', 'Sabrina Carpenter'),
+    mkVariant('yt-esp4', 'Espresso [Official Music Video]', 'Sabrina Carpenter - Topic'),
+    mkVariant('yt-esp5', 'Espresso (Acoustic)', 'Sabrina Carpenter'),
+    mkVariant('yt-asake1', 'Lonely At The Top', 'Asake'),
+    mkVariant('yt-asake2', 'Lonely At The Top (Official Visualizer)', 'Asake'),
+    mkVariant('yt-asake3', 'Lonely At The Top (Acoustic)', 'Asake, H.E.R.'),
+    mkVariant('yt-asake4', 'Lonely At The Top (Lyric Video)', 'Asake - Topic'),
+    mkVariant('yt-wknd', 'Timeless', 'The Weeknd'),
+    mkVariant('yt-kdot', 'Luther', 'Kendrick Lamar'),
+    mkVariant('yt-tems', 'Love Me JeJe', 'Tems'),
+    mkVariant('yt-rema', 'Ozeba', 'Rema'),
+  ];
+
+  const deduped = deduplicateDiverseTracks(duplicateHeavyPool, {
+    maxPerSong: 1,
+    maxPerArtist: 1,
+    maxResults: 12,
+  });
+
+  // Strictly 1 Espresso, 1 Lonely At The Top, plus the 4 other distinct artists = 6 unique songs
+  assert.equal(deduped.length, 6);
+  assert.deepEqual(
+    deduped.map((t) => t.id),
+    ['yt-esp1', 'yt-asake1', 'yt-wknd', 'yt-kdot', 'yt-tems', 'yt-rema']
+  );
+
+  // Consecutive visits exclude previously picked seeds so recommendations stay fresh on re-entry
+  const visit1Seeds = pickDiverseDiscoverySeeds(6, 1001);
+  const visit2Seeds = pickDiverseDiscoverySeeds(6, 2002, visit1Seeds);
+  assert.equal(visit1Seeds.length, 6);
+  assert.equal(visit2Seeds.length, 6);
+  assert.equal(visit2Seeds.some((s) => visit1Seeds.includes(s)), false);
+});
+
+test('content-based filtering analyzes current track metadata/genre, ranks matching candidates, and enforces session-unique picks', async () => {
+  const {
+    analyzeTrackContentProfile,
+    buildContentBasedQueries,
+    canonicalSongKey,
+    markSessionSeenSongs,
+    pickContentBasedPopularSearches,
+    rankContentBasedCandidates,
+    readSessionSeenSongKeys,
+  } = await import('./streamDiscovery');
+
+  const activeTrack: Track = {
+    id: 'yt-asake-1',
+    youtubeId: 'yt-asake-1',
+    title: 'Lonely At The Top (feat. H.E.R.) (Official Visualizer)',
+    artist: 'Asake - Topic',
+    album: 'Work Of Art',
+    genre: 'Afrobeats',
+    bpm: 104,
+    duration: 168,
+    source: 'stream',
+    addedAt: 1,
+  };
+
+  const profile = analyzeTrackContentProfile(activeTrack);
+  assert.ok(profile);
+  assert.equal(profile.cleanTitle, 'lonely at the top');
+  assert.equal(profile.primaryArtist, 'Asake');
+  assert.equal(profile.resolvedGenre, 'Afrobeats');
+  assert.equal(profile.cleanAlbum, 'Work Of Art');
+  assert.equal(profile.tempoMood, 'midtempo');
+  assert.ok(profile.collaborators.some((c) => c.toLowerCase().includes('h.e.r.')));
+  assert.ok(profile.keywords.includes('afrobeats'));
+
+  // Infer genre even when track.genre is generic "YouTube"
+  const inferredProfile = analyzeTrackContentProfile({
+    id: 'yt-burna',
+    title: 'City Boys',
+    artist: 'Burna Boy',
+    album: 'YouTube Music Stream',
+    genre: 'YouTube',
+    duration: 155,
+    source: 'stream',
+    addedAt: 2,
+  });
+  assert.equal(inferredProfile?.resolvedGenre, 'Afrobeats');
+  assert.equal(inferredProfile?.cleanAlbum, '');
+
+  const queryPlan = buildContentBasedQueries(profile, 777, ['Burna Boy City Boys']);
+  assert.ok(queryPlan.seeds.length >= 4);
+  assert.equal(
+    queryPlan.seeds.some((s) => s.toLowerCase().includes('lonely at the top')),
+    false
+  );
+  assert.equal(queryPlan.seeds.includes('Burna Boy City Boys'), false);
+  assert.match(queryPlan.broadQuery.toLowerCase(), /afrobeats/);
+
+  const mkCand = (
+    id: string,
+    title: string,
+    artist: string,
+    genre: string,
+    isOfficial = true
+  ): Track => ({
+    id,
+    youtubeId: id,
+    title,
+    artist,
+    album: `${genre} Cuts`,
+    genre,
+    duration: 195,
+    isOfficial,
+    source: 'stream',
+    addedAt: 1,
+  });
+
+  const candidates: Track[] = [
+    // Exact same song as currentTrack (must always be excluded)
+    mkCand('yt-asake-dup', 'Lonely At The Top (Acoustic)', 'Asake', 'Afrobeats'),
+    // Already seen in this session (must rank below unseen songs)
+    mkCand('yt-seen-afro', 'Essence', 'Wizkid', 'Afrobeats'),
+    // Unrelated genre
+    mkCand('yt-rock-1', 'Overdriven Amp', 'Static Foundry', 'Rock', false),
+    // Fresh Afrobeats + collaborator matches (must rank highest)
+    mkCand('yt-her-1', 'Damage', 'H.E.R.', 'R&B', true),
+    mkCand('yt-rema-1', 'Ozeba', 'Rema', 'Afrobeats', true),
+    mkCand('yt-ayra-1', 'Commas', 'Ayra Starr', 'Afrobeats', true),
+  ];
+
+  const sessionKey = 'test_session_seen_cb_1';
+  markSessionSeenSongs([candidates[1]], sessionKey);
+  const seenKeys = readSessionSeenSongKeys(sessionKey);
+  assert.ok(seenKeys.has(canonicalSongKey('Essence', 'Wizkid')));
+
+  const ranked = rankContentBasedCandidates(candidates, profile, {
+    seenSongKeys: seenKeys,
+    visitSeed: 555,
+    maxResults: 4,
+  });
+
+  // Current track is never recommended back
+  assert.equal(ranked.some((t) => t.id === 'yt-asake-dup'), false);
+  // Top results prioritize unseen Afrobeats / collaborator-matched songs before seen/unrelated tracks
+  assert.equal(ranked.length, 4);
+  assert.ok(['yt-rema-1', 'yt-ayra-1', 'yt-her-1'].includes(ranked[0].id));
+  assert.equal(ranked.slice(0, 3).some((t) => t.id === 'yt-seen-afro'), false);
+
+  const popularForAfro = pickContentBasedPopularSearches(5, 321, [], profile);
+  assert.equal(popularForAfro.length, 5);
+  assert.equal(
+    popularForAfro.some((p) => p.toLowerCase().includes('lonely at the top')),
+    false
+  );
+});
+
+
