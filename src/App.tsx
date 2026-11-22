@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Radio, WifiOff, X } from 'lucide-react';
+import { CheckCircle2, Download, Loader2, Radio, WifiOff, X } from 'lucide-react';
 import { audioEngine } from './audio/AudioEngine';
 import { DashboardView } from './components/DashboardView';
+import { DownloadSheetModal, type DownloadTarget } from './components/DownloadSheetModal';
 import { DspStudioModal } from './components/DspStudioModal';
 import { FloatingPipWindow } from './components/FloatingPipWindow';
 import { FolderScannerView } from './components/FolderScannerView';
@@ -50,6 +51,7 @@ import {
 } from './utils/streamFilter';
 import {
   evaluatePoorConnectionState,
+  insertPlayNextTracks,
   POOR_CONNECTION_THRESHOLD_MS,
   reorderMultipleQueueItems,
   restoreQueueOrder,
@@ -72,6 +74,11 @@ import {
   saveVisualizerPalette,
   type VisualizerPaletteId,
 } from './utils/visualizerUtils';
+import {
+  downloadTrackToAppStorage,
+  downloadTrackToLocalDevice,
+  type DownloadFormatId,
+} from './utils/streamDownloads';
 
 export default function App() {
   const isOnline = useOnlineStatus();
@@ -116,6 +123,22 @@ export default function App() {
     groupName?: string | null;
     nonce: number;
   } | null>(null);
+  const [downloadModalState, setDownloadModalState] = useState<{
+    target: DownloadTarget;
+    initialStep: 'choice' | 'formats';
+  } | null>(null);
+  const [activeDownload, setActiveDownload] = useState<{
+    label: string;
+    current: number;
+    total: number;
+    percent: number;
+    mode: 'app' | 'device';
+  } | null>(null);
+  const [downloadToast, setDownloadToast] = useState<{
+    text: string;
+    isError?: boolean;
+  } | null>(null);
+  const downloadToastTimerRef = useRef<number | null>(null);
   const folderStatusTimerRef = useRef<number | null>(null);
   const playlistsRef = useRef<Playlist[]>(playlists);
   playlistsRef.current = playlists;
@@ -461,7 +484,7 @@ export default function App() {
   useEffect(() => {
     const cur = engine.currentTrack;
     const now = Date.now();
-    if (!cur || cur.source !== 'stream') {
+    if (!cur || cur.source !== 'stream' || cur.isAppDownload) {
       lastStreamProgressRef.current = { trackId: null, time: 0, atMs: 0 };
       badConnSinceRef.current = null;
       dismissedBadSinceRef.current = null;
@@ -478,15 +501,23 @@ export default function App() {
     } else if (Math.abs(engine.currentTime - prev.time) >= 0.35 && engine.isPlaying && isOnline) {
       lastStreamProgressRef.current = { trackId: cur.id, time: engine.currentTime, atMs: now };
     }
-  }, [engine.currentTrack?.id, engine.currentTrack?.source, engine.currentTime, engine.isPlaying, isOnline]);
+  }, [
+    engine.currentTrack?.id,
+    engine.currentTrack?.source,
+    engine.currentTrack?.isAppDownload,
+    engine.currentTime,
+    engine.isPlaying,
+    isOnline,
+  ]);
 
   // Prompt user to switch to offline listening after 30s of poor/stalled connection while streaming
   useEffect(() => {
-    if (engine.currentTrack?.source !== 'stream') return;
+    if (engine.currentTrack?.source !== 'stream' || engine.currentTrack?.isAppDownload) return;
 
     const evaluate = () => {
       const result = evaluatePoorConnectionState({
-        isStreamingTrack: engine.currentTrack?.source === 'stream',
+        isStreamingTrack:
+          engine.currentTrack?.source === 'stream' && !engine.currentTrack?.isAppDownload,
         isPlaying: engine.isPlaying,
         isOnline,
         isBuffering: engine.isBuffering || engine.streamErrorCount > 0,
@@ -506,6 +537,7 @@ export default function App() {
   }, [
     engine.currentTrack?.id,
     engine.currentTrack?.source,
+    engine.currentTrack?.isAppDownload,
     engine.isPlaying,
     engine.isBuffering,
     engine.streamErrorCount,
@@ -513,7 +545,7 @@ export default function App() {
   ]);
 
   const offlineFallbackCount = useMemo(() => {
-    const localCount = savedTracks.filter((t) => t.source === 'local').length;
+    const localCount = savedTracks.filter((t) => t.source === 'local' || Boolean(t.isAppDownload)).length;
     return localCount > 0 ? localCount : PROCEDURAL_STEMS.length;
   }, [savedTracks]);
 
@@ -522,7 +554,7 @@ export default function App() {
     dismissedBadSinceRef.current = badConnSinceRef.current ?? Date.now();
     setShowOfflineSwitchPrompt(false);
 
-    const localSongs = savedTracks.filter((t) => t.source === 'local');
+    const localSongs = savedTracks.filter((t) => t.source === 'local' || Boolean(t.isAppDownload));
     const sourcePool = localSongs.length > 0 ? localSongs : PROCEDURAL_STEMS;
     const orderedPool = smartShuffleEnabled
       ? selectSmartLibraryTracks(sourcePool, localDb.loadPlayCounts(), new Set(), sourcePool.length).map(
@@ -824,6 +856,35 @@ export default function App() {
     }
   }, []);
 
+  const finalizeFolderTracks = useCallback(
+    async (importedTracks: Track[], failedFiles = 0) => {
+      if (importedTracks.length === 0) {
+        showTimedFolderStatus(
+          'No audio files (.mp3, .flac, .wav, .m4a, .ogg) found in that folder.',
+          4200
+        );
+        return;
+      }
+      const topFolder = importedTracks[0].folderPath || 'Picked Folder';
+      setLibraryFocusRequest({
+        subTab: 'folders',
+        groupName: topFolder,
+        nonce: Date.now(),
+      });
+      setActiveTab('library');
+      triggerHaptic('success');
+      const skippedNote =
+        failedFiles > 0 ? ` (${failedFiles} unreadable ${failedFiles === 1 ? 'file' : 'files'} skipped)` : '';
+      showTimedFolderStatus(
+        `Imported ${importedTracks.length} ${importedTracks.length === 1 ? 'song' : 'songs'} from "${topFolder}"${skippedNote}.`
+      );
+      if (!engine.currentTrack || !engine.isPlaying || engine.currentTrack.source === 'synth') {
+        playTrack(importedTracks[0]);
+      }
+    },
+    [engine.currentTrack, engine.isPlaying, playTrack, showTimedFolderStatus]
+  );
+
   const finalizeFolderImport = useCallback(
     async (imported: Array<{ track: Track; file: File }>) => {
       if (imported.length === 0) {
@@ -834,22 +895,9 @@ export default function App() {
         return;
       }
       await handleImportTracks(imported);
-      const topFolder = imported[0].track.folderPath || 'Picked Folder';
-      setLibraryFocusRequest({
-        subTab: 'folders',
-        groupName: topFolder,
-        nonce: Date.now(),
-      });
-      setActiveTab('library');
-      triggerHaptic('success');
-      showTimedFolderStatus(
-        `Imported ${imported.length} ${imported.length === 1 ? 'song' : 'songs'} from "${topFolder}".`
-      );
-      if (!engine.currentTrack || !engine.isPlaying || engine.currentTrack.source === 'synth') {
-        playTrack(imported[0].track);
-      }
+      await finalizeFolderTracks(imported.map((e) => e.track));
     },
-    [engine.currentTrack, engine.isPlaying, playTrack, showTimedFolderStatus]
+    [finalizeFolderTracks, showTimedFolderStatus]
   );
 
   const handlePickFolderInput = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -880,8 +928,17 @@ export default function App() {
     if (hasNativeFolderPicker()) {
       setFolderImportStatus('Opening Android folder picker...');
       try {
-        const result = await importFromNativeFolderPicker((p) => {
-          setFolderImportStatus(`Importing ${p.scanned} / ${p.found}: ${p.currentFile}`);
+        const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
+        const result = await importFromNativeFolderPicker({
+          onProgress: (p) => {
+            setFolderImportStatus(`Importing ${p.scanned} / ${p.found}: ${p.currentFile}`);
+          },
+          onTrackReady: async ({ track, file }) => {
+            // Persist each track + blob right away so File bytes can be garbage-collected on Android WebView
+            await localDb.saveTrack(track, file);
+            setSavedTracks((prev) => mergeImportedTracks(prev, [track]));
+            setQueue((prev) => enqueueImportedOfflineTracks(prev, [track], stemIds));
+          },
         });
         if (result.cancelled) {
           setFolderImportStatus('');
@@ -891,9 +948,10 @@ export default function App() {
           showTimedFolderStatus(result.error, 4200);
           return;
         }
-        await finalizeFolderImport(result.entries);
-      } catch {
-        showTimedFolderStatus('Could not read the selected Android folder.', 4200);
+        await finalizeFolderTracks(result.tracks, result.failedFiles);
+      } catch (err) {
+        const detail = err instanceof Error && err.message ? ` (${err.message})` : '';
+        showTimedFolderStatus(`Could not read the selected Android folder.${detail}`, 4200);
       }
       return;
     }
@@ -1027,6 +1085,29 @@ export default function App() {
     });
   }, []);
 
+  const handlePlayNext = useCallback(
+    (tracksOrTrack: Track | Track[]) => {
+      const incoming = Array.isArray(tracksOrTrack) ? tracksOrTrack : [tracksOrTrack];
+      if (incoming.length === 0) return;
+      triggerHaptic('selection');
+      const currentId = engine.currentTrack?.id ?? null;
+      setQueue((prev) => insertPlayNextTracks(prev, incoming, currentId));
+      const msg =
+        incoming.length === 1
+          ? `"${incoming[0].title}" will play next.`
+          : `${incoming.length} tracks will play next.`;
+      if (downloadToastTimerRef.current !== null) {
+        window.clearTimeout(downloadToastTimerRef.current);
+      }
+      setDownloadToast({ text: msg, isError: false });
+      downloadToastTimerRef.current = window.setTimeout(() => {
+        setDownloadToast(null);
+        downloadToastTimerRef.current = null;
+      }, 3200);
+    },
+    [engine.currentTrack?.id]
+  );
+
   const handleDeleteTracks = useCallback(async (trackIds: string[]) => {
     if (trackIds.length === 0) return;
     const idSet = new Set(trackIds);
@@ -1070,6 +1151,189 @@ export default function App() {
       await handleDeleteTracks([trackId]);
     },
     [handleDeleteTracks]
+  );
+
+  const downloadedTrackIdSet = useMemo(
+    () => new Set(savedTracks.filter((t) => Boolean(t.isAppDownload)).map((t) => t.id)),
+    [savedTracks]
+  );
+
+  const showDownloadToast = useCallback((text: string, isError = false) => {
+    if (downloadToastTimerRef.current !== null) {
+      window.clearTimeout(downloadToastTimerRef.current);
+    }
+    setDownloadToast({ text, isError });
+    downloadToastTimerRef.current = window.setTimeout(() => {
+      setDownloadToast(null);
+      downloadToastTimerRef.current = null;
+    }, 4200);
+  }, []);
+
+  const handleDownloadToApp = useCallback(
+    async (tracksToDownload: Track[]) => {
+      if (tracksToDownload.length === 0) return;
+      triggerHaptic('selection');
+      let savedCount = 0;
+      let failedCount = 0;
+      let lastTitle = tracksToDownload[0].title;
+
+      for (let i = 0; i < tracksToDownload.length; i++) {
+        const track = tracksToDownload[i];
+        setActiveDownload({
+          label: track.title,
+          current: i + 1,
+          total: tracksToDownload.length,
+          percent: 5,
+          mode: 'app',
+        });
+        try {
+          const { track: downloadedTrack, blob } = await downloadTrackToAppStorage(track, (p) => {
+            setActiveDownload({
+              label: track.title,
+              current: i + 1,
+              total: tracksToDownload.length,
+              percent: p.percent,
+              mode: 'app',
+            });
+          });
+          await localDb.saveTrack(downloadedTrack, blob);
+          setSavedTracks((prev) => {
+            const exists = prev.some((t) => t.id === downloadedTrack.id);
+            if (exists) {
+              return prev.map((t) => (t.id === downloadedTrack.id ? downloadedTrack : t));
+            }
+            return [downloadedTrack, ...prev];
+          });
+          setQueue((prev) =>
+            prev.map((q) => (q.id === downloadedTrack.id ? { ...q, ...downloadedTrack } : q))
+          );
+          savedCount++;
+          lastTitle = downloadedTrack.title;
+        } catch {
+          failedCount++;
+        }
+      }
+
+      setActiveDownload(null);
+      if (savedCount > 0) {
+        triggerHaptic('success');
+        const msg =
+          tracksToDownload.length === 1
+            ? `Saved "${lastTitle}" for offline playback in kaGO.PIaY.`
+            : `Saved ${savedCount} of ${tracksToDownload.length} tracks to App Downloads.`;
+        showDownloadToast(msg);
+      } else if (failedCount > 0) {
+        showDownloadToast('Could not save offline download right now. Please try again.', true);
+      }
+    },
+    [showDownloadToast]
+  );
+
+  const handleRemoveAppDownloads = useCallback(
+    async (trackIds: string[]) => {
+      if (trackIds.length === 0) return;
+      triggerHaptic('medium');
+      const idSet = new Set(trackIds);
+      const playlistTrackIdSet = new Set(playlistsRef.current.flatMap((p) => p.trackIds));
+
+      const keepUpdatedIds: string[] = [];
+      const fullDeleteIds: string[] = [];
+      for (const id of idSet) {
+        if (playlistTrackIdSet.has(id)) keepUpdatedIds.push(id);
+        else fullDeleteIds.push(id);
+      }
+
+      if (keepUpdatedIds.length > 0) {
+        const keepSet = new Set(keepUpdatedIds);
+        const strippedTracks: Track[] = [];
+        setSavedTracks((prev) =>
+          prev.map((t) => {
+            if (!keepSet.has(t.id)) return t;
+            const stripped: Track = {
+              ...t,
+              isAppDownload: false,
+              downloadedAt: undefined,
+              downloadSizeBytes: undefined,
+              downloadFormat: undefined,
+            };
+            strippedTracks.push(stripped);
+            return stripped;
+          })
+        );
+        if (strippedTracks.length > 0) {
+          await localDb.saveTracksBatch(strippedTracks);
+        }
+        for (const id of keepUpdatedIds) {
+          await localDb.deleteAudioBlob(id);
+        }
+      }
+
+      if (fullDeleteIds.length > 0) {
+        await handleDeleteTracks(fullDeleteIds);
+      }
+
+      showDownloadToast(
+        trackIds.length === 1
+          ? 'Removed from offline App Downloads.'
+          : `Removed ${trackIds.length} songs from offline App Downloads.`
+      );
+    },
+    [handleDeleteTracks, showDownloadToast]
+  );
+
+  const handleDownloadToDevice = useCallback(
+    async (tracksToExport: Track[], formatId: DownloadFormatId) => {
+      if (tracksToExport.length === 0) return;
+      triggerHaptic('selection');
+      let doneCount = 0;
+      let lastLabel = '';
+
+      for (let i = 0; i < tracksToExport.length; i++) {
+        const track = tracksToExport[i];
+        setActiveDownload({
+          label: track.title,
+          current: i + 1,
+          total: tracksToExport.length,
+          percent: 6,
+          mode: 'device',
+        });
+        try {
+          const result = await downloadTrackToLocalDevice(track, formatId, (p) => {
+            setActiveDownload({
+              label: track.title,
+              current: i + 1,
+              total: tracksToExport.length,
+              percent: p.percent,
+              mode: 'device',
+            });
+          });
+          doneCount++;
+          lastLabel = `${result.filename} (${result.actualFormatLabel})`;
+        } catch (err) {
+          if (tracksToExport.length === 1) {
+            setActiveDownload(null);
+            showDownloadToast(
+              err instanceof Error ? err.message : 'Download failed. Please try again.',
+              true
+            );
+            return;
+          }
+        }
+      }
+
+      setActiveDownload(null);
+      if (doneCount > 0) {
+        triggerHaptic('success');
+        showDownloadToast(
+          tracksToExport.length === 1
+            ? `Saved ${lastLabel} to device Downloads.`
+            : `Downloaded ${doneCount} of ${tracksToExport.length} files to device Downloads.`
+        );
+      } else {
+        showDownloadToast('Could not download files to device right now.', true);
+      }
+    },
+    [showDownloadToast]
   );
 
   const handleImportYouTubePlaylist = useCallback(
@@ -1213,9 +1477,12 @@ export default function App() {
         {activeTab === 'stream' && (
           <StreamView
             engine={engine}
+            downloadedTrackIds={downloadedTrackIdSet}
             onPlayTrack={playTrack}
             onPlayCollection={playCollection}
             onTogglePlay={() => void audioEngine.togglePlay()}
+            onPlayNext={(t) => handlePlayNext(t)}
+            onPlayMultipleNext={(trs) => handlePlayNext(trs)}
             onAddToQueue={(t) => {
               triggerHaptic('selection');
               setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]));
@@ -1224,6 +1491,18 @@ export default function App() {
             onSaveTrackToLibrary={(t) => void handleSaveTrackToLibrary(t)}
             onSaveCollectionAsPlaylist={(name, desc, trs) =>
               void handleCreatePlaylistWithTracks(name, desc, trs)
+            }
+            onRequestDownloadTrack={(tr) =>
+              setDownloadModalState({
+                target: { kind: 'track', track: tr },
+                initialStep: 'choice',
+              })
+            }
+            onRequestDownloadCollection={(col) =>
+              setDownloadModalState({
+                target: { kind: 'collection', ...col },
+                initialStep: 'choice',
+              })
             }
           />
         )}
@@ -1238,6 +1517,8 @@ export default function App() {
             onPlayTrack={playTrack}
             onPlayCollection={playCollection}
             onTogglePlay={() => void audioEngine.togglePlay()}
+            onPlayNext={(t) => handlePlayNext(t)}
+            onPlayMultipleNext={(trs) => handlePlayNext(trs)}
             onAddToQueue={(t) => {
               triggerHaptic('selection');
               setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]));
@@ -1260,6 +1541,25 @@ export default function App() {
             }
             onDeleteTrack={(id) => void handleDeleteTrack(id)}
             onDeleteTracks={(ids) => void handleDeleteTracks(ids)}
+            onRequestDownloadTrack={(tr) =>
+              setDownloadModalState({
+                target: { kind: 'track', track: tr },
+                initialStep: 'choice',
+              })
+            }
+            onRequestDownloadTrackFormats={(tr) =>
+              setDownloadModalState({
+                target: { kind: 'track', track: tr },
+                initialStep: 'formats',
+              })
+            }
+            onRequestDownloadCollection={(col) =>
+              setDownloadModalState({
+                target: { kind: 'collection', ...col },
+                initialStep: 'choice',
+              })
+            }
+            onRemoveAppDownloads={(ids) => void handleRemoveAppDownloads(ids)}
           />
         )}
 
@@ -1297,9 +1597,11 @@ export default function App() {
         {activeTab === 'search' && (
           <SearchView
             libraryTracks={allLibraryTracks}
+            downloadedTrackIds={downloadedTrackIdSet}
             engine={engine}
             onPlayTrack={playTrack}
             onTogglePlay={() => void audioEngine.togglePlay()}
+            onPlayNext={(t) => handlePlayNext(t)}
             onAddToQueue={(t) => {
               triggerHaptic('selection');
               setQueue((prev) => (prev.some((q) => q.id === t.id) ? prev : [...prev, t]));
@@ -1307,6 +1609,12 @@ export default function App() {
             onSaveTrackToLibrary={(t) => void handleSaveTrackToLibrary(t)}
             onPickSong={() => songPickerRef.current?.click()}
             onPickFolder={() => void handlePickFolder()}
+            onRequestDownloadTrack={(tr) =>
+              setDownloadModalState({
+                target: { kind: 'track', track: tr },
+                initialStep: 'choice',
+              })
+            }
           />
         )}
 
@@ -1361,6 +1669,17 @@ export default function App() {
         visualizerPalette={visualizerPalette}
         onChangeVisualizerPalette={handleChangeVisualizerPalette}
         isFavorite={engine.currentTrack ? favoriteIds.includes(engine.currentTrack.id) : false}
+        isDownloaded={
+          engine.currentTrack
+            ? downloadedTrackIdSet.has(engine.currentTrack.id) || Boolean(engine.currentTrack.isAppDownload)
+            : false
+        }
+        onRequestDownloadTrack={(tr) =>
+          setDownloadModalState({
+            target: { kind: 'track', track: tr },
+            initialStep: 'choice',
+          })
+        }
         storedLyrics={engine.currentTrack ? lyricsMap[engine.currentTrack.id] : undefined}
         isInAppPip={isInAppPip}
         onToggleInAppPip={() => setIsInAppPip((prev) => !prev)}
@@ -1387,6 +1706,77 @@ export default function App() {
         isFetchingLyrics={isFetchingLyrics}
         onFetchTrackLyrics={(tr, customQ) => void handleFetchTrackLyrics(tr, customQ)}
         onToggleAutoplayRadio={handleToggleAutoplayRadio}
+      />
+
+      {/* Active Download Progress / Completion Toast */}
+      {(activeDownload || downloadToast) && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-[calc(8.75rem+env(safe-area-inset-bottom))] md:bottom-24 left-3 right-3 sm:left-auto sm:right-6 sm:w-[22rem] z-[95] rounded-xl border border-white/15 bg-[#0D0E12]/95 px-4 py-3 shadow-2xl backdrop-blur-md"
+        >
+          {activeDownload ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[#E11D48]" />
+                  <span className="truncate font-semibold text-[#F4F3F0]">
+                    {activeDownload.mode === 'app' ? 'Saving offline' : 'Downloading'}{' '}
+                    {activeDownload.total > 1
+                      ? `(${activeDownload.current}/${activeDownload.total})`
+                      : ''}
+                    : {activeDownload.label}
+                  </span>
+                </div>
+                <span className="font-mono-tabular shrink-0 text-[#FF4D6D]">
+                  {activeDownload.percent}%
+                </span>
+              </div>
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                <div
+                  className="h-full bg-[#E11D48] transition-all duration-200"
+                  style={{ width: `${Math.max(4, activeDownload.percent)}%` }}
+                />
+              </div>
+            </div>
+          ) : downloadToast ? (
+            <div className="flex items-center justify-between gap-2.5 text-xs">
+              <div className="flex items-center gap-2 min-w-0">
+                {downloadToast.isError ? (
+                  <Download className="h-4 w-4 shrink-0 text-red-400" />
+                ) : (
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
+                )}
+                <span
+                  className={`truncate font-medium ${
+                    downloadToast.isError ? 'text-red-300' : 'text-[#F4F3F0]'
+                  }`}
+                >
+                  {downloadToast.text}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDownloadToast(null)}
+                aria-label="Dismiss download message"
+                className="text-zinc-400 hover:text-white shrink-0"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      <DownloadSheetModal
+        target={downloadModalState?.target ?? null}
+        initialStep={downloadModalState?.initialStep ?? 'choice'}
+        savedTracks={savedTracks}
+        isBusy={Boolean(activeDownload)}
+        onClose={() => setDownloadModalState(null)}
+        onSaveToApp={(trs) => void handleDownloadToApp(trs)}
+        onRemoveFromApp={(ids) => void handleRemoveAppDownloads(ids)}
+        onDownloadLocally={(trs, fmt) => void handleDownloadToDevice(trs, fmt)}
       />
 
       {showOfflineSwitchPrompt && (

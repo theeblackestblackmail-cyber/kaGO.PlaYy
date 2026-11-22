@@ -618,7 +618,7 @@ class DualChannelAudioEngine {
         });
       };
 
-      if (track.source === 'local') {
+      if (track.source === 'local' || track.isAppDownload) {
         const blob = await localDb.getAudioBlob(track.id);
         if (seq !== this.playSeq || !this.isPlaying) return;
         if (blob) {
@@ -1032,9 +1032,9 @@ class DualChannelAudioEngine {
       if (targets.length === 0) return;
 
       const now = Date.now();
-      // 1. Always pre-warm local offline tracks from IndexedDB regardless of network status
+      // 1. Always pre-warm local and downloaded offline tracks from IndexedDB regardless of network status
       for (const track of targets) {
-        if (track.source !== 'local') continue;
+        if (track.source !== 'local' && !track.isAppDownload) continue;
         const existing = this.preloadPool.get(track.id);
         if (existing && (existing.status === 'ready' || existing.status === 'pending')) continue;
         const entry: PreloadEntry = {
@@ -1049,7 +1049,7 @@ class DualChannelAudioEngine {
 
       // 2. Check network stability before proactively buffering upcoming streamed tracks
       const streamTargets = targets.filter((t) => {
-        if (t.source !== 'stream') return false;
+        if (t.source !== 'stream' || t.isAppDownload) return false;
         const cooldownUntil = this.preloadRetryCooldown.get(t.id) || 0;
         if (now < cooldownUntil) return false;
         const existing = this.preloadPool.get(t.id);
@@ -2208,7 +2208,7 @@ class DualChannelAudioEngine {
     }
 
     this.userPausedAt = 0;
-    this.isBuffering = track.source === 'stream';
+    this.isBuffering = track.source === 'stream' && !track.isAppDownload && !preloadedLocalBlob;
     this.streamErrorCount = 0;
     this.activeChannel = incomingChannelId;
     this.currentTrack = track;
@@ -2244,6 +2244,58 @@ class DualChannelAudioEngine {
       this.isCrossfading = false;
       incomingStrip.gainNode.gain.cancelScheduledValues(now);
       incomingStrip.gainNode.gain.setValueAtTime(1, now);
+    }
+
+    // Prefer offline stored IndexedDB audio for local imports AND Spotify-style App Downloads before any network stream
+    if (track.source === 'local' || track.isAppDownload || Boolean(preloadedLocalBlob)) {
+      const blob = preloadedLocalBlob ?? (await localDb.getAudioBlob(track.id));
+      if (seq !== this.playSeq) return;
+      if (blob) {
+        if (this.ytActive) {
+          this.stopYouTubePlayback(wasPlaying ? crossfade : 0);
+        }
+        this.stopSynthTicker();
+        if (ctx.state === 'suspended') {
+          await ctx.resume().catch(() => {});
+        }
+        if (seq !== this.playSeq) return;
+        incomingStrip.audioEl.volume = 1.0;
+        incomingStrip.audioEl.muted = false;
+        const url = URL.createObjectURL(blob);
+        incomingStrip.objectUrl = url;
+        incomingStrip.audioEl.src = url;
+        incomingStrip.audioEl.currentTime = 0;
+        this.isBuffering = false;
+        try {
+          await incomingStrip.audioEl.play();
+          this.startBgKeepalive();
+          this.scheduleProactivePreload(PRELOAD_SETTLE_DELAY_MS);
+          this.emit();
+          return;
+        } catch {
+          if (seq !== this.playSeq) return;
+          if (track.source === 'local' && track.synthProfile) {
+            await this.startSynthOnStrip(incomingStrip, track);
+            this.startBgKeepalive();
+            this.scheduleProactivePreload(PRELOAD_SETTLE_DELAY_MS);
+            this.emit();
+            return;
+          }
+        }
+      } else if (track.source === 'local' && track.streamUrl) {
+        if (this.ytActive) {
+          this.stopYouTubePlayback(wasPlaying ? crossfade : 0);
+        }
+        incomingStrip.audioEl.volume = 1.0;
+        incomingStrip.audioEl.muted = false;
+        incomingStrip.audioEl.src = track.streamUrl;
+        incomingStrip.audioEl.currentTime = 0;
+        await incomingStrip.audioEl.play().catch(() => {});
+        this.startBgKeepalive();
+        this.scheduleProactivePreload(PRELOAD_SETTLE_DELAY_MS);
+        this.emit();
+        return;
+      }
     }
 
     // Play full-length YouTube stream via YouTube IFrame Player API
@@ -2304,32 +2356,6 @@ class DualChannelAudioEngine {
     // Decide how to render audio for non-YouTube tracks
     if (track.source === 'synth' || (!track.streamUrl && track.source === 'stream' && track.synthProfile)) {
       await this.startSynthOnStrip(incomingStrip, track);
-    } else if (track.source === 'local') {
-      incomingStrip.audioEl.volume = 1.0;
-      incomingStrip.audioEl.muted = false;
-      const blob = preloadedLocalBlob ?? (await localDb.getAudioBlob(track.id));
-      if (seq !== this.playSeq) return;
-      if (ctx.state === 'suspended') {
-        await ctx.resume().catch(() => {});
-      }
-      if (seq !== this.playSeq) return;
-      if (blob) {
-        const url = URL.createObjectURL(blob);
-        incomingStrip.objectUrl = url;
-        incomingStrip.audioEl.src = url;
-        incomingStrip.audioEl.currentTime = 0;
-        try {
-          await incomingStrip.audioEl.play();
-        } catch {
-          if (seq !== this.playSeq) return;
-          // Fallback to synth if browser rejects codec
-          if (track.synthProfile) await this.startSynthOnStrip(incomingStrip, track);
-        }
-      } else if (track.streamUrl) {
-        incomingStrip.audioEl.src = track.streamUrl;
-        incomingStrip.audioEl.currentTime = 0;
-        await incomingStrip.audioEl.play().catch(() => {});
-      }
     } else if (track.streamUrl) {
       incomingStrip.audioEl.volume = 1.0;
       incomingStrip.audioEl.muted = false;

@@ -88,47 +88,56 @@ export const FolderScannerView: React.FC<FolderScannerViewProps> = ({
         error: '',
       });
 
-      const result = await importFromNativeFolderPicker((progress) => {
-        setScanStats((prev) => ({
-          ...prev,
-          scanned: progress.scanned,
-          found: progress.found,
-          currentFile: progress.currentFile,
-        }));
-      });
+      try {
+        const result = await importFromNativeFolderPicker((progress) => {
+          setScanStats((prev) => ({
+            ...prev,
+            scanned: progress.scanned,
+            found: progress.found,
+            currentFile: progress.currentFile,
+          }));
+        });
 
-      if (result.cancelled) {
-        setIsScanning(false);
-        setScanStats((prev) => ({ ...prev, currentFile: 'Folder selection cancelled' }));
-        return;
-      }
+        if (result.cancelled) {
+          setIsScanning(false);
+          setScanStats((prev) => ({ ...prev, currentFile: 'Folder selection cancelled' }));
+          return;
+        }
 
-      if (result.error) {
-        setIsScanning(false);
+        if (result.error) {
+          setIsScanning(false);
+          setScanStats((prev) => ({
+            ...prev,
+            currentFile: 'Scan failed',
+            error: result.error || 'Unable to scan folder.',
+          }));
+          return;
+        }
+
+        if (result.entries.length > 0) {
+          await onImportTracks(result.entries);
+        }
+
+        setScanStats({
+          scanned: result.entries.length,
+          found: result.entries.length,
+          currentFile:
+            result.entries.length > 0 ? 'Folder scan complete' : 'No supported audio files found',
+          lastImported: result.entries.map((e) => e.track),
+          error:
+            result.entries.length === 0
+              ? 'No audio files (.mp3, .flac, .wav, .m4a, .ogg) were found inside that folder.'
+              : '',
+        });
+      } catch (err) {
         setScanStats((prev) => ({
           ...prev,
           currentFile: 'Scan failed',
-          error: result.error || 'Unable to scan folder.',
+          error: err instanceof Error ? err.message : 'Unable to read selected Android folder.',
         }));
-        return;
+      } finally {
+        setIsScanning(false);
       }
-
-      if (result.entries.length > 0) {
-        await onImportTracks(result.entries);
-      }
-
-      setScanStats({
-        scanned: result.entries.length,
-        found: result.entries.length,
-        currentFile:
-          result.entries.length > 0 ? 'Folder scan complete' : 'No supported audio files found',
-        lastImported: result.entries.map((e) => e.track),
-        error:
-          result.entries.length === 0
-            ? 'No audio files (.mp3, .flac, .wav, .m4a, .ogg) were found inside that folder.'
-            : '',
-      });
-      setIsScanning(false);
       return;
     }
 

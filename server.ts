@@ -1,5 +1,9 @@
 import express from 'express';
+import { spawn } from 'node:child_process';
+import { createReadStream } from 'node:fs';
+import fs from 'node:fs/promises';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
@@ -10,6 +14,7 @@ import {
   buildCategorySearchPlan,
   buildInnertubeBrowseBody,
   buildInnertubeNextBody,
+  buildInnertubePlaylistNextBody,
   buildInnertubeSearchBody,
   buildRadioSeedQuery,
   extractYouTubeArtists,
@@ -26,6 +31,13 @@ import {
   toYouTubeTracks,
   type ParsedYouTubeVideo,
 } from './src/utils/streamFilter';
+import {
+  DOWNLOAD_FORMAT_MAP,
+  DOWNLOAD_FORMAT_OPTIONS,
+  estimateFormatSizeBytes,
+  sanitizeDownloadFilename,
+  type DownloadFormatId,
+} from './src/utils/streamDownloads';
 import {
   convertPlainLyricsToLrc,
   pickBestLrclibCandidate,
@@ -163,13 +175,15 @@ async function fetchYouTubeSearchPayload(
       'https://www.youtube.com/youtubei/v1/search?prettyPrint=false',
       {
         method: 'POST',
-        signal: AbortSignal.timeout(6500),
+        signal: AbortSignal.timeout(7500),
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
           'Accept-Language': 'en-US,en;q=0.9',
+          'X-YouTube-Client-Name': '1',
+          'X-YouTube-Client-Version': '2.20250218.01.00',
           Origin: 'https://www.youtube.com',
           Referer: 'https://www.youtube.com/',
           Cookie: YT_COOKIE_HEADER,
@@ -187,7 +201,12 @@ async function fetchYouTubeSearchPayload(
     // Fall back to HTML scrape
   }
 
-  if (payloads.length === 0) {
+  const shouldScrapeHtml =
+    payloads.length === 0 ||
+    extractYouTubeSearchResults(payloads[0], { strictSongFilter: false, includeShorts: true })
+      .length === 0;
+
+  if (shouldScrapeHtml) {
     try {
       const spParam = sp ? `&sp=${sp}` : '';
       const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(
@@ -195,7 +214,7 @@ async function fetchYouTubeSearchPayload(
       )}${spParam}&gl=US&hl=en&persist_gl=1&persist_hl=1`;
 
       const response = await fetch(url, {
-        signal: AbortSignal.timeout(7000),
+        signal: AbortSignal.timeout(7500),
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -258,7 +277,10 @@ async function searchYouTubeCategory(
 
     const mergedMap = new Map<string, ParsedYouTubeVideo>();
     const collectVideos = (raw: string) => {
-      for (const item of extractYouTubeSearchResults(raw)) {
+      for (const item of extractYouTubeSearchResults(raw, {
+        strictSongFilter: false,
+        includeShorts: true,
+      })) {
         if (excludeYoutubeId && item.videoId === excludeYoutubeId) continue;
         if (!mergedMap.has(item.videoId)) {
           mergedMap.set(item.videoId, item);
@@ -272,7 +294,7 @@ async function searchYouTubeCategory(
     const hasOfficialYet = Array.from(mergedMap.values()).some(
       (v) => v.isOfficial || (v.viewCount || 0) >= 100_000
     );
-    if ((mergedMap.size < 3 || !hasOfficialYet) && (plan.sp || plan.searchQuery !== rawQuery.trim())) {
+    if ((mergedMap.size < 8 || !hasOfficialYet) && (plan.sp || plan.searchQuery !== rawQuery.trim())) {
       const organicQuery =
         [rawQuery.trim(), genre ? `${genre} music` : ''].filter(Boolean).join(' ') ||
         plan.searchQuery;
@@ -287,8 +309,9 @@ async function searchYouTubeCategory(
     const ranked = rankYouTubeSearchResults(
       Array.from(mergedMap.values()),
       rankingQuery,
-      category
-    ).slice(0, 15);
+      category,
+      { allowAllVideos: true }
+    ).slice(0, 25);
     const tracks = toYouTubeTracks(ranked, genre).map((t) => ({
       ...t,
       resultType: category === 'videos' ? ('video' as const) : ('song' as const),
@@ -399,19 +422,27 @@ async function searchAudiusTracks(term: string, genre?: string): Promise<Track[]
   }
 }
 
+const YT_VR_USER_AGENT =
+  'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
+
 function isAllowedProxyHost(hostname: string): boolean {
   const lower = hostname.toLowerCase();
   if (
     lower === 'localhost' ||
     lower === '127.0.0.1' ||
     lower === '0.0.0.0' ||
+    lower === '::1' ||
+    lower === '[::1]' ||
     lower.startsWith('10.') ||
     lower.startsWith('192.168.') ||
+    lower.startsWith('169.254.') ||
+    lower.startsWith('fe80:') ||
     /^172\.(1[6-9]|2\d|3[0-1])\./.test(lower)
   ) {
     return false;
   }
   const allowedSuffixes = [
+    'googlevideo.com',
     'audius.co',
     'audius.org',
     'audiusrules.com',
@@ -421,6 +452,184 @@ function isAllowedProxyHost(hostname: string): boolean {
   return allowedSuffixes.some(
     (host) => lower === host || lower.endsWith(`.${host}`)
   );
+}
+
+interface ServerDirectMedia {
+  audioUrl?: string;
+  audioExt: 'm4a' | 'webm' | 'mp3';
+  audioContentLength: number;
+  muxed360Url?: string;
+  muxed360Length: number;
+  videoStreams: Partial<Record<'144p' | '240p' | '360p' | '480p' | '720p', { url: string; contentLength: number }>>;
+  durationSeconds: number;
+}
+
+async function resolveYouTubeDirectMedia(youtubeId: string): Promise<ServerDirectMedia | null> {
+  if (!/^[a-zA-Z0-9_-]{6,20}$/.test(youtubeId)) return null;
+
+  const clientProfiles = [
+    {
+      ua: YT_VR_USER_AGENT,
+      client: {
+        clientName: 'ANDROID_VR',
+        clientVersion: '1.60.19',
+        androidSdkVersion: 32,
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    {
+      ua: 'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
+      client: {
+        clientName: 'ANDROID',
+        clientVersion: '19.29.37',
+        androidSdkVersion: 34,
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    {
+      ua: 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
+      client: {
+        clientName: 'IOS',
+        clientVersion: '19.29.1',
+        deviceModel: 'iPhone16,2',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+  ];
+
+  for (const profile of clientProfiles) {
+    try {
+      const playerRes = await fetch(
+        'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+        {
+          method: 'POST',
+          signal: AbortSignal.timeout(8500),
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'User-Agent': profile.ua,
+            Origin: 'https://www.youtube.com',
+            Referer: `https://www.youtube.com/watch?v=${encodeURIComponent(youtubeId)}`,
+          },
+          body: JSON.stringify({
+            videoId: youtubeId,
+            context: { client: profile.client },
+            contentCheckOk: true,
+            racyCheckOk: true,
+          }),
+        }
+      );
+
+      if (!playerRes.ok) continue;
+      const data = (await playerRes.json()) as {
+        videoDetails?: { lengthSeconds?: string };
+        streamingData?: {
+          formats?: Array<{ itag?: number; url?: string; contentLength?: string; mimeType?: string }>;
+          adaptiveFormats?: Array<{
+            itag?: number;
+            url?: string;
+            contentLength?: string;
+            mimeType?: string;
+            qualityLabel?: string;
+          }>;
+        };
+      };
+
+      const streaming = data.streamingData;
+      if (!streaming) continue;
+
+      const adaptive = Array.isArray(streaming.adaptiveFormats) ? streaming.adaptiveFormats : [];
+      const formats = Array.isArray(streaming.formats) ? streaming.formats : [];
+
+      const m4a140 = adaptive.find((f) => f.itag === 140 && f.url);
+      const anyMp4Audio = adaptive.find((f) => (f.mimeType || '').includes('audio/mp4') && f.url);
+      const anyAudio = adaptive.find((f) => (f.mimeType || '').startsWith('audio/') && f.url);
+      const pickedAudio = m4a140 || anyMp4Audio || anyAudio;
+      const muxed18 = formats.find((f) => f.itag === 18 && f.url);
+
+      if (!pickedAudio?.url && !muxed18?.url) continue;
+
+      const videoStreams: ServerDirectMedia['videoStreams'] = {};
+      const desiredVideoItags: Array<{ res: '144p' | '240p' | '360p' | '480p' | '720p'; itag: number }> = [
+        { res: '144p', itag: 160 },
+        { res: '240p', itag: 133 },
+        { res: '360p', itag: 134 },
+        { res: '480p', itag: 135 },
+        { res: '720p', itag: 136 },
+      ];
+
+      for (const target of desiredVideoItags) {
+        const match =
+          adaptive.find((f) => f.itag === target.itag && f.url) ||
+          adaptive.find(
+            (f) =>
+              (f.mimeType || '').includes('video/mp4') &&
+              (f.mimeType || '').includes('avc1') &&
+              f.qualityLabel === target.res &&
+              f.url
+          );
+        if (match?.url) {
+          videoStreams[target.res] = {
+            url: match.url,
+            contentLength: Number(match.contentLength || 0) || 0,
+          };
+        }
+      }
+
+      const audioMime = pickedAudio?.mimeType || '';
+      return {
+        audioUrl: pickedAudio?.url || muxed18?.url,
+        audioExt: audioMime.includes('webm') ? 'webm' : 'm4a',
+        audioContentLength: Number(pickedAudio?.contentLength || 0) || 0,
+        muxed360Url: muxed18?.url,
+        muxed360Length: Number(muxed18?.contentLength || 0) || 0,
+        videoStreams,
+        durationSeconds: Number(data.videoDetails?.lengthSeconds || 0) || 0,
+      };
+    } catch {
+      // Try next Innertube client profile
+    }
+  }
+  return null;
+}
+
+function runFfmpegToFile(args: string[], signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn('ffmpeg', args, { shell: false, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderrTail = '';
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrTail = (stderrTail + chunk.toString('utf8')).slice(-800);
+    });
+
+    const onAbort = () => {
+      child.kill('SIGKILL');
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        reject(new Error('Aborted'));
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    child.on('error', (err) => {
+      signal?.removeEventListener('abort', onAbort);
+      reject(err);
+    });
+
+    child.on('close', (code) => {
+      signal?.removeEventListener('abort', onAbort);
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(stderrTail.trim() || `ffmpeg exited with code ${code}`));
+      }
+    });
+  });
 }
 
 async function startServer() {
@@ -597,7 +806,7 @@ async function startServer() {
   app.get('/api/stream/playlist', async (req, res) => {
     const listId = String(req.query.list || '').trim();
     const title = String(req.query.title || 'YouTube Playlist').trim();
-    if (!listId || !/^[a-zA-Z0-9_-]{8,}$/.test(listId)) {
+    if (!listId || !/^[a-zA-Z0-9_-]{6,}$/.test(listId)) {
       return res.json({ title, tracks: [] });
     }
 
@@ -619,6 +828,33 @@ async function startServer() {
       });
       if (browseRes.ok) {
         const jsonText = await browseRes.text();
+        const info = extractYouTubePlaylistInfo(jsonText, title);
+        if (info.tracks.length > 0) {
+          return res.json({ listId, title: info.title, tracks: info.tracks });
+        }
+      }
+    } catch {
+      // Fall back to /next and playlist HTML page
+    }
+
+    try {
+      const nextRes = await fetch('https://www.youtube.com/youtubei/v1/next?prettyPrint=false', {
+        method: 'POST',
+        signal: AbortSignal.timeout(7000),
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'Accept-Language': 'en-US,en;q=0.9',
+          Origin: 'https://www.youtube.com',
+          Referer: 'https://www.youtube.com/',
+          Cookie: YT_COOKIE_HEADER,
+        },
+        body: buildInnertubePlaylistNextBody(listId),
+      });
+      if (nextRes.ok) {
+        const jsonText = await nextRes.text();
         const info = extractYouTubePlaylistInfo(jsonText, title);
         if (info.tracks.length > 0) {
           return res.json({ listId, title: info.title, tracks: info.tracks });
@@ -737,6 +973,321 @@ async function startServer() {
       mode: 'synth-stem',
       recoveredFrom: 'Local Synth Engine Fallback',
     });
+  });
+
+  app.get('/api/stream/formats', async (req, res) => {
+    const youtubeId = String(req.query.youtubeId || '').trim();
+    const streamUrl = String(req.query.streamUrl || '').trim();
+    const fallbackDuration = Math.max(10, Number(req.query.duration || 210) || 210);
+
+    if (youtubeId && !/^[a-zA-Z0-9_-]{6,20}$/.test(youtubeId)) {
+      return res.status(400).json({ error: 'Invalid youtubeId' });
+    }
+    if (streamUrl) {
+      try {
+        const parsed = new URL(streamUrl);
+        if (parsed.protocol !== 'https:' || !isAllowedProxyHost(parsed.hostname)) {
+          return res.status(403).json({ error: 'Host not permitted' });
+        }
+      } catch {
+        return res.status(400).json({ error: 'Invalid streamUrl' });
+      }
+    }
+
+    let durationSeconds = fallbackDuration;
+    const sizes: Partial<Record<DownloadFormatId, number>> = {};
+
+    if (youtubeId) {
+      const resolved = await resolveYouTubeDirectMedia(youtubeId);
+      if (resolved) {
+        if (resolved.durationSeconds > 0) durationSeconds = resolved.durationSeconds;
+        const audioBytes = resolved.audioContentLength;
+        for (const opt of DOWNLOAD_FORMAT_OPTIONS) {
+          if (opt.id === 'm4a-128' && audioBytes > 0) {
+            sizes[opt.id] = audioBytes;
+          } else if (opt.category === 'video' && opt.resolutionLabel) {
+            const key = opt.resolutionLabel as '144p' | '240p' | '360p' | '480p' | '720p';
+            const vStream = resolved.videoStreams[key];
+            if (vStream?.contentLength && audioBytes > 0) {
+              sizes[opt.id] = vStream.contentLength + audioBytes;
+            } else if (opt.id === 'mp4-360p' && resolved.muxed360Length > 0) {
+              sizes[opt.id] = resolved.muxed360Length;
+            } else {
+              sizes[opt.id] = estimateFormatSizeBytes(durationSeconds, opt);
+            }
+          } else {
+            sizes[opt.id] = estimateFormatSizeBytes(durationSeconds, opt);
+          }
+        }
+        return res.json({ durationSeconds, sizes });
+      }
+    }
+
+    for (const opt of DOWNLOAD_FORMAT_OPTIONS) {
+      sizes[opt.id] = estimateFormatSizeBytes(durationSeconds, opt);
+    }
+    return res.json({ durationSeconds, sizes });
+  });
+
+  app.get('/api/stream/download', async (req, res) => {
+    const youtubeId = String(req.query.youtubeId || '').trim();
+    const streamUrl = String(req.query.streamUrl || '').trim();
+    const rawFormat = String(req.query.format || 'mp3-160').trim() as DownloadFormatId;
+    const option = DOWNLOAD_FORMAT_MAP[rawFormat];
+    const cleanMeta = (val: unknown, fallback: string) =>
+      String(val || fallback)
+        .replace(/[\u0000-\u001f]+/g, ' ')
+        .trim()
+        .slice(0, 120) || fallback;
+
+    const title = cleanMeta(req.query.title, 'Track');
+    const artist = cleanMeta(req.query.artist, 'Unknown Artist');
+    const album = cleanMeta(req.query.album, 'kaGO.PIaY');
+
+    if (!option) {
+      return res.status(400).send('Unsupported download format');
+    }
+    if (!youtubeId && !streamUrl) {
+      return res.status(400).send('Missing youtubeId or streamUrl');
+    }
+    if (youtubeId && !/^[a-zA-Z0-9_-]{6,20}$/.test(youtubeId)) {
+      return res.status(400).send('Invalid youtubeId');
+    }
+
+    let validatedStreamUrl = '';
+    if (streamUrl) {
+      try {
+        const parsed = new URL(streamUrl);
+        if (parsed.protocol !== 'https:' || !isAllowedProxyHost(parsed.hostname)) {
+          return res.status(403).send('Host not permitted');
+        }
+        validatedStreamUrl = parsed.toString();
+      } catch {
+        return res.status(400).send('Invalid streamUrl');
+      }
+    }
+
+    const abortController = new AbortController();
+    req.on('close', () => abortController.abort());
+
+    const downloadFilename = sanitizeDownloadFilename(title, artist, option.ext);
+    const asciiFallbackName = downloadFilename.replace(/[^\x20-\x7e]+/g, '_');
+    const tmpOutFile = path.join(
+      os.tmpdir(),
+      `kago-dl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.${option.ext}`
+    );
+
+    const cleanupTempFile = async () => {
+      await fs.unlink(tmpOutFile).catch(() => {});
+    };
+
+    try {
+      let resolved: ServerDirectMedia | null = null;
+      if (youtubeId) {
+        resolved = await resolveYouTubeDirectMedia(youtubeId);
+      }
+
+      const sourceAudioUrl = resolved?.audioUrl || validatedStreamUrl;
+      if (!sourceAudioUrl) {
+        return res.status(502).send('Media stream could not be resolved');
+      }
+
+      const baseInputFlags = youtubeId
+        ? ['-user_agent', YT_VR_USER_AGENT, '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
+        : ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2'];
+
+      let ffmpegArgs: string[] = [];
+
+      if (option.category === 'music') {
+        if (option.id === 'm4a-128') {
+          const canCopyM4a = Boolean(youtubeId && resolved?.audioExt === 'm4a');
+          ffmpegArgs = [
+            '-y',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            ...baseInputFlags,
+            '-i',
+            sourceAudioUrl,
+            '-vn',
+            ...(canCopyM4a ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '128k']),
+            '-metadata',
+            `title=${title}`,
+            '-metadata',
+            `artist=${artist}`,
+            '-metadata',
+            `album=${album}`,
+            '-movflags',
+            '+faststart',
+            tmpOutFile,
+          ];
+        } else {
+          const bitrateArg = `${option.estimatedBitrateKbps}k`;
+          ffmpegArgs = [
+            '-y',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            ...baseInputFlags,
+            '-i',
+            sourceAudioUrl,
+            '-vn',
+            '-c:a',
+            'libmp3lame',
+            '-b:a',
+            bitrateArg,
+            '-ar',
+            '44100',
+            '-metadata',
+            `title=${title}`,
+            '-metadata',
+            `artist=${artist}`,
+            '-metadata',
+            `album=${album}`,
+            '-id3v2_version',
+            '3',
+            tmpOutFile,
+          ];
+        }
+      } else {
+        // Video MP4 formats: 144p, 240p, 360p, 480p, 720p
+        if (!youtubeId || !resolved) {
+          return res.status(400).send('Video format unavailable for audio-only stream');
+        }
+        const resKey = (option.resolutionLabel || '360p') as
+          | '144p'
+          | '240p'
+          | '360p'
+          | '480p'
+          | '720p';
+        const adaptiveVideo = resolved.videoStreams[resKey];
+
+        if (adaptiveVideo?.url && resolved.audioUrl) {
+          ffmpegArgs = [
+            '-y',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            ...baseInputFlags,
+            '-i',
+            adaptiveVideo.url,
+            ...baseInputFlags,
+            '-i',
+            resolved.audioUrl,
+            '-map',
+            '0:v:0',
+            '-map',
+            '1:a:0',
+            '-c:v',
+            'copy',
+            '-c:a',
+            resolved.audioExt === 'm4a' ? 'copy' : 'aac',
+            '-metadata',
+            `title=${title}`,
+            '-metadata',
+            `artist=${artist}`,
+            '-movflags',
+            '+faststart',
+            tmpOutFile,
+          ];
+        } else if (resolved.muxed360Url) {
+          const heightMap: Record<string, number> = {
+            '144p': 144,
+            '240p': 240,
+            '360p': 360,
+            '480p': 480,
+            '720p': 720,
+          };
+          const targetHeight = heightMap[resKey] || 360;
+          if (targetHeight === 360) {
+            ffmpegArgs = [
+              '-y',
+              '-hide_banner',
+              '-loglevel',
+              'error',
+              ...baseInputFlags,
+              '-i',
+              resolved.muxed360Url,
+              '-c',
+              'copy',
+              '-movflags',
+              '+faststart',
+              tmpOutFile,
+            ];
+          } else {
+            ffmpegArgs = [
+              '-y',
+              '-hide_banner',
+              '-loglevel',
+              'error',
+              ...baseInputFlags,
+              '-i',
+              resolved.muxed360Url,
+              '-vf',
+              `scale=-2:${targetHeight}`,
+              '-c:v',
+              'libx264',
+              '-preset',
+              'veryfast',
+              '-c:a',
+              'copy',
+              '-movflags',
+              '+faststart',
+              tmpOutFile,
+            ];
+          }
+        } else {
+          return res.status(502).send('Requested video stream unavailable');
+        }
+      }
+
+      await runFfmpegToFile(ffmpegArgs, abortController.signal);
+      if (abortController.signal.aborted) {
+        await cleanupTempFile();
+        return;
+      }
+
+      const stat = await fs.stat(tmpOutFile);
+      if (stat.size <= 0) {
+        await cleanupTempFile();
+        return res.status(502).send('Generated media file was empty');
+      }
+
+      res.status(200);
+      res.setHeader('Content-Type', option.mimeType);
+      res.setHeader('Content-Length', String(stat.size));
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${asciiFallbackName}"; filename*=UTF-8''${encodeURIComponent(downloadFilename)}`
+      );
+      res.setHeader('Cache-Control', 'no-store');
+
+      const readStream = createReadStream(tmpOutFile);
+      readStream.on('close', () => {
+        void cleanupTempFile();
+      });
+      readStream.on('error', () => {
+        void cleanupTempFile();
+        if (!res.headersSent) {
+          res.status(502).end('Failed reading processed download');
+        } else {
+          res.end();
+        }
+      });
+      req.on('close', () => {
+        readStream.destroy();
+        void cleanupTempFile();
+      });
+      readStream.pipe(res);
+    } catch {
+      await cleanupTempFile();
+      if (!res.headersSent && !abortController.signal.aborted) {
+        return res.status(502).send('Download conversion failed');
+      }
+      if (!res.writableEnded) {
+        res.end();
+      }
+    }
   });
 
   app.get('/api/stream/proxy', async (req, res) => {

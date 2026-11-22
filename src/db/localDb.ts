@@ -6,7 +6,20 @@ import { clampCrossfadeSeconds } from '../utils/streamFilter';
 const DB_NAME = 'kagoplay_offline_db';
 const DB_VERSION = 1;
 const MAX_IDB_AUDIO_BLOB_BYTES = 150 * 1024 * 1024;
+const MAX_MEMORY_BLOB_CACHE_ENTRIES = 12;
 const memoryBlobCache = new Map<string, Blob>();
+
+function setBoundedMemoryBlob(trackId: string, blob: Blob): void {
+  if (memoryBlobCache.has(trackId)) {
+    memoryBlobCache.delete(trackId);
+  }
+  memoryBlobCache.set(trackId, blob);
+  while (memoryBlobCache.size > MAX_MEMORY_BLOB_CACHE_ENTRIES) {
+    const oldestKey = memoryBlobCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    memoryBlobCache.delete(oldestKey);
+  }
+}
 
 const STORES = {
   TRACKS: 'tracks',
@@ -152,13 +165,13 @@ export const localDb = {
   },
 
   primeAudioBlob(trackId: string, audioBlob: Blob): void {
-    memoryBlobCache.set(trackId, audioBlob);
+    setBoundedMemoryBlob(trackId, audioBlob);
   },
 
   async saveTrack(track: Track, audioBlob?: Blob): Promise<void> {
     await putInStore(STORES.TRACKS, track);
     if (audioBlob) {
-      memoryBlobCache.set(track.id, audioBlob);
+      setBoundedMemoryBlob(track.id, audioBlob);
       if (audioBlob.size <= MAX_IDB_AUDIO_BLOB_BYTES) {
         await putInStore(STORES.BLOBS, audioBlob, track.id);
       }
@@ -184,10 +197,13 @@ export const localDb = {
 
   async getAudioBlob(trackId: string): Promise<Blob | undefined> {
     const cached = memoryBlobCache.get(trackId);
-    if (cached) return cached;
+    if (cached) {
+      setBoundedMemoryBlob(trackId, cached);
+      return cached;
+    }
     const stored = await getByKey<Blob>(STORES.BLOBS, trackId);
     if (stored) {
-      memoryBlobCache.set(trackId, stored);
+      setBoundedMemoryBlob(trackId, stored);
     }
     return stored;
   },
@@ -195,6 +211,11 @@ export const localDb = {
   async deleteTrack(trackId: string): Promise<void> {
     memoryBlobCache.delete(trackId);
     await deleteByKey(STORES.TRACKS, trackId);
+    await deleteByKey(STORES.BLOBS, trackId);
+  },
+
+  async deleteAudioBlob(trackId: string): Promise<void> {
+    memoryBlobCache.delete(trackId);
     await deleteByKey(STORES.BLOBS, trackId);
   },
 

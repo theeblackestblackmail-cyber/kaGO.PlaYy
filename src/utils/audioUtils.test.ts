@@ -11,6 +11,7 @@ import {
   buildCategorySearchPlan,
   buildCollectionQueue,
   buildInnertubeNextBody,
+  buildInnertubePlaylistNextBody,
   buildInnertubeSearchBody,
   buildRadioSeedQuery,
   clampCrossfadeSeconds,
@@ -48,6 +49,7 @@ import {
 import {
   POOR_CONNECTION_THRESHOLD_MS,
   evaluatePoorConnectionState,
+  insertPlayNextTracks,
   reorderMultipleQueueItems,
   restoreQueueOrder,
   selectSmartLibraryTracks,
@@ -205,13 +207,18 @@ test('extractYouTubeSearchResults & rankYouTubeSearchResults rank official high-
     },
   };
   const html = `<html><script>var ytInitialData = ${JSON.stringify(sampleYtData)};</script></html>`;
+  // Strict mode keeps only individual 45s-15m non-mix songs; default unrestricted mode extracts all 4 videos
+  assert.equal(extractYouTubeSearchResults(html, { strictSongFilter: true, includeShorts: false }).length, 2);
+
   const extracted = extractYouTubeSearchResults(html);
-  assert.equal(extracted.length, 2);
+  assert.equal(extracted.length, 4);
 
   const ranked = rankYouTubeSearchResults(extracted, 'Drake hotline bling');
   assert.equal(ranked[0].videoId, 'uxpDa-c-4Mc');
   assert.equal(ranked[0].isOfficial, true);
   assert.equal(ranked[0].viewCount, 2_100_000_000);
+  // Cover, short teaser, and mix remain searchable rather than hidden
+  assert.equal(ranked.length, 4);
 });
 
 test('parseYouTubeSuggestResponse parses autocomplete arrays cleanly', () => {
@@ -643,13 +650,15 @@ test('rankYouTubeSearchResults ranks popular official songs #1 even with minor s
   // Typo "wangeci" (missing 'h') still boosts official 3.4M hit to #1 and filters out unrequested acoustic covers
   const ranked = rankYouTubeSearchResults(candidates, 'we wega wangeci', 'songs');
   assert.equal(ranked[0].videoId, 'popularhit1');
-  assert.equal(ranked.some((r) => r.videoId === 'coverhit002'), false);
+  // Cover remains discoverable below the official #1 hit
+  assert.equal(ranked.some((r) => r.videoId === 'coverhit002'), true);
 });
 
 test('buildCategorySearchPlan builds appropriate search queries and YouTube filters for all 8 categories', () => {
   assert.equal(buildCategorySearchPlan('Drake', '', 'all').sp, undefined);
   assert.equal(buildCategorySearchPlan('Drake', '', 'songs').sp, 'EgIQAQ%3D%3D');
-  assert.ok(buildCategorySearchPlan('Drake', '', 'videos').searchQuery.includes('official music video'));
+  assert.equal(buildCategorySearchPlan('How to cook chapati', '', 'videos').searchQuery, 'How to cook chapati');
+  assert.ok(buildCategorySearchPlan('', '', 'videos').searchQuery.includes('official music video'));
   assert.ok(buildCategorySearchPlan('Drake', '', 'albums').searchQuery.includes('full album'));
   assert.equal(buildCategorySearchPlan('Drake', '', 'artists').sp, 'EgIQAg%3D%3D');
   assert.equal(buildCategorySearchPlan('Drake', '', 'playlists').sp, 'EgIQAw%3D%3D');
@@ -882,10 +891,10 @@ test('extractYouTubeSearchResults parses Innertube JSON, videoWithContextRendere
   assert.equal(spamItem?.isOfficial, false);
   assert.equal(officialItem?.isOfficial, true);
 
-  // Plain search drops Sped Up and ranks verified 340M official upload #1
+  // Official 340M upload ranks #1 while sped-up derivative still remains available below it
   const rankedPlain = rankYouTubeSearchResults(extracted, 'Burna Boy Last Last', 'songs');
   assert.equal(rankedPlain[0].videoId, '421w1j87fEM');
-  assert.equal(rankedPlain.some((r) => r.videoId === 'spedup00002'), false);
+  assert.equal(rankedPlain.some((r) => r.videoId === 'spedup00002'), true);
 
   // Explicit derivative search keeps Sped Up when requested
   const rankedSpedUp = rankYouTubeSearchResults(extracted, 'Burna Boy Last Last sped up', 'songs');
@@ -2305,5 +2314,406 @@ test('content-based filtering analyzes current track metadata/genre, ranks match
     false
   );
 });
+
+test('extractYouTubeSearchResults & rankYouTubeSearchResults include 2-view videos, non-music videos, >15m mixes, and Shorts while prioritizing popular hits', () => {
+  const mixedYoutubePayload = JSON.stringify({
+    contents: {
+      twoColumnSearchResultsRenderer: {
+        primaryContents: {
+          sectionListRenderer: {
+            contents: [
+              {
+                itemSectionRenderer: {
+                  contents: [
+                    {
+                      videoRenderer: {
+                        videoId: 'twoviewvid1',
+                        title: { runs: [{ text: 'Nairobi Street Freestyle Studio Clip' }] },
+                        ownerText: { runs: [{ text: 'Bedroom Records KE' }] },
+                        lengthText: { simpleText: '1:12' },
+                        viewCountText: { simpleText: '2 views' },
+                      },
+                    },
+                    {
+                      videoRenderer: {
+                        videoId: 'kenyanmix01',
+                        title: { runs: [{ text: 'Kenyan Arbantone 1 Hour Nonstop DJ Mix' }] },
+                        ownerText: { runs: [{ text: 'DJ Nairobi' }] },
+                        lengthText: { simpleText: '1:04:20' },
+                        viewCountText: { simpleText: '540K views' },
+                      },
+                    },
+                    {
+                      videoRenderer: {
+                        videoId: 'chapativid1',
+                        title: { runs: [{ text: 'How to Make Soft Layered Kenyan Chapati Tutorial' }] },
+                        ownerText: { runs: [{ text: 'Jikoni Magic' }] },
+                        lengthText: { simpleText: '17:35' },
+                        viewCountText: { simpleText: '2.4M views' },
+                      },
+                    },
+                    {
+                      videoRenderer: {
+                        videoId: 'sautisol001',
+                        title: { runs: [{ text: 'Sauti Sol - Suzanna' }] },
+                        ownerText: { runs: [{ text: 'Sauti Sol' }] },
+                        ownerBadges: [{ metadataBadgeRenderer: { style: 'BADGE_STYLE_TYPE_VERIFIED_ARTIST' } }],
+                        lengthText: { simpleText: '3:57' },
+                        viewCountText: { simpleText: '45M views' },
+                      },
+                    },
+                    {
+                      shortsLockupViewModel: {
+                        entityId: 'shorts-shelf-item-shortvid001',
+                        overlayMetadata: {
+                          primaryText: { content: 'Nairobi Studio Clip #shorts' },
+                          secondaryText: { content: '2 views' },
+                        },
+                        onTap: {
+                          innertubeCommand: {
+                            reelWatchEndpoint: { videoId: 'shortvid001' },
+                          },
+                        },
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+  });
+
+  const extracted = extractYouTubeSearchResults(mixedYoutubePayload);
+  assert.equal(extracted.length, 5);
+  assert.equal(extracted.some((v) => v.videoId === 'twoviewvid1' && v.viewCount === 2), true);
+  assert.equal(extracted.some((v) => v.videoId === 'kenyanmix01' && v.durationSeconds === 3860), true);
+  assert.equal(extracted.some((v) => v.videoId === 'chapativid1' && v.durationSeconds === 1055), true);
+  assert.equal(extracted.some((v) => v.videoId === 'shortvid001'), true);
+
+  // Popular official Kenyan hit ranks #1 when searching Sauti Sol Suzanna
+  const rankedPopular = rankYouTubeSearchResults(extracted, 'Sauti Sol Suzanna', 'all');
+  assert.equal(rankedPopular[0].videoId, 'sautisol001');
+
+  // Searching specifically for a 2-view video surfaces it #1
+  const rankedObscure = rankYouTubeSearchResults(extracted, 'Nairobi Street Freestyle Studio Clip', 'all');
+  assert.equal(rankedObscure[0].videoId, 'twoviewvid1');
+});
+
+test('readNativeDocumentBytes & importFromNativeFolderPicker recover from oversized chunk errors and per-file failures', async () => {
+  const { readNativeDocumentBytes } = await import('./nativeMediaBridge');
+  const { importFromNativeFolderPicker } = await import('./folderImporter');
+
+  const sampleBytes = new TextEncoder().encode('ID3TESTAUDIO_PAYLOAD_1234567890');
+  const sampleB64 = Buffer.from(sampleBytes).toString('base64');
+
+  const prevWindow = (globalThis as { window?: unknown }).window;
+  const listeners = new Map<string, Set<(ev: { detail?: unknown }) => void>>();
+
+  // Simulate Android Binder throwing on 128KB request and succeeding on 32KB fallback, plus one unreadable file
+  const mockWindow = {
+    KaGoNative: {
+      pickFolderNative: (requestId: string) => {
+        setTimeout(() => {
+          const cbs = listeners.get('kago-native-folder');
+          cbs?.forEach((fn) =>
+            fn({
+              detail: {
+                requestId,
+                ok: true,
+                cancelled: false,
+                rootFolder: 'Muziq',
+                files: [
+                  {
+                    uri: 'content://bad/1',
+                    name: 'corrupted_song.mp3',
+                    mimeType: 'audio/mpeg',
+                    size: 1000,
+                    lastModified: 1000,
+                    folderPath: 'Muziq',
+                  },
+                  {
+                    uri: 'content://good/2',
+                    name: 'Nairobi - Valid Song.mp3',
+                    mimeType: 'audio/mpeg',
+                    size: sampleBytes.length,
+                    lastModified: 2000,
+                    folderPath: 'Muziq',
+                  },
+                ],
+              },
+            })
+          );
+        }, 5);
+      },
+      readDocumentChunkBase64: (uri: string, offset: number, length: number) => {
+        if (uri === 'content://bad/1') {
+          throw new Error('Binder TransactionTooLargeException');
+        }
+        if (length > 64 * 1024) {
+          throw new Error('Chunk too large');
+        }
+        if (offset >= sampleBytes.length) return '';
+        return Buffer.from(sampleBytes.slice(offset, offset + length)).toString('base64');
+      },
+    },
+    addEventListener: (name: string, fn: (ev: { detail?: unknown }) => void) => {
+      if (!listeners.has(name)) listeners.set(name, new Set());
+      listeners.get(name)!.add(fn);
+    },
+    removeEventListener: (name: string, fn: (ev: { detail?: unknown }) => void) => {
+      listeners.get(name)?.delete(fn);
+    },
+    setTimeout,
+    clearTimeout,
+  };
+
+  (globalThis as { window?: unknown }).window = mockWindow;
+  try {
+    // Expect readNativeDocumentBytes with expectedSize=200KB (triggers 128KB first, then retries 32KB!)
+    const bytes = readNativeDocumentBytes('content://good/2', 200 * 1024);
+    assert.ok(bytes && bytes.length === sampleBytes.length);
+    assert.equal(Buffer.from(bytes).toString('base64'), sampleB64);
+
+    // Expect importFromNativeFolderPicker to skip bad file and cleanly import good file via streaming callback
+    const streamed: string[] = [];
+    const importRes = await importFromNativeFolderPicker({
+      onTrackReady: ({ track }) => {
+        streamed.push(track.folderPath || '');
+      },
+    });
+    assert.equal(importRes.cancelled, false);
+    assert.equal(importRes.error, undefined);
+    assert.equal(importRes.failedFiles, 1);
+    assert.equal(importRes.tracks.length, 1);
+    assert.deepEqual(streamed, ['Muziq']);
+  } finally {
+    (globalThis as { window?: unknown }).window = prevWindow;
+  }
+});
+
+test('streamDownloads gates visibility strictly to streamed tracks and validates format options & filename sanitization', async () => {
+  const {
+    DEFAULT_LOCAL_DOWNLOAD_FORMAT,
+    DOWNLOAD_FORMAT_MAP,
+    DOWNLOAD_FORMAT_OPTIONS,
+    estimateFormatSizeBytes,
+    formatByteSize,
+    isCollectionDownloadable,
+    isStreamDownloadableTrack,
+    isTrackSavedAsAppDownload,
+    sanitizeDownloadFilename,
+  } = await import('./streamDownloads');
+
+  const streamTrack: Track = {
+    id: 'yt-12345678901',
+    youtubeId: '12345678901',
+    title: 'Chonjo (feat. Scar)',
+    artist: 'Wangechi',
+    album: 'Chonjo',
+    duration: 210,
+    source: 'stream',
+    addedAt: 1,
+  };
+  const localTrack: Track = {
+    id: 'local-1',
+    title: 'My Offline Song',
+    artist: 'Local Artist',
+    album: 'Phone Folder',
+    duration: 200,
+    source: 'local',
+    addedAt: 2,
+  };
+  const synthTrack: Track = {
+    id: 'synth-1',
+    title: 'Synth Stem',
+    artist: 'kaGO Synth',
+    album: 'Stems',
+    duration: 180,
+    source: 'synth',
+    addedAt: 3,
+  };
+  const collectionItem: Track = {
+    id: 'pl-1',
+    title: 'Chonjo EP',
+    artist: 'Wangechi',
+    album: 'Album',
+    duration: 0,
+    source: 'stream',
+    resultType: 'album',
+    youtubePlaylistId: 'PLalbum12345',
+    addedAt: 4,
+  };
+
+  assert.equal(isStreamDownloadableTrack(streamTrack), true);
+  assert.equal(isStreamDownloadableTrack(localTrack), false);
+  assert.equal(isStreamDownloadableTrack(synthTrack), false);
+  assert.equal(isStreamDownloadableTrack(collectionItem), false);
+  assert.equal(isCollectionDownloadable([localTrack, synthTrack]), false);
+  assert.equal(isCollectionDownloadable([localTrack, streamTrack]), true);
+
+  const savedOffline = [{ ...streamTrack, isAppDownload: true }];
+  assert.equal(isTrackSavedAsAppDownload(streamTrack.id, savedOffline), true);
+  assert.equal(isTrackSavedAsAppDownload(localTrack.id, savedOffline), false);
+
+  assert.equal(DEFAULT_LOCAL_DOWNLOAD_FORMAT, 'mp3-160');
+  const expectedIds = [
+    'm4a-128',
+    'mp3-70',
+    'mp3-128',
+    'mp3-160',
+    'mp3-320',
+    'mp4-144p',
+    'mp4-240p',
+    'mp4-360p',
+    'mp4-480p',
+    'mp4-720p',
+  ];
+  assert.deepEqual(
+    DOWNLOAD_FORMAT_OPTIONS.map((o) => o.id),
+    expectedIds
+  );
+
+  // Classic MP3 (160K) at 210s => (160_000 / 8) * 210 = 4,200,000 bytes (~4.0 MB)
+  const mp3Size = estimateFormatSizeBytes(210, DOWNLOAD_FORMAT_MAP['mp3-160']);
+  assert.equal(mp3Size, 4_200_000);
+  assert.equal(formatByteSize(mp3Size), '4.0 MB');
+  assert.equal(
+    sanitizeDownloadFilename('Song: "Test"? / Remix*', 'Artist/One', 'mp3'),
+    'Artist One - Song Test Remix.mp3'
+  );
+});
+
+test('YouTube RD Mix URLs, collection cards, and Innertube next bodies resolve cleanly for streaming & downloading', () => {
+  assert.equal(
+    parseYouTubePlaylistInput('https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=RDdQw4w9WgXcQ'),
+    'RDdQw4w9WgXcQ'
+  );
+  assert.equal(parseYouTubePlaylistInput('RDMM_abc1234'), 'RDMM_abc1234');
+
+  const nextBody = JSON.parse(buildInnertubePlaylistNextBody('RDdQw4w9WgXcQ')) as {
+    playlistId: string;
+    videoId?: string;
+  };
+  assert.equal(nextBody.playlistId, 'RDdQw4w9WgXcQ');
+  assert.equal(nextBody.videoId, 'dQw4w9WgXcQ');
+
+  const mixSearchPayload = `<html><script>var ytInitialData = ${JSON.stringify({
+    contents: {
+      twoColumnSearchResultsRenderer: {
+        primaryContents: {
+          sectionListRenderer: {
+            contents: [
+              {
+                itemSectionRenderer: {
+                  contents: [
+                    {
+                      playlistRenderer: {
+                        playlistId: 'RDdQw4w9WgXcQ',
+                        title: { simpleText: 'Mix - Classic Synth Pop' },
+                        shortBylineText: { runs: [{ text: 'YouTube' }] },
+                        videoCount: '25',
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      },
+    },
+  })};</script></html>`;
+
+  const mixes = extractYouTubeCollections(mixSearchPayload, 'playlists', 'Pop');
+  assert.equal(mixes.length, 1);
+  assert.equal(mixes[0].youtubePlaylistId, 'RDdQw4w9WgXcQ');
+  assert.equal(mixes[0].resultType, 'playlist');
+});
+
+test('setup-android-native installs mipmap launcher PNGs and adaptive icons when public icons exist', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { applyAndroidNativeOverrides } = await import('../../scripts/setup-android-native.mjs');
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kago-icon-test-'));
+  try {
+    const androidMain = path.join(tmpRoot, 'android', 'app', 'src', 'main');
+    fs.mkdirSync(path.join(androidMain, 'java', 'com', 'kagoplay', 'workstation'), { recursive: true });
+    fs.symlinkSync(path.resolve(process.cwd(), 'android-native'), path.join(tmpRoot, 'android-native'));
+    fs.symlinkSync(path.resolve(process.cwd(), 'public'), path.join(tmpRoot, 'public'));
+
+    fs.writeFileSync(
+      path.join(androidMain, 'AndroidManifest.xml'),
+      `<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="@string/app_name">
+        <activity android:name=".MainActivity" android:exported="true"></activity>
+    </application>
+    <uses-permission android:name="android.permission.INTERNET" />
+</manifest>`,
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(tmpRoot, 'android', 'app', 'build.gradle'),
+      `android {}\ndependencies {\n    implementation "androidx.appcompat:appcompat:1.6.1"\n}\n`,
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(tmpRoot, 'android', 'variables.gradle'),
+      `ext {\n    compileSdkVersion = 34\n    targetSdkVersion = 34\n}\n`,
+      'utf8'
+    );
+
+    applyAndroidNativeOverrides(tmpRoot);
+
+    assert.ok(fs.existsSync(path.join(androidMain, 'res', 'mipmap-xxxhdpi', 'ic_launcher.png')));
+    assert.ok(fs.existsSync(path.join(androidMain, 'res', 'mipmap-xxxhdpi', 'ic_launcher_round.png')));
+    assert.ok(fs.existsSync(path.join(androidMain, 'res', 'mipmap-xxxhdpi', 'ic_launcher_foreground.png')));
+    assert.ok(fs.existsSync(path.join(androidMain, 'res', 'mipmap-anydpi-v26', 'ic_launcher.xml')));
+    const manifest = fs.readFileSync(path.join(androidMain, 'AndroidManifest.xml'), 'utf8');
+    assert.ok(manifest.includes('WRITE_EXTERNAL_STORAGE'));
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('insertPlayNextTracks inserts directly after current track, deduplicates existing entries, and handles batches cleanly', () => {
+  const mk = (id: string, autoQueued = false): Track => ({
+    id,
+    title: `Song ${id}`,
+    artist: 'Artist',
+    album: 'Album',
+    duration: 180,
+    source: 'local',
+    autoQueued,
+    addedAt: 1,
+  });
+
+  const q = [mk('a'), mk('b'), mk('c', true), mk('d')];
+
+  // Insert brand new track 'e' right after current track 'b'
+  const afterNew = insertPlayNextTracks(q, [mk('e', true)], 'b');
+  assert.deepEqual(afterNew.map((t) => t.id), ['a', 'b', 'e', 'c', 'd']);
+  assert.equal(afterNew[2].autoQueued, false);
+
+  // Move existing track 'd' ahead to Play Next right after 'b' without duplicating it
+  const afterReorder = insertPlayNextTracks(q, [mk('d')], 'b');
+  assert.deepEqual(afterReorder.map((t) => t.id), ['a', 'b', 'd', 'c']);
+
+  // Batch Play Next preserves selection order directly after current track and skips active 'b'
+  const afterBatch = insertPlayNextTracks(q, [mk('b'), mk('x'), mk('a')], 'b');
+  assert.deepEqual(afterBatch.map((t) => t.id), ['b', 'x', 'a', 'c', 'd']);
+
+  // When nothing is active yet, prepends cleanly at index 0
+  const afterIdle = insertPlayNextTracks(q, [mk('z')], null);
+  assert.deepEqual(afterIdle.map((t) => t.id), ['z', 'a', 'b', 'c', 'd']);
+});
+
+
+
 
 

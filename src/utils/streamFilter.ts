@@ -252,25 +252,42 @@ function isOfficialYouTubeUpload(
   return false;
 }
 
+export interface YouTubeSearchExtractOptions {
+  strictSongFilter?: boolean;
+  includeShorts?: boolean;
+}
+
 function toParsedVideoFromRenderer(
   v: YouTubeVideoRenderer,
-  seenIds: Set<string>
+  seenIds: Set<string>,
+  options: YouTubeSearchExtractOptions = {}
 ): ParsedYouTubeVideo | null {
+  const { strictSongFilter = false, includeShorts = true } = options;
   const videoId = v?.videoId?.trim();
   if (!videoId || seenIds.has(videoId)) return null;
   const urlPath = v.navigationEndpoint?.commandMetadata?.webCommandMetadata?.url || '';
-  if (v.navigationEndpoint?.reelWatchEndpoint || urlPath.includes('/shorts/')) return null;
+  if (!includeShorts && (v.navigationEndpoint?.reelWatchEndpoint || urlPath.includes('/shorts/'))) {
+    return null;
+  }
 
   const rawTitle = readYtText(v.title) || readYtText(v.headline);
-  const channelName =
+  const rawChannel =
     readYtText(v.ownerText) || readYtText(v.shortBylineText) || readYtText(v.longBylineText);
-  const durationSeconds = parseYouTubeDuration(readYtText(v.lengthText));
+  const channelName = rawChannel
+    .split(/\r?\n/)[0]
+    .replace(/\s*[•·]\s*[\d.,]+\s*[KMB]?\s*views?.*$/i, '')
+    .replace(/\s*[•·]\s*\d+\s*(?:seconds?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago.*$/i, '')
+    .trim();
+  const parsedDuration = parseYouTubeDuration(readYtText(v.lengthText));
 
-  if (!rawTitle || durationSeconds <= 0) return null;
-  if (!isIndividualSong(rawTitle, channelName, durationSeconds)) return null;
+  if (!rawTitle) return null;
+  if (strictSongFilter) {
+    if (parsedDuration <= 0) return null;
+    if (!isIndividualSong(rawTitle, channelName, parsedDuration)) return null;
+  }
 
   const { artist, title } = parseYouTubeArtistAndTitle(rawTitle, channelName);
-  if (!isIndividualSong(title, artist, durationSeconds)) return null;
+  if (strictSongFilter && !isIndividualSong(title, artist, parsedDuration)) return null;
 
   const viewText =
     readYtText(v.viewCountText) ||
@@ -285,7 +302,7 @@ function toParsedVideoFromRenderer(
     videoId,
     title,
     artist,
-    durationSeconds,
+    durationSeconds: parsedDuration > 0 ? parsedDuration : urlPath.includes('/shorts/') ? 45 : 180,
     thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
     viewCount,
     isOfficial,
@@ -341,8 +358,10 @@ interface YouTubeLockupVideoCard {
 
 function extractVideoFromLockup(
   lk: YouTubeLockupVideoCard,
-  seenIds: Set<string>
+  seenIds: Set<string>,
+  options: YouTubeSearchExtractOptions = {}
 ): ParsedYouTubeVideo | null {
+  const { strictSongFilter = false } = options;
   const videoId = lk?.contentId?.trim() || '';
   if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId) || seenIds.has(videoId)) return null;
   if (
@@ -372,12 +391,14 @@ function extractVideoFromLockup(
       break;
     }
   }
-  const durationSeconds = parseYouTubeDuration(durationText);
-  if (durationSeconds <= 0) return null;
-  if (!isIndividualSong(rawTitle, channelName, durationSeconds)) return null;
+  const parsedDuration = parseYouTubeDuration(durationText);
+  if (strictSongFilter) {
+    if (parsedDuration <= 0) return null;
+    if (!isIndividualSong(rawTitle, channelName, parsedDuration)) return null;
+  }
 
   const { artist, title } = parseYouTubeArtistAndTitle(rawTitle, channelName);
-  if (!isIndividualSong(title, artist, durationSeconds)) return null;
+  if (strictSongFilter && !isIndividualSong(title, artist, parsedDuration)) return null;
 
   let viewCount = 0;
   for (const row of rows) {
@@ -404,7 +425,7 @@ function extractVideoFromLockup(
     videoId,
     title,
     artist,
-    durationSeconds,
+    durationSeconds: parsedDuration > 0 ? parsedDuration : 180,
     thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
     viewCount,
     isOfficial,
@@ -412,7 +433,95 @@ function extractVideoFromLockup(
   };
 }
 
-export function extractYouTubeSearchResults(htmlOrJson: string): ParsedYouTubeVideo[] {
+interface YouTubeShortsLockupCard {
+  entityId?: string;
+  onTap?: {
+    innertubeCommand?: {
+      reelWatchEndpoint?: { videoId?: string };
+      commandMetadata?: { webCommandMetadata?: { url?: string } };
+    };
+  };
+  overlayMetadata?: {
+    primaryText?: { content?: string };
+    secondaryText?: { content?: string };
+  };
+}
+
+interface YouTubeReelItemRenderer {
+  videoId?: string;
+  headline?: YouTubeTextContainer;
+  viewCountText?: YouTubeTextContainer;
+  navigationEndpoint?: {
+    reelWatchEndpoint?: { videoId?: string };
+  };
+}
+
+function extractShortFromLockup(
+  card: YouTubeShortsLockupCard,
+  seenIds: Set<string>
+): ParsedYouTubeVideo | null {
+  const url = card?.onTap?.innertubeCommand?.commandMetadata?.webCommandMetadata?.url || '';
+  const urlMatch = url.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
+  const entityMatch = (card?.entityId || '').match(/([a-zA-Z0-9_-]{11})$/);
+  const videoId =
+    card?.onTap?.innertubeCommand?.reelWatchEndpoint?.videoId?.trim() ||
+    urlMatch?.[1] ||
+    entityMatch?.[1] ||
+    '';
+  if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId) || seenIds.has(videoId)) return null;
+
+  const rawTitle = card?.overlayMetadata?.primaryText?.content?.trim() || '';
+  if (!rawTitle) return null;
+
+  const secondary = card?.overlayMetadata?.secondaryText?.content || '';
+  const viewCount = parseYouTubeViewCount(secondary);
+  const { artist, title } = parseYouTubeArtistAndTitle(rawTitle, 'YouTube Shorts');
+
+  seenIds.add(videoId);
+  return {
+    videoId,
+    title,
+    artist,
+    durationSeconds: 45,
+    thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    viewCount,
+    isOfficial: false,
+    channelName: 'YouTube Shorts',
+  };
+}
+
+function extractShortFromReelRenderer(
+  reel: YouTubeReelItemRenderer,
+  seenIds: Set<string>
+): ParsedYouTubeVideo | null {
+  const videoId =
+    reel?.videoId?.trim() || reel?.navigationEndpoint?.reelWatchEndpoint?.videoId?.trim() || '';
+  if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId) || seenIds.has(videoId)) return null;
+
+  const rawTitle = readYtText(reel?.headline);
+  if (!rawTitle) return null;
+
+  const viewCount = parseYouTubeViewCount(readYtText(reel?.viewCountText));
+  const { artist, title } = parseYouTubeArtistAndTitle(rawTitle, 'YouTube Shorts');
+
+  seenIds.add(videoId);
+  return {
+    videoId,
+    title,
+    artist,
+    durationSeconds: 45,
+    thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    viewCount,
+    isOfficial: false,
+    channelName: 'YouTube Shorts',
+  };
+}
+
+export function extractYouTubeSearchResults(
+  htmlOrJson: string,
+  options: YouTubeSearchExtractOptions = {}
+): ParsedYouTubeVideo[] {
+  const { strictSongFilter = false, includeShorts = !strictSongFilter } = options;
   const data = extractYtInitialDataJson(htmlOrJson);
   if (!data) return [];
 
@@ -424,7 +533,7 @@ export function extractYouTubeSearchResults(htmlOrJson: string): ParsedYouTubeVi
   const results: ParsedYouTubeVideo[] = [];
 
   for (const v of renderers) {
-    const parsed = toParsedVideoFromRenderer(v, seenIds);
+    const parsed = toParsedVideoFromRenderer(v, seenIds, { strictSongFilter, includeShorts });
     if (parsed) results.push(parsed);
   }
 
@@ -432,8 +541,25 @@ export function extractYouTubeSearchResults(htmlOrJson: string): ParsedYouTubeVi
   const lockups: YouTubeLockupVideoCard[] = [];
   collectNodesByKey(data, 'lockupViewModel', lockups as unknown[]);
   for (const lk of lockups) {
-    const parsed = extractVideoFromLockup(lk, seenIds);
+    const parsed = extractVideoFromLockup(lk, seenIds, { strictSongFilter, includeShorts });
     if (parsed) results.push(parsed);
+  }
+
+  // Include YouTube Shorts cards when unrestricted so any YouTube upload is playable
+  if (includeShorts && !strictSongFilter) {
+    const shortsLockups: YouTubeShortsLockupCard[] = [];
+    collectNodesByKey(data, 'shortsLockupViewModel', shortsLockups as unknown[]);
+    for (const card of shortsLockups) {
+      const parsed = extractShortFromLockup(card, seenIds);
+      if (parsed) results.push(parsed);
+    }
+
+    const reelItems: YouTubeReelItemRenderer[] = [];
+    collectNodesByKey(data, 'reelItemRenderer', reelItems as unknown[]);
+    for (const reel of reelItems) {
+      const parsed = extractShortFromReelRenderer(reel, seenIds);
+      if (parsed) results.push(parsed);
+    }
   }
 
   return results;
@@ -499,7 +625,11 @@ export function buildCategorySearchPlan(
       };
     case 'videos':
       return {
-        searchQuery: [cleanQ, genre ? `${genre} music` : '', 'official music video']
+        searchQuery: [
+          cleanQ,
+          genre ? `${genre} music` : '',
+          !cleanQ && !genre ? 'official music video' : '',
+        ]
           .filter(Boolean)
           .join(' '),
         sp: 'EgIQAQ%3D%3D',
@@ -595,22 +725,46 @@ export function buildInnertubeBrowseBody(browseId: string): string {
   });
 }
 
+export function buildInnertubePlaylistNextBody(playlistId: string, videoId?: string): string {
+  const payload: Record<string, unknown> = {
+    context: {
+      client: {
+        clientName: 'WEB',
+        clientVersion: '2.20250218.01.00',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    playlistId,
+  };
+  const derivedRdMatch = !videoId ? playlistId.match(/^RD([a-zA-Z0-9_-]{11})$/) : null;
+  const effectiveVideoId = videoId || derivedRdMatch?.[1];
+  if (effectiveVideoId) {
+    payload.videoId = effectiveVideoId;
+  }
+  return JSON.stringify(payload);
+}
+
 export function rankYouTubeSearchResults(
   results: ParsedYouTubeVideo[],
   query: string,
-  category: StreamSearchCategory = 'all'
+  category: StreamSearchCategory = 'all',
+  options: { allowAllVideos?: boolean } = {}
 ): ParsedYouTubeVideo[] {
+  const { allowAllVideos = true } = options;
   const cleanQuery = query.trim().toLowerCase();
   const queryWantsDerivative =
     DERIVATIVE_UPLOAD_RE.test(cleanQuery) || VERSION_QUALIFIER_RE.test(cleanQuery);
   const queryTokens = cleanQuery.split(/[^a-z0-9]+/i).filter((t) => t.length >= 2);
 
-  // Drop obvious unofficial derivative uploads unless user specifically asked for them
-  const primaryPool = queryWantsDerivative
-    ? results
-    : results.filter(
-        (r) => !DERIVATIVE_UPLOAD_RE.test(`${r.title} ${r.artist} ${r.channelName || ''}`)
-      );
+  // When allowAllVideos is false, filter derivative uploads if primary hits exist;
+  // when allowAllVideos is true (default), keep ALL videos (even 2-view / mixes / covers) and rank official hits first.
+  const primaryPool =
+    allowAllVideos || queryWantsDerivative
+      ? results
+      : results.filter(
+          (r) => !DERIVATIVE_UPLOAD_RE.test(`${r.title} ${r.artist} ${r.channelName || ''}`)
+        );
 
   const pool = primaryPool.length > 0 ? primaryPool : results;
   const hasHighAuthorityAnchor = pool.some(
@@ -626,6 +780,7 @@ export function rankYouTubeSearchResults(
     let score = 0;
 
     // 1. Typo-tolerant word relevance match against search terms
+    let matchRatio = 1;
     if (queryTokens.length > 0) {
       let matchedSum = 0;
       let longTokensCount = 0;
@@ -638,11 +793,12 @@ export function rankYouTubeSearchResults(
           if (ts > 0) longTokensMatched++;
         }
       }
-      const matchRatio = matchedSum / queryTokens.length;
-      score += matchRatio * 75;
-      if (matchRatio >= 0.85) score += 28;
-      if (longTokensCount > 0 && longTokensMatched === longTokensCount) score += 24;
-      if (cleanQuery.length >= 4 && haystack.includes(cleanQuery)) score += 18;
+      matchRatio = matchedSum / queryTokens.length;
+      score += matchRatio * 135;
+      if (matchRatio >= 0.85) score += 36;
+      if (longTokensCount > 0 && longTokensMatched === longTokensCount) score += 28;
+      if (cleanQuery.length >= 4 && haystack.includes(cleanQuery)) score += 26;
+      if (matchRatio < 0.25) score -= 90;
 
       // Extra credit when the official/channel name itself matches artist tokens in query
       if (channelWords.length > 0) {
@@ -653,25 +809,30 @@ export function rankYouTubeSearchResults(
       }
     }
 
+    // Scale authority & view boosts by relevance so popular matches win #1, but unrelated viral hits cannot hijack specific queries
+    const relevanceGate = queryTokens.length === 0 ? 1 : Math.max(0.15, matchRatio);
+
     // 2. Strong Official Artist / VEVO / - Topic channel authority boost
-    if (item.isOfficial) score += 46;
+    if (item.isOfficial) score += 46 * relevanceGate;
     if (/-\s*topic$/i.test(item.channelName || '')) {
-      score += category === 'songs' ? 24 : category === 'all' ? 14 : 6;
+      score += (category === 'songs' ? 24 : category === 'all' ? 14 : 6) * relevanceGate;
     } else if (/vevo$/i.test(item.channelName || '')) {
-      score += 18;
+      score += 18 * relevanceGate;
     }
 
     // 3. Strong View-Count Popularity Ranking so popular hit singles beat obscure uploads
     const views = item.viewCount || 0;
     if (views > 0) {
-      score += Math.log10(views + 1) * 14;
-      if (views >= 100_000_000) score += 42;
-      else if (views >= 10_000_000) score += 32;
-      else if (views >= 1_000_000) score += 22;
-      else if (views >= 100_000) score += 12;
-      else if (hasHighAuthorityAnchor && !item.isOfficial && views < 10_000) score -= 65;
-    } else if (hasHighAuthorityAnchor && !item.isOfficial) {
-      score -= 48;
+      score += Math.log10(views + 1) * 14 * relevanceGate;
+      if (views >= 100_000_000) score += 42 * relevanceGate;
+      else if (views >= 10_000_000) score += 32 * relevanceGate;
+      else if (views >= 1_000_000) score += 22 * relevanceGate;
+      else if (views >= 100_000) score += 12 * relevanceGate;
+      else if (hasHighAuthorityAnchor && !item.isOfficial && views < 10_000 && matchRatio < 0.9) {
+        score -= 40;
+      }
+    } else if (hasHighAuthorityAnchor && !item.isOfficial && matchRatio < 0.9) {
+      score -= 30;
     }
 
     // 4. Category-specific ranking adjustments
@@ -681,10 +842,13 @@ export function rankYouTubeSearchResults(
       score += 14;
     }
 
-    // 5. Penalize unrequested remixes / covers / live / slowed / edits so original hit song comes #1
+    // 5. Demote unrequested remixes / covers / live / slowed / edits below official originals
     if (!queryWantsDerivative) {
+      if (DERIVATIVE_UPLOAD_RE.test(haystack)) {
+        score -= 55;
+      }
       if (VERSION_QUALIFIER_RE.test(titleLower) || VERSION_QUALIFIER_RE.test(cleanChannel)) {
-        score -= 68;
+        score -= 48;
       } else if (item.isOfficial) {
         score += 14;
       }
@@ -731,18 +895,20 @@ export function filterMusicSuggestions(suggestions: string[], userQuery = ''): s
     DERIVATIVE_UPLOAD_RE.test(cleanQ) || VERSION_QUALIFIER_RE.test(cleanQ);
   const seen = new Set<string>();
   const filtered: string[] = [];
+  const unfiltered: string[] = [];
 
   for (const raw of suggestions) {
     const clean = raw.trim();
     if (!clean) continue;
     const key = clean.toLowerCase();
     if (seen.has(key)) continue;
-    if (!userAskedDerivative && JUNK_SUGGESTION_RE.test(key)) continue;
     seen.add(key);
+    unfiltered.push(clean);
+    if (!userAskedDerivative && JUNK_SUGGESTION_RE.test(key)) continue;
     filtered.push(clean);
   }
 
-  return filtered.slice(0, 7);
+  return (filtered.length > 0 ? filtered : unfiltered).slice(0, 7);
 }
 
 export function filterRelevantAudiusTracks(tracks: Track[], query: string): Track[] {
@@ -869,7 +1035,7 @@ export function extractYouTubeRelatedResults(
   const lockups: YouTubeLockupVideoCard[] = [];
   collectNodesByKey(secondary, 'lockupViewModel', lockups as unknown[]);
   for (const lk of lockups) {
-    const parsed = extractVideoFromLockup(lk, seenIds);
+    const parsed = extractVideoFromLockup(lk, seenIds, { strictSongFilter: true });
     if (parsed) results.push(parsed);
   }
 
@@ -1187,11 +1353,12 @@ export function extractYouTubeCollections(
 
   for (const lk of lockups) {
     const playlistId = lk.contentId || '';
-    if (!playlistId || playlistId.startsWith('RD') || seen.has(playlistId)) continue;
+    if (!playlistId || seen.has(playlistId)) continue;
     if (
       lk.contentType &&
       !lk.contentType.includes('PLAYLIST') &&
-      !lk.contentType.includes('ALBUM')
+      !lk.contentType.includes('ALBUM') &&
+      !lk.contentType.includes('MIX')
     ) {
       continue;
     }
@@ -1222,19 +1389,24 @@ export function extractYouTubeCollections(
     const trackCount = countMatch ? parseInt(countMatch[1], 10) : undefined;
 
     seen.add(playlistId);
+    const isMix = playlistId.startsWith('RD');
     tracks.push({
       id: `ytpl-${playlistId}`,
       youtubePlaylistId: playlistId,
       streamProvider: 'youtube',
       title,
       artist: byline.replace(/\s*-\s*Topic$/i, '').trim() || 'YouTube Music',
-      album: category === 'albums' ? 'Full Album' : 'Playlist Collection',
+      album: isMix
+        ? 'YouTube Mix'
+        : category === 'albums'
+          ? 'Full Album'
+          : 'Playlist Collection',
       duration: (trackCount || 10) * 180,
       trackCount,
       resultType,
       source: 'stream',
       artworkUrl,
-      genre: genre || (category === 'albums' ? 'Album' : 'Playlist'),
+      genre: genre || (isMix ? 'Mix' : category === 'albums' ? 'Album' : 'Playlist'),
       addedAt: Date.now(),
       isOfficial: /vevo|topic|official|album/i.test(`${byline} ${title}`) || category === 'featured_playlists',
     });
@@ -1341,7 +1513,7 @@ export function parseYouTubePlaylistInput(rawInput: string): string | null {
     if (candidateUrl) {
       const parsed = new URL(candidateUrl);
       const listParam = parsed.searchParams.get('list')?.trim();
-      if (listParam && /^[a-zA-Z0-9_-]{10,}$/.test(listParam)) {
+      if (listParam && /^[a-zA-Z0-9_-]{6,}$/.test(listParam)) {
         return listParam;
       }
     }
@@ -1349,12 +1521,12 @@ export function parseYouTubePlaylistInput(rawInput: string): string | null {
     // Fall back to direct query/ID matching
   }
 
-  const listParamMatch = trimmed.match(/[?&]list=([a-zA-Z0-9_-]{10,})/);
+  const listParamMatch = trimmed.match(/[?&]list=([a-zA-Z0-9_-]{6,})/);
   if (listParamMatch?.[1]) {
     return listParamMatch[1];
   }
 
-  if (/^[a-zA-Z0-9_-]{10,}$/.test(trimmed) && !trimmed.includes('.')) {
+  if (/^[a-zA-Z0-9_-]{6,}$/.test(trimmed) && !trimmed.includes('.')) {
     return trimmed;
   }
 

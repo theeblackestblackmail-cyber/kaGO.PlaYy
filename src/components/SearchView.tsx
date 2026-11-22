@@ -1,9 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BadgeCheck,
+  CheckCircle2,
   Disc3,
+  Download,
   FolderOpen,
   ListPlus,
+  ListStart,
   Loader2,
   Music,
   Pause,
@@ -31,6 +34,7 @@ import {
   writeDiscoveryText,
 } from '../utils/streamDiscovery';
 import { pushRecentSearch } from '../utils/streamFilter';
+import { isStreamDownloadableTrack } from '../utils/streamDownloads';
 import {
   fetchDiverseDiscoveryFeed,
   fetchMusicSuggestions,
@@ -39,13 +43,16 @@ import {
 
 interface SearchViewProps {
   libraryTracks: Track[];
+  downloadedTrackIds?: Set<string>;
   engine: AudioEngineSnapshot;
   onPlayTrack: (track: Track) => void;
   onTogglePlay: () => void;
+  onPlayNext?: (track: Track) => void;
   onAddToQueue: (track: Track) => void;
   onSaveTrackToLibrary: (track: Track) => void;
   onPickSong: () => void;
   onPickFolder: () => void;
+  onRequestDownloadTrack?: (track: Track) => void;
 }
 
 const SEARCH_POPULAR_STORAGE_KEY = 'kago_search_last_popular';
@@ -55,13 +62,16 @@ const SEARCH_SESSION_SEEN_KEY = 'kago_search_session_seen';
 
 export const SearchView: React.FC<SearchViewProps> = ({
   libraryTracks,
+  downloadedTrackIds,
   engine,
   onPlayTrack,
   onTogglePlay,
+  onPlayNext,
   onAddToQueue,
   onSaveTrackToLibrary,
   onPickSong,
   onPickFolder,
+  onRequestDownloadTrack,
 }) => {
   const [visitSeed] = useState<number>(() => nextDiscoveryVisitSeed('kago_search_visit_seed'));
   const currentContentProfile = useMemo(
@@ -484,10 +494,24 @@ export const SearchView: React.FC<SearchViewProps> = ({
                       </p>
                     </div>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <span className="font-mono-tabular text-xs text-[#8E929B]">
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <span className="font-mono-tabular text-xs text-[#8E929B] mr-1">
                       {formatDuration(track.duration)}
                     </span>
+                    {onPlayNext && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          triggerHaptic('selection');
+                          onPlayNext(track);
+                        }}
+                        aria-label={`Play ${track.title} next`}
+                        title="Play Next"
+                        className="flex h-8 w-8 items-center justify-center rounded-md text-[#8E929B] hover:bg-[#1C1E27] hover:text-white cursor-pointer"
+                      >
+                        <ListStart className="h-4 w-4 text-[#E11D48]" />
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => {
@@ -607,6 +631,55 @@ export const SearchView: React.FC<SearchViewProps> = ({
                   </div>
 
                   <div className="mt-4 flex items-center gap-2 border-t border-[#1A1C24] pt-3">
+                    {onRequestDownloadTrack && isStreamDownloadableTrack(track) && (() => {
+                      const isSavedOffline =
+                        Boolean(track.isAppDownload) || Boolean(downloadedTrackIds?.has(track.id));
+                      return (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            triggerHaptic('selection');
+                            onRequestDownloadTrack(track);
+                          }}
+                          aria-label={
+                            isSavedOffline
+                              ? `Downloaded ${track.title}`
+                              : `Download ${track.title}`
+                          }
+                          title={
+                            isSavedOffline
+                              ? 'Saved in App Downloads (tap for local export or removal)'
+                              : 'Download to app or device storage'
+                          }
+                          className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border transition-colors cursor-pointer ${
+                            isSavedOffline
+                              ? 'border-[#10B981]/50 bg-[#10B981]/10 text-[#10B981]'
+                              : 'border-[#282B36] bg-[#14161D] text-[#D1D5DB] hover:border-[#E11D48] hover:text-white'
+                          }`}
+                        >
+                          {isSavedOffline ? (
+                            <CheckCircle2 className="h-4 w-4" />
+                          ) : (
+                            <Download className="h-4 w-4 text-[#E11D48]" />
+                          )}
+                        </button>
+                      );
+                    })()}
+                    {onPlayNext && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          triggerHaptic('selection');
+                          onPlayNext(track);
+                          onSaveTrackToLibrary(track);
+                        }}
+                        aria-label={`Play ${track.title} next`}
+                        title="Play Next"
+                        className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[#282B36] bg-[#14161D] text-[#D1D5DB] hover:border-[#E11D48] hover:text-white cursor-pointer"
+                      >
+                        <ListStart className="h-4 w-4 text-[#E11D48]" />
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => {

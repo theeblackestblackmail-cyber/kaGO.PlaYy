@@ -7,6 +7,7 @@ import {
 } from './nativeMediaBridge';
 import {
   buildInnertubeBrowseBody,
+  buildInnertubePlaylistNextBody,
   extractYouTubePlaylistInfo,
   parseYouTubePlaylistInput,
 } from './streamFilter';
@@ -57,7 +58,7 @@ export async function fetchYouTubePlaylistByUrlOrId(
     // Fall through to native Android HTTP bridge
   }
 
-  // 2. Native Android APK bridge (Innertube browse + playlist HTML)
+  // 2. Native Android APK bridge (Innertube browse + /next for Mixes + playlist HTML)
   if (hasNativeHttpPostBridge()) {
     const browseRes = await nativePostJson(
       'https://www.youtube.com/youtubei/v1/browse?prettyPrint=false',
@@ -66,6 +67,23 @@ export async function fetchYouTubePlaylistByUrlOrId(
     );
     if (browseRes?.ok && browseRes.text) {
       const info = extractYouTubePlaylistInfo(browseRes.text, fallbackTitle);
+      if (info.tracks.length > 0) {
+        return {
+          ok: true,
+          listId,
+          title: preferredTitle?.trim() || info.title,
+          tracks: info.tracks,
+        };
+      }
+    }
+
+    const nextRes = await nativePostJson(
+      'https://www.youtube.com/youtubei/v1/next?prettyPrint=false',
+      buildInnertubePlaylistNextBody(listId),
+      9500
+    );
+    if (nextRes?.ok && nextRes.text) {
+      const info = extractYouTubePlaylistInfo(nextRes.text, fallbackTitle);
       if (info.tracks.length > 0) {
         return {
           ok: true,

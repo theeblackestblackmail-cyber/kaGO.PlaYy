@@ -4,9 +4,12 @@ import {
   BadgeCheck,
   BookmarkPlus,
   Check,
+  CheckCircle2,
   Disc3,
+  Download,
   ListMusic,
   ListPlus,
+  ListStart,
   Loader2,
   Pause,
   Play,
@@ -41,6 +44,7 @@ import {
   writeDiscoveryText,
 } from '../utils/streamDiscovery';
 import { pushRecentSearch } from '../utils/streamFilter';
+import { isStreamDownloadableTrack } from '../utils/streamDownloads';
 import { fetchYouTubePlaylistByUrlOrId } from '../utils/youtubePlaylist';
 import {
   fetchDiverseDiscoveryFeed,
@@ -51,13 +55,25 @@ import {
 
 interface StreamViewProps {
   engine: AudioEngineSnapshot;
+  downloadedTrackIds?: Set<string>;
   onPlayTrack: (track: Track) => void;
   onPlayCollection?: (tracks: Track[], startIndex: number) => void;
   onTogglePlay: () => void;
+  onPlayNext?: (track: Track) => void;
+  onPlayMultipleNext?: (tracks: Track[]) => void;
   onAddToQueue: (track: Track) => void;
   onAddMultipleToQueue?: (tracks: Track[]) => void;
   onSaveTrackToLibrary: (track: Track) => void;
   onSaveCollectionAsPlaylist?: (name: string, description: string, tracks: Track[]) => void;
+  onRequestDownloadTrack?: (track: Track) => void;
+  onRequestDownloadCollection?: (col: {
+    title: string;
+    artist: string;
+    artworkUrl?: string;
+    playlistId?: string;
+    tracks: Track[];
+    collectionType?: string;
+  }) => void;
 }
 
 const STREAM_CATEGORIES: Array<{ id: StreamSearchCategory; label: string }> = [
@@ -86,13 +102,18 @@ function formatCompactViews(views?: number): string {
 
 export const StreamView: React.FC<StreamViewProps> = ({
   engine,
+  downloadedTrackIds,
   onPlayTrack,
   onPlayCollection,
   onTogglePlay,
+  onPlayNext,
+  onPlayMultipleNext,
   onAddToQueue,
   onAddMultipleToQueue,
   onSaveTrackToLibrary,
   onSaveCollectionAsPlaylist,
+  onRequestDownloadTrack,
+  onRequestDownloadCollection,
 }) => {
   const [visitSeed] = useState<number>(() => nextDiscoveryVisitSeed('kago_stream_visit_seed'));
   const [query, setQuery] = useState('');
@@ -361,7 +382,7 @@ export const StreamView: React.FC<StreamViewProps> = ({
       setResults(merged.length > 0 ? merged : category === 'artists' ? [] : rotatedFallback);
       if (sourceFlag === 'fallback' && liveSongs.length === 0 && liveArtists.length === 0) {
         setStatusNote(
-          `No official stream matched "${cleanQ}". Showing rotated offline sound bank.`
+          `No YouTube stream matched "${cleanQ}". Showing rotated offline sound bank.`
         );
       }
     } catch {
@@ -838,6 +859,23 @@ export const StreamView: React.FC<StreamViewProps> = ({
                     <span>Play All</span>
                   </button>
 
+                  {onPlayMultipleNext && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        onPlayMultipleNext(inspectedTracks);
+                        setStatusNote(
+                          `Set all ${inspectedTracks.length} tracks from "${inspectedCollection.title}" to play next.`
+                        );
+                      }}
+                      className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3.5 py-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer whitespace-nowrap"
+                    >
+                      <ListStart className="h-3.5 w-3.5 text-[#E11D48]" />
+                      <span>Play Next</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
                     onClick={() => {
@@ -884,6 +922,32 @@ export const StreamView: React.FC<StreamViewProps> = ({
                           <span>Save Playlist</span>
                         </>
                       )}
+                    </button>
+                  )}
+
+                  {onRequestDownloadCollection && (
+                    <button
+                      type="button"
+                      data-testid="collection-inspector-download"
+                      onClick={() => {
+                        triggerHaptic('selection');
+                        onRequestDownloadCollection({
+                          title: inspectedCollection.title,
+                          artist: inspectedCollection.artist,
+                          artworkUrl: inspectedCollection.artworkUrl,
+                          playlistId: inspectedCollection.youtubePlaylistId,
+                          tracks: inspectedTracks,
+                          collectionType:
+                            inspectedCollection.resultType === 'album'
+                              ? 'Album Download'
+                              : 'Playlist / Mix Download',
+                        });
+                      }}
+                      aria-label={`Download ${inspectedCollection.title}`}
+                      className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3.5 py-2 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer whitespace-nowrap"
+                    >
+                      <Download className="h-3.5 w-3.5 text-[#E11D48]" />
+                      <span>Download</span>
                     </button>
                   )}
                 </div>
@@ -959,6 +1023,55 @@ export const StreamView: React.FC<StreamViewProps> = ({
                       <span className="mr-1 font-mono-tabular text-xs text-[#8E929B]">
                         {formatDuration(trk.duration)}
                       </span>
+                      {onRequestDownloadTrack && isStreamDownloadableTrack(trk) && (() => {
+                        const isSavedOffline =
+                          Boolean(trk.isAppDownload) || Boolean(downloadedTrackIds?.has(trk.id));
+                        return (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              triggerHaptic('selection');
+                              onRequestDownloadTrack(trk);
+                            }}
+                            aria-label={
+                              isSavedOffline
+                                ? `Downloaded ${trk.title} (tap for options)`
+                                : `Download ${trk.title}`
+                            }
+                            title={
+                              isSavedOffline
+                                ? 'Saved in App Downloads (tap for local export or removal)'
+                                : 'Download offline or locally'
+                            }
+                            className={`flex h-8 w-8 items-center justify-center rounded-md border transition-colors cursor-pointer ${
+                              isSavedOffline
+                                ? 'border-[#10B981]/50 bg-[#10B981]/10 text-[#10B981]'
+                                : 'border-[#252834] bg-[#14161D] text-[#D1D5DB] hover:border-[#E11D48] hover:text-white'
+                            }`}
+                          >
+                            {isSavedOffline ? (
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                            ) : (
+                              <Download className="h-3.5 w-3.5" />
+                            )}
+                          </button>
+                        );
+                      })()}
+                      {onPlayNext && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            triggerHaptic('selection');
+                            onPlayNext(trk);
+                            onSaveTrackToLibrary(trk);
+                          }}
+                          aria-label={`Play ${trk.title} next`}
+                          title="Play Next"
+                          className="flex h-8 w-8 items-center justify-center rounded-md border border-[#252834] bg-[#14161D] text-[#D1D5DB] hover:border-[#E11D48] hover:text-white cursor-pointer"
+                        >
+                          <ListStart className="h-3.5 w-3.5 text-[#E11D48]" />
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => {
@@ -1260,6 +1373,32 @@ export const StreamView: React.FC<StreamViewProps> = ({
                         <span>View Tracks</span>
                       </button>
 
+                      {onRequestDownloadCollection && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            triggerHaptic('selection');
+                            onRequestDownloadCollection({
+                              title: track.title,
+                              artist: track.artist,
+                              artworkUrl: track.artworkUrl,
+                              playlistId: track.youtubePlaylistId,
+                              tracks: [],
+                              collectionType:
+                                track.resultType === 'album'
+                                  ? 'Album Download'
+                                  : 'Playlist / Mix Download',
+                            });
+                          }}
+                          aria-label={`Download ${track.title}`}
+                          title="Download album, playlist, or mix"
+                          className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-2 text-xs font-medium text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors whitespace-nowrap cursor-pointer"
+                        >
+                          <Download className="h-3.5 w-3.5 text-[#E11D48]" />
+                          <span className="hidden sm:inline">Download</span>
+                        </button>
+                      )}
+
                       <button
                         type="button"
                         disabled={isCollectionBusy}
@@ -1312,6 +1451,58 @@ export const StreamView: React.FC<StreamViewProps> = ({
                         />
                         <span>Auto-Recovery</span>
                       </button>
+
+                      {onRequestDownloadTrack && isStreamDownloadableTrack(track) && (() => {
+                        const isSavedOffline =
+                          Boolean(track.isAppDownload) || Boolean(downloadedTrackIds?.has(track.id));
+                        return (
+                          <button
+                            type="button"
+                            data-testid={`stream-download-btn-${track.id}`}
+                            onClick={() => {
+                              triggerHaptic('selection');
+                              onRequestDownloadTrack(track);
+                            }}
+                            aria-label={
+                              isSavedOffline
+                                ? `Downloaded ${track.title}`
+                                : `Download ${track.title}`
+                            }
+                            title={
+                              isSavedOffline
+                                ? 'Downloaded in app (tap for local export or removal)'
+                                : 'Download to app or device storage'
+                            }
+                            className={`inline-flex items-center justify-center gap-1 rounded-lg border px-2.5 py-2 text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                              isSavedOffline
+                                ? 'border-[#10B981]/50 bg-[#10B981]/10 text-[#10B981]'
+                                : 'border-[#282B36] bg-[#14161D] text-[#D1D5DB] hover:border-[#E11D48] hover:text-white'
+                            }`}
+                          >
+                            {isSavedOffline ? (
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                            ) : (
+                              <Download className="h-3.5 w-3.5 text-[#E11D48]" />
+                            )}
+                          </button>
+                        );
+                      })()}
+
+                      {onPlayNext && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            triggerHaptic('selection');
+                            onPlayNext(track);
+                            onSaveTrackToLibrary(track);
+                          }}
+                          aria-label={`Play ${track.title} next`}
+                          title="Play Next"
+                          className="inline-flex items-center justify-center gap-1 rounded-lg border border-[#282B36] bg-[#14161D] px-2.5 py-2 text-xs font-medium text-[#D1D5DB] hover:border-[#E11D48] hover:text-white transition-colors whitespace-nowrap cursor-pointer"
+                        >
+                          <ListStart className="h-3.5 w-3.5 text-[#E11D48]" />
+                        </button>
+                      )}
 
                       <button
                         type="button"

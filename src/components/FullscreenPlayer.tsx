@@ -3,9 +3,11 @@ import {
   ArrowLeft,
   AudioLines,
   Check,
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
   Disc3,
+  Download,
   GripVertical,
   Heart,
   Loader2,
@@ -30,6 +32,7 @@ import type { DspSettings, StoredLyrics, Track } from '../types/audio';
 import { formatDuration, parseLrc, findActiveLyricIndex } from '../utils/lrcParser';
 import { sanitizeTrackForLyrics } from '../utils/lyricsFetcher';
 import { triggerHaptic } from '../utils/haptics';
+import { isStreamDownloadableTrack } from '../utils/streamDownloads';
 import { fetchRelatedRadioTracks } from '../utils/streamRadio';
 import type { VisualizerPaletteId } from '../utils/visualizerUtils';
 import { AudioVisualizerOverlay } from './AudioVisualizerOverlay';
@@ -51,6 +54,8 @@ interface FullscreenPlayerProps {
   visualizerPalette?: VisualizerPaletteId;
   onChangeVisualizerPalette?: (paletteId: VisualizerPaletteId) => void;
   isFavorite: boolean;
+  isDownloaded?: boolean;
+  onRequestDownloadTrack?: (track: Track) => void;
   storedLyrics?: StoredLyrics;
   isInAppPip: boolean;
   onToggleInAppPip: () => void;
@@ -95,6 +100,8 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
   visualizerPalette,
   onChangeVisualizerPalette,
   isFavorite,
+  isDownloaded = false,
+  onRequestDownloadTrack,
   storedLyrics,
   isInAppPip,
   onToggleInAppPip,
@@ -1180,19 +1187,49 @@ export const FullscreenPlayer: React.FC<FullscreenPlayerProps> = ({
               </p>
             </div>
 
-            <button
-              type="button"
-              onClick={() => {
-                triggerHaptic('selection');
-                onToggleFavorite(track.id);
-              }}
-              aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-              className={`flex h-10 w-10 sm:h-11 sm:w-11 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#121319] transition-colors cursor-pointer ${
-                isFavorite ? 'text-[#FF4D6D]' : 'text-[#8E929B] hover:text-white'
-              }`}
-            >
-              <Heart className={`h-5 w-5 ${isFavorite ? 'fill-current' : ''}`} />
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              {onRequestDownloadTrack && isStreamDownloadableTrack(track) && (
+                <button
+                  type="button"
+                  data-testid="fullscreen-download-btn"
+                  onClick={() => {
+                    triggerHaptic('selection');
+                    onRequestDownloadTrack(track);
+                  }}
+                  aria-label={isDownloaded ? 'Downloaded (tap for options)' : 'Download track'}
+                  title={
+                    isDownloaded
+                      ? 'Saved offline in kaGO.PIaY (tap for local download or removal)'
+                      : 'Download to App Downloads or Device'
+                  }
+                  className={`flex h-10 w-10 sm:h-11 sm:w-11 shrink-0 items-center justify-center rounded-lg border transition-colors cursor-pointer ${
+                    isDownloaded
+                      ? 'border-[#10B981]/60 bg-[#10B981]/15 text-[#10B981]'
+                      : 'border-[#242732] bg-[#121319] text-[#8E929B] hover:border-[#E11D48] hover:text-white'
+                  }`}
+                >
+                  {isDownloaded ? (
+                    <CheckCircle2 className="h-5 w-5" />
+                  ) : (
+                    <Download className="h-5 w-5" />
+                  )}
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={() => {
+                  triggerHaptic('selection');
+                  onToggleFavorite(track.id);
+                }}
+                aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+                className={`flex h-10 w-10 sm:h-11 sm:w-11 shrink-0 items-center justify-center rounded-lg border border-[#242732] bg-[#121319] transition-colors cursor-pointer ${
+                  isFavorite ? 'text-[#FF4D6D]' : 'text-[#8E929B] hover:text-white'
+                }`}
+              >
+                <Heart className={`h-5 w-5 ${isFavorite ? 'fill-current' : ''}`} />
+              </button>
+            </div>
           </div>
 
           {/* Seek Bar: Red for played portion, White for remaining */}

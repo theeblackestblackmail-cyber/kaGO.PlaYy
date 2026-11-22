@@ -34,6 +34,16 @@ export interface NativeMediaBridgeApi {
   pickFolderNative?: (requestId: string) => void;
   readDocumentChunkBase64?: (uriString: string, offset: number, length: number) => string;
   triggerHaptic?: (style: string) => void;
+  downloadMediaToCacheAsync?: (requestId: string, urlString: string) => void;
+  readCachedDownloadChunkBase64?: (requestId: string, offset: number, length: number) => string;
+  clearCachedDownload?: (requestId: string) => void;
+  saveMediaToPublicDownloadsAsync?: (
+    requestId: string,
+    primaryUrl: string,
+    secondaryAudioUrl: string,
+    fileName: string,
+    mimeType: string
+  ) => void;
 }
 
 export type NativeMediaActionDetail =
@@ -63,6 +73,21 @@ export function hasNativeFolderPicker(): boolean {
     typeof window !== 'undefined' &&
     typeof window.KaGoNative?.pickFolderNative === 'function' &&
     typeof window.KaGoNative?.readDocumentChunkBase64 === 'function'
+  );
+}
+
+export function hasNativeMediaDownloadBridge(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.KaGoNative?.downloadMediaToCacheAsync === 'function' &&
+    typeof window.KaGoNative?.readCachedDownloadChunkBase64 === 'function'
+  );
+}
+
+export function hasNativePublicDownloadBridge(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.KaGoNative?.saveMediaToPublicDownloadsAsync === 'function'
   );
 }
 
@@ -235,33 +260,289 @@ export function readNativeDocumentBytes(uri: string, expectedSize = 0): Uint8Arr
   if (typeof reader !== 'function') return null;
 
   const MAX_IMPORT_BYTES = 35 * 1024 * 1024;
-  const CHUNK_SIZE = 1024 * 1024;
+  let chunkSize = 128 * 1024; // ~175KB Base64 (~350KB UTF-16), safely below 1MB Android Binder limit
   const limit = expectedSize > 0 ? Math.min(expectedSize, MAX_IMPORT_BYTES) : MAX_IMPORT_BYTES;
 
   const chunks: Uint8Array[] = [];
   let total = 0;
   let offset = 0;
 
-  while (offset < limit) {
-    const reqLen = Math.min(CHUNK_SIZE, limit - offset);
-    const b64 = reader(uri, offset, reqLen);
-    if (!b64) break;
-    const part = decodeBase64ToBytes(b64);
-    if (part.length === 0) break;
-    chunks.push(part);
-    total += part.length;
-    offset += part.length;
-    if (part.length < reqLen) break;
+  try {
+    while (offset < limit) {
+      const reqLen = Math.min(chunkSize, limit - offset);
+      let b64 = '';
+      try {
+        b64 = reader(uri, offset, reqLen);
+      } catch {
+        if (chunkSize > 32 * 1024) {
+          chunkSize = 32 * 1024;
+          const retryLen = Math.min(chunkSize, limit - offset);
+          try {
+            b64 = reader(uri, offset, retryLen);
+          } catch {
+            return null;
+          }
+        } else {
+          return null;
+        }
+      }
+      if (!b64) break;
+      const part = decodeBase64ToBytes(b64);
+      if (part.length === 0) break;
+      chunks.push(part);
+      total += part.length;
+      offset += part.length;
+      if (part.length < Math.min(chunkSize, reqLen)) break;
+    }
+
+    if (total === 0) return null;
+    const combined = new Uint8Array(total);
+    let pos = 0;
+    for (const part of chunks) {
+      combined.set(part, pos);
+      pos += part.length;
+    }
+    return combined;
+  } catch {
+    return null;
+  }
+}
+
+export function downloadToCacheNative(
+  url: string,
+  onProgress?: (loadedBytes: number, totalBytes: number) => void,
+  timeoutMs = 180000
+): Promise<{ ok: boolean; requestId: string; totalBytes: number; error?: string }> {
+  if (!hasNativeMediaDownloadBridge()) {
+    return Promise.resolve({
+      ok: false,
+      requestId: '',
+      totalBytes: 0,
+      error: 'Native media downloader unavailable.',
+    });
   }
 
-  if (total === 0) return null;
-  const combined = new Uint8Array(total);
-  let pos = 0;
-  for (const part of chunks) {
-    combined.set(part, pos);
-    pos += part.length;
+  const requestId = `dl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const cleanup = () => {
+      window.removeEventListener('kago-native-dl-progress', onProgressEvent);
+      window.removeEventListener('kago-native-dl-done', onDoneEvent);
+      window.clearTimeout(timer);
+    };
+
+    const onProgressEvent = (ev: Event) => {
+      const detail = (
+        ev as CustomEvent<{ requestId?: string; loadedBytes?: number; totalBytes?: number }>
+      )?.detail;
+      if (!detail || detail.requestId !== requestId || settled) return;
+      onProgress?.(detail.loadedBytes || 0, detail.totalBytes || 0);
+    };
+
+    const onDoneEvent = (ev: Event) => {
+      const detail = (
+        ev as CustomEvent<{
+          requestId?: string;
+          ok?: boolean;
+          totalBytes?: number;
+          error?: string;
+        }>
+      )?.detail;
+      if (!detail || detail.requestId !== requestId || settled) return;
+      settled = true;
+      cleanup();
+      resolve({
+        ok: Boolean(detail.ok),
+        requestId,
+        totalBytes: detail.totalBytes || 0,
+        error: detail.error || undefined,
+      });
+    };
+
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        window.KaGoNative?.clearCachedDownload?.(requestId);
+      } catch {
+        // Ignore
+      }
+      resolve({
+        ok: false,
+        requestId,
+        totalBytes: 0,
+        error: 'Native download timed out.',
+      });
+    }, timeoutMs);
+
+    window.addEventListener('kago-native-dl-progress', onProgressEvent);
+    window.addEventListener('kago-native-dl-done', onDoneEvent);
+    try {
+      window.KaGoNative?.downloadMediaToCacheAsync?.(requestId, url);
+    } catch {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        resolve({
+          ok: false,
+          requestId,
+          totalBytes: 0,
+          error: 'Could not start native download.',
+        });
+      }
+    }
+  });
+}
+
+export function readCachedDownloadBytes(requestId: string, expectedSize: number): Uint8Array | null {
+  const reader =
+    typeof window !== 'undefined' ? window.KaGoNative?.readCachedDownloadChunkBase64 : undefined;
+  const clearer = typeof window !== 'undefined' ? window.KaGoNative?.clearCachedDownload : undefined;
+  if (typeof reader !== 'function' || !requestId) return null;
+
+  const MAX_DOWNLOAD_BYTES = 120 * 1024 * 1024;
+  let chunkSize = 128 * 1024;
+  const limit = expectedSize > 0 ? Math.min(expectedSize, MAX_DOWNLOAD_BYTES) : MAX_DOWNLOAD_BYTES;
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let offset = 0;
+
+  try {
+    while (offset < limit) {
+      const reqLen = Math.min(chunkSize, limit - offset);
+      let b64 = '';
+      try {
+        b64 = reader(requestId, offset, reqLen);
+      } catch {
+        if (chunkSize > 32 * 1024) {
+          chunkSize = 32 * 1024;
+          try {
+            b64 = reader(requestId, offset, Math.min(chunkSize, limit - offset));
+          } catch {
+            return null;
+          }
+        } else {
+          return null;
+        }
+      }
+      if (!b64) break;
+      const part = decodeBase64ToBytes(b64);
+      if (part.length === 0) break;
+      chunks.push(part);
+      total += part.length;
+      offset += part.length;
+      if (part.length < Math.min(chunkSize, reqLen)) break;
+    }
+
+    if (total === 0) return null;
+    const combined = new Uint8Array(total);
+    let pos = 0;
+    for (const part of chunks) {
+      combined.set(part, pos);
+      pos += part.length;
+    }
+    return combined;
+  } catch {
+    return null;
+  } finally {
+    try {
+      clearer?.(requestId);
+    } catch {
+      // Ignore
+    }
   }
-  return combined;
+}
+
+export function saveNativeMediaToPublicDownloads(params: {
+  primaryUrl: string;
+  secondaryAudioUrl?: string;
+  fileName: string;
+  mimeType: string;
+  onProgress?: (loadedBytes: number, totalBytes: number) => void;
+  timeoutMs?: number;
+}): Promise<{ ok: boolean; totalBytes: number; error?: string }> {
+  if (!hasNativePublicDownloadBridge()) {
+    return Promise.resolve({
+      ok: false,
+      totalBytes: 0,
+      error: 'Native Downloads bridge unavailable.',
+    });
+  }
+
+  const requestId = `pub-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const timeoutMs = params.timeoutMs ?? 240000;
+
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const cleanup = () => {
+      window.removeEventListener('kago-native-dl-progress', onProgressEvent);
+      window.removeEventListener('kago-native-dl-done', onDoneEvent);
+      window.clearTimeout(timer);
+    };
+
+    const onProgressEvent = (ev: Event) => {
+      const detail = (
+        ev as CustomEvent<{ requestId?: string; loadedBytes?: number; totalBytes?: number }>
+      )?.detail;
+      if (!detail || detail.requestId !== requestId || settled) return;
+      params.onProgress?.(detail.loadedBytes || 0, detail.totalBytes || 0);
+    };
+
+    const onDoneEvent = (ev: Event) => {
+      const detail = (
+        ev as CustomEvent<{
+          requestId?: string;
+          ok?: boolean;
+          totalBytes?: number;
+          error?: string;
+        }>
+      )?.detail;
+      if (!detail || detail.requestId !== requestId || settled) return;
+      settled = true;
+      cleanup();
+      resolve({
+        ok: Boolean(detail.ok),
+        totalBytes: detail.totalBytes || 0,
+        error: detail.error || undefined,
+      });
+    };
+
+    const timer = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({
+        ok: false,
+        totalBytes: 0,
+        error: 'Device download timed out.',
+      });
+    }, timeoutMs);
+
+    window.addEventListener('kago-native-dl-progress', onProgressEvent);
+    window.addEventListener('kago-native-dl-done', onDoneEvent);
+    try {
+      window.KaGoNative?.saveMediaToPublicDownloadsAsync?.(
+        requestId,
+        params.primaryUrl,
+        params.secondaryAudioUrl || '',
+        params.fileName,
+        params.mimeType
+      );
+    } catch {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        resolve({
+          ok: false,
+          totalBytes: 0,
+          error: 'Could not launch native download.',
+        });
+      }
+    }
+  });
 }
 
 export function syncNativeNowPlaying(params: {

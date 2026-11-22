@@ -6,7 +6,7 @@ import {
   type NativeFolderFileEntry,
 } from './nativeMediaBridge';
 
-export const AUDIO_FILE_RE = /\.(mp3|flac|wav|ogg|m4a|aac|opus|webm|wma|aiff)$/i;
+export const AUDIO_FILE_RE = /\.(mp3|flac|wav|ogg|oga|m4a|m4b|aac|opus|webm|wma|aiff|amr|3gp|mp2)$/i;
 
 export interface FolderScanProgress {
   scanned: number;
@@ -19,14 +19,17 @@ export function isSupportedAudioFile(file: Pick<File, 'name' | 'type'>): boolean
 }
 
 export function createFileFromNativeEntry(entry: NativeFolderFileEntry): File | null {
-  const bytes = readNativeDocumentBytes(entry.uri, entry.size);
-  if (!bytes || bytes.length === 0) return null;
-  const copy = new Uint8Array(bytes.length);
-  copy.set(bytes);
-  return new File([copy.buffer], entry.name, {
-    type: entry.mimeType || 'audio/mpeg',
-    lastModified: entry.lastModified || Date.now(),
-  });
+  try {
+    const bytes = readNativeDocumentBytes(entry.uri, entry.size);
+    if (!bytes || bytes.length === 0) return null;
+    const blobPart = new Uint8Array(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
+    return new File([blobPart], entry.name || 'audio-track.mp3', {
+      type: entry.mimeType || 'audio/mpeg',
+      lastModified: entry.lastModified || Date.now(),
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function resolveFolderPathFromRelativePath(
@@ -116,34 +119,61 @@ export async function buildTracksFromFilePairs(
   return importedEntries;
 }
 
+export interface NativeFolderImportOptions {
+  onProgress?: (progress: FolderScanProgress) => void;
+  onTrackReady?: (entry: { track: Track; file: File }) => Promise<void> | void;
+}
+
 export async function importFromNativeFolderPicker(
-  onProgress?: (progress: FolderScanProgress) => void
+  onProgressOrOptions?: ((progress: FolderScanProgress) => void) | NativeFolderImportOptions
 ): Promise<{
   cancelled: boolean;
   error?: string;
+  failedFiles: number;
   entries: Array<{ track: Track; file: File }>;
+  tracks: Track[];
 }> {
+  const opts: NativeFolderImportOptions =
+    typeof onProgressOrOptions === 'function'
+      ? { onProgress: onProgressOrOptions }
+      : onProgressOrOptions || {};
+
   const res = await pickNativeFolder();
   if (!res) {
-    return { cancelled: false, error: 'Native folder picker not available.', entries: [] };
+    return {
+      cancelled: false,
+      error: 'Native folder picker not available.',
+      failedFiles: 0,
+      entries: [],
+      tracks: [],
+    };
   }
   if (res.cancelled) {
-    return { cancelled: true, entries: [] };
+    return { cancelled: true, failedFiles: 0, entries: [], tracks: [] };
   }
   if (!res.ok) {
     return {
       cancelled: false,
       error: res.error || 'Could not read selected folder.',
+      failedFiles: 0,
       entries: [],
+      tracks: [],
     };
   }
 
   const total = res.files.length;
-  const imported: Array<{ track: Track; file: File }> = [];
+  const importedEntries: Array<{ track: Track; file: File }> = [];
+  const importedTracks: Track[] = [];
+  let failedFiles = 0;
 
   for (let i = 0; i < total; i++) {
     const entry = res.files[i];
-    onProgress?.({
+    if (!entry || !entry.uri || !entry.name) {
+      failedFiles++;
+      continue;
+    }
+
+    opts.onProgress?.({
       scanned: i + 1,
       found: total,
       currentFile: entry.name,
@@ -152,25 +182,54 @@ export async function importFromNativeFolderPicker(
     // Yield a frame so Android WebView UI stays responsive on large folders
     await new Promise<void>((r) => setTimeout(r, 0));
 
-    const file = createFileFromNativeEntry(entry);
-    if (!file) continue;
+    try {
+      const file = createFileFromNativeEntry(entry);
+      if (!file) {
+        failedFiles++;
+        continue;
+      }
 
-    const folderLabel = entry.folderPath.split('/').filter(Boolean).pop() || res.rootFolder || 'Picked Folder';
-    const meta = await readAudioFileTags(file, folderLabel);
+      const safeFolderPath = (entry.folderPath || res.rootFolder || 'Picked Folder').trim();
+      const folderLabel = safeFolderPath.split('/').filter(Boolean).pop() || res.rootFolder || 'Picked Folder';
+      const meta = await readAudioFileTags(file, folderLabel);
 
-    const track: Track = {
-      id: `local-${file.name}-${file.size}-${file.lastModified}`.replace(/[^a-zA-Z0-9_-]/g, '_'),
-      title: meta.title,
-      artist: meta.artist,
-      album: meta.album,
-      trackNumber: meta.trackNumber,
-      duration: 180,
-      source: 'local',
-      folderPath: entry.folderPath || res.rootFolder || 'Picked Folder',
-      addedAt: Date.now(),
-    };
-    imported.push({ track, file });
+      const track: Track = {
+        id: `local-${file.name}-${file.size}-${file.lastModified}`.replace(/[^a-zA-Z0-9_-]/g, '_'),
+        title: meta.title,
+        artist: meta.artist,
+        album: meta.album,
+        trackNumber: meta.trackNumber,
+        duration: 180,
+        source: 'local',
+        folderPath: safeFolderPath,
+        addedAt: Date.now(),
+      };
+
+      importedTracks.push(track);
+      if (opts.onTrackReady) {
+        await opts.onTrackReady({ track, file });
+      } else {
+        importedEntries.push({ track, file });
+      }
+    } catch {
+      failedFiles++;
+    }
   }
 
-  return { cancelled: false, entries: imported };
+  if (total > 0 && importedTracks.length === 0) {
+    return {
+      cancelled: false,
+      error: `Found ${total} ${total === 1 ? 'song' : 'songs'} in "${res.rootFolder || 'folder'}", but Android could not read their bytes. Try moving the files or re-picking the folder.`,
+      failedFiles,
+      entries: [],
+      tracks: [],
+    };
+  }
+
+  return {
+    cancelled: false,
+    failedFiles,
+    entries: importedEntries,
+    tracks: importedTracks,
+  };
 }

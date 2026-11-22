@@ -228,3 +228,42 @@ export function evaluatePoorConnectionState(
     shouldPromptOffline: elapsedBadMs >= threshold && !alreadyDismissedForThisOutage,
   };
 }
+
+/**
+ * Inserts one or more tracks directly after the currently playing track (or at index 0
+ * if nothing is playing), deduplicating any matching upcoming/earlier entries so `handleNext`
+ * advances cleanly without repeats.
+ */
+export function insertPlayNextTracks(
+  queue: Track[],
+  tracksToInsert: Track[],
+  currentTrackId?: string | null
+): Track[] {
+  const uniqueIncoming: Track[] = [];
+  const seenIncoming = new Set<string>();
+
+  for (const item of tracksToInsert) {
+    if (!item || !item.id || seenIncoming.has(item.id)) continue;
+    if (currentTrackId && item.id === currentTrackId) continue;
+    seenIncoming.add(item.id);
+    uniqueIncoming.push({ ...item, autoQueued: false });
+  }
+
+  if (uniqueIncoming.length === 0) {
+    return queue;
+  }
+
+  const remaining = queue.filter((t) => !seenIncoming.has(t.id));
+  const currentIdx = currentTrackId
+    ? remaining.findIndex((t) => t.id === currentTrackId)
+    : -1;
+
+  if (currentIdx >= 0) {
+    const nextQueue = [...remaining];
+    nextQueue.splice(currentIdx + 1, 0, ...uniqueIncoming);
+    return nextQueue;
+  }
+
+  return [...uniqueIncoming, ...remaining];
+}
+

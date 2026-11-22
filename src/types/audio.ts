@@ -7,7 +7,14 @@ export type ActiveTab =
   | 'scanner'
   | 'lyrics';
 
-export type LibrarySubTab = 'all' | 'folders' | 'playlists' | 'albums' | 'artists' | 'favorites';
+export type LibrarySubTab =
+  | 'all'
+  | 'downloads'
+  | 'folders'
+  | 'playlists'
+  | 'albums'
+  | 'artists'
+  | 'favorites';
 
 export type EqPresetName =
   | 'Flat'
@@ -89,6 +96,10 @@ export interface Track {
   autoQueued?: boolean;
   viewCount?: number;
   isOfficial?: boolean;
+  isAppDownload?: boolean;
+  downloadedAt?: number;
+  downloadSizeBytes?: number;
+  downloadFormat?: string;
 }
 
 export interface Playlist {

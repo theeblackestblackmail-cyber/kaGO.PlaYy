@@ -159,7 +159,7 @@ export async function searchYouTubeNatively(
 
   const mergedMap = new Map<string, ParsedYouTubeVideo>();
   const collectVideos = (raw: string) => {
-    for (const v of extractYouTubeSearchResults(raw)) {
+    for (const v of extractYouTubeSearchResults(raw, { strictSongFilter: false, includeShorts: true })) {
       if (excludeId && v.videoId === excludeId) continue;
       if (!mergedMap.has(v.videoId)) {
         mergedMap.set(v.videoId, v);
@@ -171,11 +171,11 @@ export async function searchYouTubeNatively(
     collectVideos(p);
   }
 
-  // If category filter (`sp`) returned fewer than 3 tracks or 0 official tracks, retry clean organic search
+  // If category filter (`sp`) returned fewer than 8 tracks or 0 official tracks, merge clean organic search
   const hasOfficialYet = Array.from(mergedMap.values()).some(
     (v) => v.isOfficial || (v.viewCount || 0) >= 100_000
   );
-  if ((mergedMap.size < 3 || !hasOfficialYet) && (plan.sp || plan.searchQuery !== searchTerm.trim())) {
+  if ((mergedMap.size < 8 || !hasOfficialYet) && (plan.sp || plan.searchQuery !== searchTerm.trim())) {
     const organicQuery =
       [searchTerm.trim(), genreFilter ? `${genreFilter} music` : ''].filter(Boolean).join(' ') ||
       plan.searchQuery;
@@ -190,8 +190,9 @@ export async function searchYouTubeNatively(
   const ranked = rankYouTubeSearchResults(
     Array.from(mergedMap.values()),
     rankingTerm,
-    category
-  ).slice(0, 15);
+    category,
+    { allowAllVideos: true }
+  ).slice(0, 25);
   const tracks = toYouTubeTracks(ranked, genreFilter).map((t) => ({
     ...t,
     resultType: category === 'videos' ? ('video' as const) : ('song' as const),
@@ -213,11 +214,6 @@ export async function searchStreamsUnified(params: {
   const cleanQ = params.query.trim();
   const genreFilter = (params.genre || '').trim();
   const category: StreamSearchCategory = params.category || 'all';
-  const isCollectionOrPodcast =
-    category === 'albums' ||
-    category === 'playlists' ||
-    category === 'featured_playlists' ||
-    category === 'podcasts';
 
   let liveSongs: Track[] = [];
   let liveArtists: StreamArtistResult[] = [];
@@ -239,10 +235,7 @@ export async function searchStreamsUnified(params: {
         source?: string;
         provider?: string;
       };
-      const rawResults = data.results || [];
-      liveSongs = isCollectionOrPodcast
-        ? rawResults
-        : rawResults.filter((t) => isIndividualSong(t.title, t.album, t.duration));
+      liveSongs = Array.isArray(data.results) ? data.results : [];
       liveArtists = Array.isArray(data.artists) ? data.artists : [];
       sourceFlag = data.source === 'fallback' ? 'fallback' : 'live';
       if (data.provider === 'youtube' || data.provider === 'audius') {

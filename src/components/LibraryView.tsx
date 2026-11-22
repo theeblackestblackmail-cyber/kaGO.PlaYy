@@ -2,14 +2,17 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   Check,
+  CheckCircle2,
   CheckSquare,
   Disc3,
   Download,
   Folder,
+  FolderDown,
   FolderOpen,
   Heart,
   ListMusic,
   ListPlus,
+  ListStart,
   Loader2,
   MoreVertical,
   Music,
@@ -17,6 +20,7 @@ import {
   Play,
   Plus,
   Radio,
+  Smartphone,
   Trash2,
   User,
   X,
@@ -24,6 +28,7 @@ import {
 import type { AudioEngineSnapshot, LibrarySubTab, Playlist, Track } from '../types/audio';
 import { triggerHaptic } from '../utils/haptics';
 import { formatDuration } from '../utils/lrcParser';
+import { formatByteSize, isStreamDownloadableTrack } from '../utils/streamDownloads';
 
 interface LibraryViewProps {
   tracks: Track[];
@@ -38,6 +43,8 @@ interface LibraryViewProps {
   onPlayTrack: (track: Track) => void;
   onPlayCollection?: (tracks: Track[], startIndex: number) => void;
   onTogglePlay: () => void;
+  onPlayNext?: (track: Track) => void;
+  onPlayMultipleNext?: (tracks: Track[]) => void;
   onAddToQueue: (track: Track) => void;
   onAddMultipleToQueue?: (tracks: Track[]) => void;
   onToggleFavorite: (trackId: string) => void;
@@ -56,10 +63,21 @@ interface LibraryViewProps {
   onAddMultipleTracksToPlaylist?: (playlistId: string, trackIds: string[]) => void;
   onDeleteTrack: (trackId: string) => void;
   onDeleteTracks?: (trackIds: string[]) => void;
+  onRequestDownloadTrack?: (track: Track) => void;
+  onRequestDownloadTrackFormats?: (track: Track) => void;
+  onRequestDownloadCollection?: (col: {
+    title: string;
+    artist: string;
+    artworkUrl?: string;
+    tracks: Track[];
+    collectionType?: string;
+  }) => void;
+  onRemoveAppDownloads?: (trackIds: string[]) => void;
 }
 
 const SUB_TABS: Array<{ id: LibrarySubTab; label: string }> = [
   { id: 'all', label: 'All Songs' },
+  { id: 'downloads', label: 'Downloads' },
   { id: 'folders', label: 'Folders' },
   { id: 'playlists', label: 'Playlists' },
   { id: 'albums', label: 'Albums' },
@@ -76,6 +94,8 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onPlayTrack,
   onPlayCollection,
   onTogglePlay,
+  onPlayNext,
+  onPlayMultipleNext,
   onAddToQueue,
   onAddMultipleToQueue,
   onToggleFavorite,
@@ -91,6 +111,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   onAddMultipleTracksToPlaylist,
   onDeleteTrack,
   onDeleteTracks,
+  onRequestDownloadTrack,
+  onRequestDownloadTrackFormats,
+  onRequestDownloadCollection,
+  onRemoveAppDownloads,
 }) => {
   const [subTab, setSubTab] = useState<LibrarySubTab>('all');
   const [showNewPlaylistModal, setShowNewPlaylistModal] = useState(false);
@@ -162,6 +186,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const favoriteTracks = useMemo(
     () => tracks.filter((t) => favoriteIds.includes(t.id)),
     [tracks, favoriteIds]
+  );
+
+  const downloadedTracks = useMemo(
+    () =>
+      tracks
+        .filter((t) => Boolean(t.isAppDownload))
+        .sort((a, b) => (b.downloadedAt || b.addedAt) - (a.downloadedAt || a.addedAt)),
+    [tracks]
+  );
+
+  const downloadedBytesTotal = useMemo(
+    () => downloadedTracks.reduce((sum, t) => sum + (t.downloadSizeBytes || 0), 0),
+    [downloadedTracks]
   );
 
   const folderGroups = useMemo(() => {
@@ -304,6 +341,22 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     }
     setBulkActionFeedback(
       `Added ${selectedTracks.length} ${selectedTracks.length === 1 ? 'track' : 'tracks'} to queue.`
+    );
+  };
+
+  const handlePlayTracksBatchNext = (selectedTracks: Track[]) => {
+    if (selectedTracks.length === 0) return;
+    if (onPlayMultipleNext) {
+      onPlayMultipleNext(selectedTracks);
+    } else if (onPlayNext) {
+      for (let i = selectedTracks.length - 1; i >= 0; i--) {
+        onPlayNext(selectedTracks[i]);
+      }
+    }
+    setBulkActionFeedback(
+      selectedTracks.length === 1
+        ? `"${selectedTracks[0].title}" will play next.`
+        : `${selectedTracks.length} tracks will play next.`
     );
   };
 
@@ -515,11 +568,28 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       >
                         {track.title}
                       </span>
+                      {track.isAppDownload && (
+                        <CheckCircle2
+                          className="h-3.5 w-3.5 shrink-0 text-[#10B981]"
+                          aria-label="Saved in App Downloads for offline playback"
+                        />
+                      )}
                     </div>
                     <div className="mt-0.5 flex items-center gap-2 text-xs text-[#8E929B]">
                       <span className="truncate">{track.artist}</span>
                       <span aria-hidden="true">·</span>
                       <span className="truncate">{track.album}</span>
+                      {track.isAppDownload && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="shrink-0 font-mono-tabular text-[11px] text-[#10B981]">
+                            Offline
+                            {track.downloadSizeBytes
+                              ? ` (${formatByteSize(track.downloadSizeBytes)})`
+                              : ''}
+                          </span>
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -572,6 +642,22 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                         aria-label={`Actions for ${track.title}`}
                         className="kago-panel-enter absolute right-0 top-9 z-40 w-48 rounded-xl border border-[#282B36] bg-[#12141B] p-1.5 shadow-[0_14px_34px_rgba(0,0,0,0.88)]"
                       >
+                        {onPlayNext && (
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              triggerHaptic('selection');
+                              onPlayNext(track);
+                              setOpenMenuTrackId(null);
+                            }}
+                            className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-medium text-[#F4F3F0] hover:bg-[#1A1D26] cursor-pointer"
+                          >
+                            <ListStart className="h-3.5 w-3.5 text-[#E11D48]" />
+                            <span>Play Next</span>
+                          </button>
+                        )}
+
                         <button
                           type="button"
                           role="menuitem"
@@ -618,6 +704,58 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                           <CheckSquare className="h-3.5 w-3.5 text-[#E11D48]" />
                           <span>Select Multiple</span>
                         </button>
+
+                        {isStreamDownloadableTrack(track) &&
+                          (track.isAppDownload ? (
+                            <>
+                              {onRequestDownloadTrackFormats && (
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    triggerHaptic('light');
+                                    setOpenMenuTrackId(null);
+                                    onRequestDownloadTrackFormats(track);
+                                  }}
+                                  className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-medium text-[#F4F3F0] hover:bg-[#1A1D26] cursor-pointer"
+                                >
+                                  <FolderDown className="h-3.5 w-3.5 text-[#E11D48]" />
+                                  <span>Download Locally</span>
+                                </button>
+                              )}
+                              {onRemoveAppDownloads && (
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => {
+                                    triggerHaptic('medium');
+                                    setOpenMenuTrackId(null);
+                                    onRemoveAppDownloads([track.id]);
+                                  }}
+                                  className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-medium text-[#FBBF24] hover:bg-[#1A1D26] cursor-pointer"
+                                >
+                                  <Smartphone className="h-3.5 w-3.5" />
+                                  <span>Remove Offline Copy</span>
+                                </button>
+                              )}
+                            </>
+                          ) : (
+                            onRequestDownloadTrack && (
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  triggerHaptic('light');
+                                  setOpenMenuTrackId(null);
+                                  onRequestDownloadTrack(track);
+                                }}
+                                className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-xs font-medium text-[#F4F3F0] hover:bg-[#1A1D26] cursor-pointer"
+                              >
+                                <Download className="h-3.5 w-3.5 text-[#E11D48]" />
+                                <span>Download</span>
+                              </button>
+                            )
+                          ))}
 
                         <button
                           type="button"
@@ -761,6 +899,62 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
         className="kago-panel-enter"
       >
         {subTab === 'all' && renderTrackRows(tracks)}
+
+        {subTab === 'downloads' && (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#1F2129] bg-[#0D0E12] p-4">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <Smartphone className="h-4 w-4 shrink-0 text-[#10B981]" />
+                  <h2 className="font-display text-base sm:text-lg font-bold text-[#F4F3F0]">
+                    App Offline Downloads
+                  </h2>
+                </div>
+                <p className="mt-0.5 text-xs text-[#8E929B]">
+                  Saved inside kaGO.PIaY app storage for 100% offline playback (hidden from device Downloads).
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <span className="font-mono-tabular text-xs font-semibold text-[#10B981]">
+                  {downloadedTracks.length} {downloadedTracks.length === 1 ? 'song' : 'songs'} ·{' '}
+                  {formatByteSize(downloadedBytesTotal)}
+                </span>
+                {downloadedTracks.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      triggerHaptic('selection');
+                      if (onPlayCollection) {
+                        onPlayCollection(downloadedTracks, 0);
+                      } else {
+                        onPlayTrack(downloadedTracks[0]);
+                      }
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer whitespace-nowrap"
+                  >
+                    <Play className="h-3.5 w-3.5 fill-current" />
+                    <span>Play All</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {downloadedTracks.length === 0 ? (
+              <div className="rounded-xl border border-[#1F2129] bg-[#0D0E12] p-10 text-center">
+                <Download className="mx-auto h-8 w-8 text-[#E11D48]" />
+                <p className="mt-3 text-sm font-semibold text-[#F4F3F0]">
+                  No offline app downloads yet
+                </p>
+                <p className="mt-1 text-xs text-[#8E929B]">
+                  Tap the Download button on any streamed song, album, playlist, or YouTube mix and choose Save to App Downloads.
+                </p>
+              </div>
+            ) : (
+              renderTrackRows(downloadedTracks)
+            )}
+          </div>
+        )}
+
         {subTab === 'favorites' && renderTrackRows(favoriteTracks)}
 
         {subTab === 'playlists' && (
@@ -768,6 +962,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             {activePlaylist ? (
               (() => {
                 const plTracks = tracks.filter((t) => activePlaylist.trackIds.includes(t.id));
+                const downloadablePlTracks = plTracks.filter(isStreamDownloadableTrack);
                 return (
                   <div className="space-y-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
@@ -779,7 +974,25 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                           <p className="text-xs text-[#8E929B]">{activePlaylist.description}</p>
                         )}
                       </div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        {downloadablePlTracks.length > 0 && onRequestDownloadCollection && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              triggerHaptic('selection');
+                              onRequestDownloadCollection({
+                                title: activePlaylist.name,
+                                artist: activePlaylist.description || 'Playlist',
+                                tracks: downloadablePlTracks,
+                                collectionType: 'Playlist Download',
+                              });
+                            }}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer whitespace-nowrap"
+                          >
+                            <Download className="h-3.5 w-3.5 text-[#E11D48]" />
+                            <span>Download Playlist</span>
+                          </button>
+                        )}
                         {plTracks.length > 0 && (
                           <button
                             type="button"
@@ -1429,6 +1642,26 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       {selectedPlaylistIds.length === 1 ? 'playlist' : 'playlists'} selected
                     </span>
                     <div className="flex flex-wrap items-center gap-2">
+                      {(onPlayMultipleNext || onPlayNext) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const chosenPlaylists = playlists.filter((p) =>
+                              selectedPlaylistIdSet.has(p.id)
+                            );
+                            const plTrackIds = new Set(chosenPlaylists.flatMap((p) => p.trackIds));
+                            const chosenTracks = tracks.filter((t) => plTrackIds.has(t.id));
+                            if (chosenTracks.length > 0) {
+                              handlePlayTracksBatchNext(chosenTracks);
+                            }
+                            exitPlaylistSelectMode();
+                          }}
+                          className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#161922] px-3 py-1.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer whitespace-nowrap shrink-0"
+                        >
+                          <ListStart className="h-3.5 w-3.5 text-[#E11D48]" />
+                          <span>Play Next</span>
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => {
@@ -1477,6 +1710,19 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                       {selectedTrackObjects.length} selected
                     </span>
                     <div className="flex flex-wrap items-center gap-2">
+                      {(onPlayMultipleNext || onPlayNext) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            handlePlayTracksBatchNext(selectedTrackObjects);
+                            exitSelectMode();
+                          }}
+                          className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#161922] px-3 py-1.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer whitespace-nowrap shrink-0"
+                        >
+                          <ListStart className="h-3.5 w-3.5 text-[#E11D48]" />
+                          <span>Play Next</span>
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => {
