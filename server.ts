@@ -35,7 +35,9 @@ import {
   DOWNLOAD_FORMAT_MAP,
   DOWNLOAD_FORMAT_OPTIONS,
   estimateFormatSizeBytes,
+  pickVerifiedAudioMirrorCandidate,
   sanitizeDownloadFilename,
+  type AudioMirrorCandidate,
   type DownloadFormatId,
 } from './src/utils/streamDownloads';
 import {
@@ -464,9 +466,189 @@ interface ServerDirectMedia {
   durationSeconds: number;
 }
 
-async function resolveYouTubeDirectMedia(youtubeId: string): Promise<ServerDirectMedia | null> {
-  if (!/^[a-zA-Z0-9_-]{6,20}$/.test(youtubeId)) return null;
+interface YouTubeResolveResult {
+  media: ServerDirectMedia | null;
+  botBlocked: boolean;
+}
 
+const ytDirectCache = new Map<string, { expiresAt: number; result: YouTubeResolveResult }>();
+let scClientIdCache: { id: string; expiresAt: number } | null = null;
+
+async function getSoundCloudClientId(): Promise<string | null> {
+  if (scClientIdCache && scClientIdCache.expiresAt > Date.now()) {
+    return scClientIdCache.id;
+  }
+  try {
+    const homeRes = await fetch('https://soundcloud.com', {
+      signal: AbortSignal.timeout(5000),
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      },
+    });
+    if (!homeRes.ok) return null;
+    const html = await homeRes.text();
+    const assetUrls = Array.from(
+      html.matchAll(/https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js/g)
+    ).map((m) => m[0]);
+
+    for (const scriptUrl of assetUrls.slice(-4).reverse()) {
+      try {
+        const jsRes = await fetch(scriptUrl, { signal: AbortSignal.timeout(4500) });
+        if (!jsRes.ok) continue;
+        const js = await jsRes.text();
+        const match = js.match(/client_id\s*:\s*"([a-zA-Z0-9]{20,40})"/);
+        if (match?.[1]) {
+          scClientIdCache = {
+            id: match[1],
+            expiresAt: Date.now() + 30 * 60 * 1000,
+          };
+          return match[1];
+        }
+      } catch {
+        // Try next bundle
+      }
+    }
+  } catch {
+    // Ignore SoundCloud script lookup failure
+  }
+  return null;
+}
+
+async function resolveFallbackAudioMirror(
+  title: string,
+  artist: string,
+  expectedDurationSec: number
+): Promise<{ url: string; provider: 'audius' | 'soundcloud' } | null> {
+  const cleanTitle = (title || '').replace(/\([^)]*\)|\[[^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim();
+  const cleanArtist = (artist || '').replace(/\s*-\s*Topic$/i, '').trim();
+  const query = [cleanArtist, cleanTitle].filter(Boolean).join(' ').trim() || title;
+  if (!query) return null;
+
+  // 1. Verified full-length match on Audius (progressive MP3/HLS, no 30s previews)
+  try {
+    const audiusUrl = `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(query)}&limit=10`;
+    const audiusRes = await fetch(audiusUrl, {
+      signal: AbortSignal.timeout(5500),
+      headers: { Accept: 'application/json' },
+    });
+    if (audiusRes.ok) {
+      const data = (await audiusRes.json()) as { data?: AudiusTrack[] };
+      const candidates: AudioMirrorCandidate[] = (data.data || [])
+        .filter((item) => Boolean(item.id && item.title && item.duration))
+        .map((item) => ({
+          title: item.title || '',
+          artist: item.user?.name || '',
+          durationSec: Math.round(item.duration || 0),
+          streamUrl: `https://api.audius.co/v1/tracks/${encodeURIComponent(item.id!)}/stream`,
+          provider: 'audius' as const,
+        }));
+      const picked = pickVerifiedAudioMirrorCandidate(
+        candidates,
+        cleanTitle || title,
+        cleanArtist,
+        expectedDurationSec
+      );
+      if (picked) {
+        return { url: picked.streamUrl, provider: 'audius' };
+      }
+    }
+  } catch {
+    // Fall through to SoundCloud
+  }
+
+  // 2. Verified full-length match on SoundCloud (strictly excluding 30s SNIP previews & remixes)
+  try {
+    const clientId = await getSoundCloudClientId();
+    if (clientId) {
+      const scSearchUrl = `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(
+        query
+      )}&client_id=${encodeURIComponent(clientId)}&limit=10`;
+      const scRes = await fetch(scSearchUrl, {
+        signal: AbortSignal.timeout(5500),
+        headers: { Accept: 'application/json' },
+      });
+      if (scRes.ok) {
+        const scJson = (await scRes.json()) as {
+          collection?: Array<{
+            title?: string;
+            duration?: number;
+            full_duration?: number;
+            policy?: string;
+            streamable?: boolean;
+            user?: { username?: string };
+            media?: {
+              transcodings?: Array<{
+                url?: string;
+                preset?: string;
+                format?: { protocol?: string; mime_type?: string };
+              }>;
+            };
+          }>;
+        };
+
+        const scCandidates: Array<AudioMirrorCandidate & { transcodingUrl: string }> = [];
+        for (const item of scJson.collection || []) {
+          if (!item.title || item.streamable === false || item.policy === 'SNIP') continue;
+          const durSec = Math.round((item.duration || 0) / 1000);
+          if (durSec < 45) continue;
+          const transcodings = item.media?.transcodings || [];
+          const pickedTrans =
+            transcodings.find((t) => t.format?.protocol === 'progressive' && t.url) ||
+            transcodings.find(
+              (t) => t.format?.protocol === 'hls' && (t.format?.mime_type || '').includes('mpeg') && t.url
+            ) ||
+            transcodings.find((t) => t.format?.protocol === 'hls' && t.url);
+          if (!pickedTrans?.url) continue;
+
+          scCandidates.push({
+            title: item.title,
+            artist: item.user?.username || '',
+            durationSec: durSec,
+            streamUrl: pickedTrans.url,
+            transcodingUrl: pickedTrans.url,
+            provider: 'soundcloud',
+          });
+        }
+
+        const matched = pickVerifiedAudioMirrorCandidate(
+          scCandidates,
+          cleanTitle || title,
+          cleanArtist,
+          expectedDurationSec
+        );
+        if (matched) {
+          const resolveRes = await fetch(
+            `${matched.streamUrl}?client_id=${encodeURIComponent(clientId)}`,
+            { signal: AbortSignal.timeout(4500), headers: { Accept: 'application/json' } }
+          );
+          if (resolveRes.ok) {
+            const resolvedJson = (await resolveRes.json()) as { url?: string };
+            if (resolvedJson.url && resolvedJson.url.startsWith('https://')) {
+              return { url: resolvedJson.url, provider: 'soundcloud' };
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // No SoundCloud mirror available
+  }
+
+  return null;
+}
+
+async function resolveYouTubeDirectMedia(youtubeId: string): Promise<YouTubeResolveResult> {
+  if (!/^[a-zA-Z0-9_-]{6,20}$/.test(youtubeId)) {
+    return { media: null, botBlocked: false };
+  }
+
+  const cached = ytDirectCache.get(youtubeId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.result;
+  }
+
+  const optionalCookie = (process.env.YT_COOKIE || '').trim();
   const clientProfiles = [
     {
       ua: YT_VR_USER_AGENT,
@@ -474,6 +656,33 @@ async function resolveYouTubeDirectMedia(youtubeId: string): Promise<ServerDirec
         clientName: 'ANDROID_VR',
         clientVersion: '1.60.19',
         androidSdkVersion: 32,
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    {
+      ua: 'Mozilla/5.0 (SMART-TV; Linux; Tizen 7.0) AppleWebKit/537.36',
+      client: {
+        clientName: 'TVHTML5',
+        clientVersion: '7.20250218.10.00',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    {
+      ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+      client: {
+        clientName: 'MWEB',
+        clientVersion: '2.20250218.01.00',
+        hl: 'en',
+        gl: 'US',
+      },
+    },
+    {
+      ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      client: {
+        clientName: 'WEB_CREATOR',
+        clientVersion: '1.20250218.01.00',
         hl: 'en',
         gl: 'US',
       },
@@ -500,20 +709,27 @@ async function resolveYouTubeDirectMedia(youtubeId: string): Promise<ServerDirec
     },
   ];
 
+  let botBlocked = false;
+
   for (const profile of clientProfiles) {
     try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': profile.ua,
+        Origin: 'https://www.youtube.com',
+        Referer: `https://www.youtube.com/watch?v=${encodeURIComponent(youtubeId)}`,
+      };
+      if (optionalCookie) {
+        headers.Cookie = optionalCookie;
+      }
+
       const playerRes = await fetch(
         'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
         {
           method: 'POST',
-          signal: AbortSignal.timeout(8500),
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-            'User-Agent': profile.ua,
-            Origin: 'https://www.youtube.com',
-            Referer: `https://www.youtube.com/watch?v=${encodeURIComponent(youtubeId)}`,
-          },
+          signal: AbortSignal.timeout(7000),
+          headers,
           body: JSON.stringify({
             videoId: youtubeId,
             context: { client: profile.client },
@@ -525,6 +741,7 @@ async function resolveYouTubeDirectMedia(youtubeId: string): Promise<ServerDirec
 
       if (!playerRes.ok) continue;
       const data = (await playerRes.json()) as {
+        playabilityStatus?: { status?: string; reason?: string };
         videoDetails?: { lengthSeconds?: string };
         streamingData?: {
           formats?: Array<{ itag?: number; url?: string; contentLength?: string; mimeType?: string }>;
@@ -537,6 +754,10 @@ async function resolveYouTubeDirectMedia(youtubeId: string): Promise<ServerDirec
           }>;
         };
       };
+
+      if (data.playabilityStatus?.status === 'LOGIN_REQUIRED') {
+        botBlocked = true;
+      }
 
       const streaming = data.streamingData;
       if (!streaming) continue;
@@ -580,20 +801,30 @@ async function resolveYouTubeDirectMedia(youtubeId: string): Promise<ServerDirec
       }
 
       const audioMime = pickedAudio?.mimeType || '';
-      return {
-        audioUrl: pickedAudio?.url || muxed18?.url,
-        audioExt: audioMime.includes('webm') ? 'webm' : 'm4a',
-        audioContentLength: Number(pickedAudio?.contentLength || 0) || 0,
-        muxed360Url: muxed18?.url,
-        muxed360Length: Number(muxed18?.contentLength || 0) || 0,
-        videoStreams,
-        durationSeconds: Number(data.videoDetails?.lengthSeconds || 0) || 0,
+      const result: YouTubeResolveResult = {
+        media: {
+          audioUrl: pickedAudio?.url || muxed18?.url,
+          audioExt: audioMime.includes('webm') ? 'webm' : 'm4a',
+          audioContentLength: Number(pickedAudio?.contentLength || 0) || 0,
+          muxed360Url: muxed18?.url,
+          muxed360Length: Number(muxed18?.contentLength || 0) || 0,
+          videoStreams,
+          durationSeconds: Number(data.videoDetails?.lengthSeconds || 0) || 0,
+        },
+        botBlocked: false,
       };
+      if (ytDirectCache.size >= 60) ytDirectCache.clear();
+      ytDirectCache.set(youtubeId, { expiresAt: Date.now() + 5 * 60 * 1000, result });
+      return result;
     } catch {
       // Try next Innertube client profile
     }
   }
-  return null;
+
+  const failResult: YouTubeResolveResult = { media: null, botBlocked };
+  if (ytDirectCache.size >= 60) ytDirectCache.clear();
+  ytDirectCache.set(youtubeId, { expiresAt: Date.now() + 90 * 1000, result: failResult });
+  return failResult;
 }
 
 function runFfmpegToFile(args: string[], signal?: AbortSignal): Promise<void> {
@@ -998,7 +1229,7 @@ async function startServer() {
     const sizes: Partial<Record<DownloadFormatId, number>> = {};
 
     if (youtubeId) {
-      const resolved = await resolveYouTubeDirectMedia(youtubeId);
+      const { media: resolved } = await resolveYouTubeDirectMedia(youtubeId);
       if (resolved) {
         if (resolved.durationSeconds > 0) durationSeconds = resolved.durationSeconds;
         const audioBytes = resolved.audioContentLength;
@@ -1034,6 +1265,7 @@ async function startServer() {
     const streamUrl = String(req.query.streamUrl || '').trim();
     const rawFormat = String(req.query.format || 'mp3-160').trim() as DownloadFormatId;
     const option = DOWNLOAD_FORMAT_MAP[rawFormat];
+    const requestedDuration = Math.max(0, Number(req.query.duration || 0) || 0);
     const cleanMeta = (val: unknown, fallback: string) =>
       String(val || fallback)
         .replace(/[\u0000-\u001f]+/g, ' ')
@@ -1045,13 +1277,13 @@ async function startServer() {
     const album = cleanMeta(req.query.album, 'kaGO.PIaY');
 
     if (!option) {
-      return res.status(400).send('Unsupported download format');
+      return res.status(400).json({ error: 'Unsupported download format.' });
     }
     if (!youtubeId && !streamUrl) {
-      return res.status(400).send('Missing youtubeId or streamUrl');
+      return res.status(400).json({ error: 'Missing track stream identifier.' });
     }
     if (youtubeId && !/^[a-zA-Z0-9_-]{6,20}$/.test(youtubeId)) {
-      return res.status(400).send('Invalid youtubeId');
+      return res.status(400).json({ error: 'Invalid YouTube track ID.' });
     }
 
     let validatedStreamUrl = '';
@@ -1059,11 +1291,11 @@ async function startServer() {
       try {
         const parsed = new URL(streamUrl);
         if (parsed.protocol !== 'https:' || !isAllowedProxyHost(parsed.hostname)) {
-          return res.status(403).send('Host not permitted');
+          return res.status(403).json({ error: 'Stream host not permitted.' });
         }
         validatedStreamUrl = parsed.toString();
       } catch {
-        return res.status(400).send('Invalid streamUrl');
+        return res.status(400).json({ error: 'Invalid stream URL.' });
       }
     }
 
@@ -1083,16 +1315,44 @@ async function startServer() {
 
     try {
       let resolved: ServerDirectMedia | null = null;
+      let ytBotBlocked = false;
       if (youtubeId) {
-        resolved = await resolveYouTubeDirectMedia(youtubeId);
+        const ytResult = await resolveYouTubeDirectMedia(youtubeId);
+        resolved = ytResult.media;
+        ytBotBlocked = ytResult.botBlocked;
       }
 
-      const sourceAudioUrl = resolved?.audioUrl || validatedStreamUrl;
+      let sourceAudioUrl = resolved?.audioUrl || validatedStreamUrl;
+      let usingYouTubeMedia = Boolean(resolved?.audioUrl || resolved?.muxed360Url);
+
+      // When YouTube blocks datacenter server IPs for music downloads, look up a verified full-length audio mirror
+      if (!sourceAudioUrl && option.category === 'music') {
+        const mirror = await resolveFallbackAudioMirror(title, artist, requestedDuration);
+        if (mirror?.url) {
+          sourceAudioUrl = mirror.url;
+          usingYouTubeMedia = false;
+        }
+      }
+
       if (!sourceAudioUrl) {
-        return res.status(502).send('Media stream could not be resolved');
+        if (option.category === 'video' && ytBotBlocked) {
+          return res.status(502).json({
+            error:
+              'YouTube blocked cloud server access for MP4 video. Choose a Music format (MP3/M4A) or use the Android app.',
+            code: 'YT_BOT_BLOCKED',
+          });
+        }
+        if (ytBotBlocked) {
+          return res.status(502).json({
+            error:
+              'YouTube blocked cloud server download for this song and no full audio mirror matched. Use the Android app to download directly.',
+            code: 'YT_BOT_BLOCKED',
+          });
+        }
+        return res.status(502).json({ error: 'Media stream could not be resolved for download.' });
       }
 
-      const baseInputFlags = youtubeId
+      const baseInputFlags = usingYouTubeMedia
         ? ['-user_agent', YT_VR_USER_AGENT, '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2']
         : ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '2'];
 
@@ -1152,7 +1412,12 @@ async function startServer() {
       } else {
         // Video MP4 formats: 144p, 240p, 360p, 480p, 720p
         if (!youtubeId || !resolved) {
-          return res.status(400).send('Video format unavailable for audio-only stream');
+          return res.status(ytBotBlocked ? 502 : 400).json({
+            error: ytBotBlocked
+              ? 'YouTube blocked cloud server access for MP4 video. Choose a Music format (MP3/M4A) or use the Android app.'
+              : 'Video format unavailable for audio-only stream.',
+            code: ytBotBlocked ? 'YT_BOT_BLOCKED' : 'VIDEO_UNAVAILABLE',
+          });
         }
         const resKey = (option.resolutionLabel || '360p') as
           | '144p'
@@ -1237,7 +1502,7 @@ async function startServer() {
             ];
           }
         } else {
-          return res.status(502).send('Requested video stream unavailable');
+          return res.status(502).json({ error: 'Requested video stream unavailable.' });
         }
       }
 
@@ -1250,7 +1515,7 @@ async function startServer() {
       const stat = await fs.stat(tmpOutFile);
       if (stat.size <= 0) {
         await cleanupTempFile();
-        return res.status(502).send('Generated media file was empty');
+        return res.status(502).json({ error: 'Generated media file was empty.' });
       }
 
       res.status(200);
@@ -1269,7 +1534,7 @@ async function startServer() {
       readStream.on('error', () => {
         void cleanupTempFile();
         if (!res.headersSent) {
-          res.status(502).end('Failed reading processed download');
+          res.status(502).json({ error: 'Failed reading processed download.' });
         } else {
           res.end();
         }
@@ -1282,7 +1547,7 @@ async function startServer() {
     } catch {
       await cleanupTempFile();
       if (!res.headersSent && !abortController.signal.aborted) {
-        return res.status(502).send('Download conversion failed');
+        return res.status(502).json({ error: 'Download conversion failed.' });
       }
       if (!res.writableEnded) {
         res.end();

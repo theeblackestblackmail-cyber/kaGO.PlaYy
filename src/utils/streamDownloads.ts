@@ -218,6 +218,213 @@ export function sanitizeDownloadFilename(
   return `${base}.${safeExt}`;
 }
 
+export interface AudioMirrorCandidate {
+  title: string;
+  artist: string;
+  durationSec: number;
+  streamUrl: string;
+  provider: 'audius' | 'soundcloud' | 'direct';
+}
+
+const MIRROR_STOP_WORDS = new Set([
+  'the',
+  'a',
+  'an',
+  'and',
+  'or',
+  'of',
+  'in',
+  'on',
+  'to',
+  'for',
+  'by',
+  'with',
+  'feat',
+  'ft',
+  'featuring',
+  'official',
+  'audio',
+  'video',
+  'music',
+  'lyric',
+  'lyrics',
+  'hd',
+  'hq',
+  '4k',
+  'visualizer',
+  'version',
+  'topic',
+  'explicit',
+  'clean',
+]);
+
+const MIRROR_VARIANT_TOKENS = [
+  'remix',
+  'cover',
+  'karaoke',
+  'instrumental',
+  'parody',
+  'slowed',
+  'reverb',
+  'nightcore',
+  'sped up',
+  '8d',
+  'mashup',
+  'tribute',
+  'teaser',
+  'snippet',
+  'ringtone',
+];
+
+function extractSignificantTokens(input: string): string[] {
+  return (input || '')
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 2 && !MIRROR_STOP_WORDS.has(w));
+}
+
+export function pickVerifiedAudioMirrorCandidate(
+  candidates: AudioMirrorCandidate[],
+  targetTitle: string,
+  targetArtist: string,
+  expectedDurationSec?: number
+): AudioMirrorCandidate | null {
+  const titleTokens = extractSignificantTokens(targetTitle);
+  const artistTokens = extractSignificantTokens(targetArtist);
+  if (titleTokens.length === 0) return null;
+
+  const targetLower = `${targetTitle} ${targetArtist}`.toLowerCase();
+  const safeExpectedDur =
+    expectedDurationSec && Number.isFinite(expectedDurationSec) && expectedDurationSec >= 45
+      ? expectedDurationSec
+      : 0;
+
+  let best: { candidate: AudioMirrorCandidate; score: number } | null = null;
+
+  for (const cand of candidates) {
+    if (!cand.streamUrl || !cand.title) continue;
+    if (!Number.isFinite(cand.durationSec) || cand.durationSec < 45) continue;
+
+    if (safeExpectedDur > 0) {
+      const tolerance = Math.max(25, Math.round(safeExpectedDur * 0.3));
+      if (Math.abs(cand.durationSec - safeExpectedDur) > tolerance) {
+        continue;
+      }
+    }
+
+    const candLower = `${cand.title} ${cand.artist}`.toLowerCase();
+    // Skip remixes / covers / instrumentals / parodies / slowed versions unless explicitly requested
+    const blockedVariant = MIRROR_VARIANT_TOKENS.some(
+      (variant) => candLower.includes(variant) && !targetLower.includes(variant)
+    );
+    if (blockedVariant) continue;
+
+    const candTokens = new Set(extractSignificantTokens(`${cand.title} ${cand.artist}`));
+    const matchedTitleCount = titleTokens.filter((t) => candTokens.has(t)).length;
+    const minRequiredTitleMatches = titleTokens.length <= 2 ? titleTokens.length : Math.ceil(titleTokens.length * 0.6);
+    if (matchedTitleCount < minRequiredTitleMatches) continue;
+
+    const matchedArtistCount = artistTokens.filter((t) => candTokens.has(t)).length;
+    const hasArtistSignal = artistTokens.length === 0 || matchedArtistCount >= 1;
+    if (!hasArtistSignal && matchedTitleCount < titleTokens.length) continue;
+
+    let score = matchedTitleCount * 30 + matchedArtistCount * 22;
+    if (hasArtistSignal) score += 20;
+    if (cand.provider === 'audius') score += 8;
+    if (safeExpectedDur > 0) {
+      const diff = Math.abs(cand.durationSec - safeExpectedDur);
+      score += Math.max(0, 25 - diff);
+    }
+
+    if (!best || score > best.score) {
+      best = { candidate: cand, score };
+    }
+  }
+
+  return best ? best.candidate : null;
+}
+
+class HtmlResponseFallbackError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'HtmlResponseFallbackError';
+  }
+}
+
+function parseDirectYouTubePlayerJson(
+  rawJson: string,
+  fallbackDuration: number
+): ResolvedDirectMedia | null {
+  const data = JSON.parse(rawJson) as {
+    streamingData?: {
+      formats?: Array<{ itag?: number; url?: string; contentLength?: string; mimeType?: string }>;
+      adaptiveFormats?: Array<{
+        itag?: number;
+        url?: string;
+        contentLength?: string;
+        mimeType?: string;
+        bitrate?: number;
+        qualityLabel?: string;
+      }>;
+    };
+    videoDetails?: { lengthSeconds?: string };
+  };
+
+  const streaming = data.streamingData;
+  if (!streaming) return null;
+
+  const adaptive = Array.isArray(streaming.adaptiveFormats) ? streaming.adaptiveFormats : [];
+  const formats = Array.isArray(streaming.formats) ? streaming.formats : [];
+
+  const m4a140 = adaptive.find((f) => f.itag === 140 && f.url);
+  const anyMp4Audio = adaptive.find((f) => (f.mimeType || '').includes('audio/mp4') && f.url);
+  const anyAudio = adaptive.find((f) => (f.mimeType || '').startsWith('audio/') && f.url);
+  const pickedAudio = m4a140 || anyMp4Audio || anyAudio;
+  const muxed18 = formats.find((f) => f.itag === 18 && f.url);
+
+  if (!pickedAudio?.url && !muxed18?.url) return null;
+
+  const videoStreams: ResolvedDirectMedia['videoStreams'] = {};
+  const desiredVideoItags: Array<{ res: '144p' | '240p' | '360p' | '480p' | '720p'; itag: number }> = [
+    { res: '144p', itag: 160 },
+    { res: '240p', itag: 133 },
+    { res: '360p', itag: 134 },
+    { res: '480p', itag: 135 },
+    { res: '720p', itag: 136 },
+  ];
+
+  for (const target of desiredVideoItags) {
+    const match =
+      adaptive.find((f) => f.itag === target.itag && f.url) ||
+      adaptive.find(
+        (f) =>
+          (f.mimeType || '').includes('video/mp4') &&
+          (f.mimeType || '').includes('avc1') &&
+          f.qualityLabel === target.res &&
+          f.url
+      );
+    if (match?.url) {
+      videoStreams[target.res] = {
+        url: match.url,
+        contentLength: Number(match.contentLength || 0) || 0,
+      };
+    }
+  }
+
+  const parsedDuration = Number(data.videoDetails?.lengthSeconds || 0) || fallbackDuration || 180;
+  const audioMime = pickedAudio?.mimeType || '';
+  return {
+    audioUrl: pickedAudio?.url || muxed18?.url,
+    audioExt: audioMime.includes('webm') ? 'webm' : 'm4a',
+    audioContentLength: Number(pickedAudio?.contentLength || 0) || 0,
+    muxed360Url: muxed18?.url,
+    muxed360Length: Number(muxed18?.contentLength || 0) || 0,
+    videoStreams,
+    durationSeconds: parsedDuration,
+  };
+}
+
 export async function resolveTrackDirectMediaNative(
   track: Track
 ): Promise<ResolvedDirectMedia | null> {
@@ -235,97 +442,58 @@ export async function resolveTrackDirectMediaNative(
 
   if (!hasNativeHttpPostBridge()) return null;
 
-  try {
-    const res = await nativePostJson(
-      'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
-      {
-        videoId: track.youtubeId,
-        context: {
-          client: {
-            clientName: 'ANDROID_VR',
-            clientVersion: '1.60.19',
-            androidSdkVersion: 32,
-            hl: 'en',
-            gl: 'US',
-          },
+  const nativeClients = [
+    {
+      clientName: 'ANDROID_VR',
+      clientVersion: '1.60.19',
+      androidSdkVersion: 32,
+      hl: 'en',
+      gl: 'US',
+    },
+    {
+      clientName: 'IOS',
+      clientVersion: '19.29.1',
+      deviceModel: 'iPhone16,2',
+      hl: 'en',
+      gl: 'US',
+    },
+    {
+      clientName: 'ANDROID_CREATOR',
+      clientVersion: '24.44.100',
+      androidSdkVersion: 34,
+      hl: 'en',
+      gl: 'US',
+    },
+    {
+      clientName: 'MWEB',
+      clientVersion: '2.20250218.01.00',
+      hl: 'en',
+      gl: 'US',
+    },
+  ];
+
+  for (const client of nativeClients) {
+    try {
+      const res = await nativePostJson(
+        'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+        {
+          videoId: track.youtubeId,
+          context: { client },
+          contentCheckOk: true,
+          racyCheckOk: true,
         },
-        contentCheckOk: true,
-        racyCheckOk: true,
-      },
-      10000
-    );
+        10000
+      );
 
-    if (!res?.ok || !res.text) return null;
-    const data = JSON.parse(res.text) as {
-      videoDetails?: { lengthSeconds?: string };
-      streamingData?: {
-        formats?: Array<{ itag?: number; url?: string; contentLength?: string; mimeType?: string }>;
-        adaptiveFormats?: Array<{
-          itag?: number;
-          url?: string;
-          contentLength?: string;
-          mimeType?: string;
-          bitrate?: number;
-          qualityLabel?: string;
-        }>;
-      };
-    };
-
-    const streaming = data.streamingData;
-    if (!streaming) return null;
-
-    const adaptive = Array.isArray(streaming.adaptiveFormats) ? streaming.adaptiveFormats : [];
-    const formats = Array.isArray(streaming.formats) ? streaming.formats : [];
-
-    // Prefer itag 140 (M4A AAC 128k), then any MP4 audio, then any audio
-    const m4a140 = adaptive.find((f) => f.itag === 140 && f.url);
-    const anyMp4Audio = adaptive.find((f) => (f.mimeType || '').includes('audio/mp4') && f.url);
-    const anyAudio = adaptive.find((f) => (f.mimeType || '').startsWith('audio/') && f.url);
-    const pickedAudio = m4a140 || anyMp4Audio || anyAudio;
-
-    const muxed18 = formats.find((f) => f.itag === 18 && f.url);
-
-    const videoStreams: ResolvedDirectMedia['videoStreams'] = {};
-    const desiredVideoItags: Array<{ res: '144p' | '240p' | '360p' | '480p' | '720p'; itag: number }> = [
-      { res: '144p', itag: 160 },
-      { res: '240p', itag: 133 },
-      { res: '360p', itag: 134 },
-      { res: '480p', itag: 135 },
-      { res: '720p', itag: 136 },
-    ];
-
-    for (const target of desiredVideoItags) {
-      const match =
-        adaptive.find((f) => f.itag === target.itag && f.url) ||
-        adaptive.find(
-          (f) =>
-            (f.mimeType || '').includes('video/mp4') &&
-            (f.mimeType || '').includes('avc1') &&
-            f.qualityLabel === target.res &&
-            f.url
-        );
-      if (match?.url) {
-        videoStreams[target.res] = {
-          url: match.url,
-          contentLength: Number(match.contentLength || 0) || 0,
-        };
-      }
+      if (!res?.ok || !res.text) continue;
+      const parsed = parseDirectYouTubePlayerJson(res.text, track.duration || 180);
+      if (parsed) return parsed;
+    } catch {
+      // Try next Innertube client profile
     }
-
-    const parsedDuration = Number(data.videoDetails?.lengthSeconds || 0) || track.duration || 180;
-    const audioMime = pickedAudio?.mimeType || '';
-    return {
-      audioUrl: pickedAudio?.url || muxed18?.url,
-      audioExt: audioMime.includes('webm') ? 'webm' : 'm4a',
-      audioContentLength: Number(pickedAudio?.contentLength || 0) || 0,
-      muxed360Url: muxed18?.url,
-      muxed360Length: Number(muxed18?.contentLength || 0) || 0,
-      videoStreams,
-      durationSeconds: parsedDuration,
-    };
-  } catch {
-    return null;
   }
+
+  return null;
 }
 
 export async function fetchStreamFormatSizes(
@@ -346,6 +514,7 @@ export async function fetchStreamFormatSizes(
     params.set('duration', String(Math.round(durationSeconds)));
 
     const res = await fetch(`/api/stream/formats?${params.toString()}`, {
+      cache: 'no-store',
       signal: AbortSignal.timeout(8000),
     });
     if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
@@ -401,16 +570,46 @@ async function fetchBlobWithProgress(
   fallbackMime: string,
   onProgress?: (info: DownloadProgressInfo) => void
 ): Promise<Blob> {
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    cache: 'no-store',
+    credentials: 'same-origin',
+  });
+  const contentType = (res.headers.get('content-type') || fallbackMime).toLowerCase();
+
   if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw new Error(errText || `Download request failed (${res.status})`);
+    const rawBody = await res.text().catch(() => '');
+    if (contentType.includes('application/json') || rawBody.trim().startsWith('{')) {
+      try {
+        const parsed = JSON.parse(rawBody) as { error?: string };
+        if (parsed.error) throw new Error(parsed.error);
+      } catch (jsonErr) {
+        if (jsonErr instanceof Error && jsonErr.message && !jsonErr.message.includes('JSON')) {
+          throw jsonErr;
+        }
+      }
+    }
+    const cleanText = rawBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    throw new Error(
+      cleanText && cleanText.length <= 180
+        ? cleanText
+        : `Download request failed (${res.status}).`
+    );
+  }
+
+  if (contentType.includes('text/html')) {
+    throw new HtmlResponseFallbackError(
+      'Download endpoint returned a web page instead of audio/video. Refresh once to update offline service worker cache.'
+    );
   }
 
   const totalHeader = Number(res.headers.get('content-length') || 0);
-  const contentType = res.headers.get('content-type') || fallbackMime;
   if (!res.body) {
     const blob = await res.blob();
+    if (blob.type.toLowerCase().includes('text/html')) {
+      throw new HtmlResponseFallbackError(
+        'Download endpoint returned a web page instead of audio/video.'
+      );
+    }
     onProgress?.({ percent: 100, loadedBytes: blob.size, totalBytes: blob.size });
     return blob;
   }
@@ -457,7 +656,51 @@ function buildServerDownloadUrl(track: Track, formatId: DownloadFormatId): strin
   if (track.album) params.set('album', track.album);
   if (track.youtubeId) params.set('youtubeId', track.youtubeId);
   if (track.streamUrl) params.set('streamUrl', track.streamUrl);
+  if (track.duration && Number.isFinite(track.duration) && track.duration > 0) {
+    params.set('duration', String(Math.round(track.duration)));
+  }
   return `/api/stream/download?${params.toString()}`;
+}
+
+async function resolveBrowserAudiusMirrorUrl(track: Track): Promise<string | null> {
+  if (track.streamUrl && track.streamUrl.includes('audius.co')) {
+    return track.streamUrl;
+  }
+  try {
+    const query = [track.artist, track.title].filter(Boolean).join(' ').trim();
+    if (!query) return null;
+    const res = await fetch(
+      `https://api.audius.co/v1/tracks/search?query=${encodeURIComponent(query)}&limit=8`,
+      { signal: AbortSignal.timeout(5500), headers: { Accept: 'application/json' } }
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      data?: Array<{
+        id?: string;
+        title?: string;
+        duration?: number;
+        user?: { name?: string };
+      }>;
+    };
+    const candidates: AudioMirrorCandidate[] = (data.data || [])
+      .filter((item) => Boolean(item.id && item.title && item.duration))
+      .map((item) => ({
+        title: item.title || '',
+        artist: item.user?.name || '',
+        durationSec: Math.round(item.duration || 0),
+        streamUrl: `https://api.audius.co/v1/tracks/${encodeURIComponent(item.id!)}/stream`,
+        provider: 'audius' as const,
+      }));
+    const picked = pickVerifiedAudioMirrorCandidate(
+      candidates,
+      track.title,
+      track.artist,
+      track.duration
+    );
+    return picked?.streamUrl || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -474,16 +717,17 @@ export async function downloadTrackToAppStorage(
 
   let downloadedBlob: Blob | null = null;
   let formatLabel = track.youtubeId ? 'M4A 128K' : 'MP3 Stream';
+  let lastError: string | null = null;
 
   // 1. Try server endpoint (Web/PWA & tethered APK)
   try {
     const serverUrl = buildServerDownloadUrl(track, track.youtubeId ? 'm4a-128' : 'mp3-160');
     const candidateBlob = await fetchBlobWithProgress(serverUrl, 'audio/mp4', onProgress);
-    if (candidateBlob.size >= 4096) {
+    if (candidateBlob.size >= 4096 && !candidateBlob.type.toLowerCase().includes('text/html')) {
       downloadedBlob = candidateBlob;
     }
-  } catch {
-    // Standalone Capacitor APK falls through to native CDN downloader
+  } catch (err) {
+    lastError = err instanceof Error ? err.message : null;
   }
 
   // 2. Native Android standalone fallback (fetches googlevideo / Audius URL into native cache + reads chunks into IndexedDB)
@@ -512,20 +756,36 @@ export async function downloadTrackToAppStorage(
     }
   }
 
-  // 3. Direct Audius proxy fallback if streamUrl is present
-  if (!downloadedBlob && track.streamUrl) {
-    const directOrProxy = track.streamUrl.startsWith('http')
-      ? `/api/stream/proxy?url=${encodeURIComponent(track.streamUrl)}`
-      : track.streamUrl;
-    const fallbackBlob = await fetchBlobWithProgress(directOrProxy, 'audio/mpeg', onProgress);
-    if (fallbackBlob.size >= 4096) {
-      downloadedBlob = fallbackBlob;
-      formatLabel = 'MP3 Audio';
+  // 3. Direct Audius CORS / proxy fallback
+  if (!downloadedBlob) {
+    const directAudioUrl =
+      (track.streamUrl && track.streamUrl.startsWith('http') ? track.streamUrl : null) ||
+      (await resolveBrowserAudiusMirrorUrl(track));
+    if (directAudioUrl) {
+      try {
+        const directBlob = await fetchBlobWithProgress(directAudioUrl, 'audio/mpeg', onProgress);
+        if (directBlob.size >= 4096 && !directBlob.type.toLowerCase().includes('text/html')) {
+          downloadedBlob = directBlob;
+          formatLabel = 'MP3 Audio';
+        }
+      } catch {
+        if (track.streamUrl && track.streamUrl.startsWith('http')) {
+          const fallbackBlob = await fetchBlobWithProgress(
+            `/api/stream/proxy?url=${encodeURIComponent(track.streamUrl)}`,
+            'audio/mpeg',
+            onProgress
+          ).catch(() => null);
+          if (fallbackBlob && fallbackBlob.size >= 4096 && !fallbackBlob.type.toLowerCase().includes('text/html')) {
+            downloadedBlob = fallbackBlob;
+            formatLabel = 'MP3 Audio';
+          }
+        }
+      }
     }
   }
 
   if (!downloadedBlob || downloadedBlob.size < 4096) {
-    throw new Error('Could not fetch audio bytes for offline storage.');
+    throw new Error(lastError || 'Could not fetch audio bytes for offline storage.');
   }
 
   const savedTrack: Track = {
@@ -569,19 +829,28 @@ export async function downloadTrackToLocalDevice(
   const option = DOWNLOAD_FORMAT_MAP[formatId] || DOWNLOAD_FORMAT_MAP[DEFAULT_LOCAL_DOWNLOAD_FORMAT];
   const targetFilename = sanitizeDownloadFilename(track.title, track.artist, option.ext);
 
-  // Check whether server backend transcoding endpoint is reachable
   let serverReachable = true;
+  let serverError: Error | null = null;
   try {
     const serverDownloadUrl = buildServerDownloadUrl(track, option.id);
-    if (hasNativePublicDownloadBridge() && typeof window !== 'undefined' && (window.location.protocol === 'capacitor:' || window.location.hostname === 'localhost')) {
+    if (
+      hasNativePublicDownloadBridge() &&
+      typeof window !== 'undefined' &&
+      (window.location.protocol === 'capacitor:' || window.location.hostname === 'localhost')
+    ) {
       // Probe health quickly so standalone static APK skips 404 HTML bodies
-      const probe = await fetch('/api/health', { signal: AbortSignal.timeout(1800) }).catch(() => null);
-      serverReachable = Boolean(probe?.ok && (probe.headers.get('content-type') || '').includes('application/json'));
+      const probe = await fetch('/api/health', {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(1800),
+      }).catch(() => null);
+      serverReachable = Boolean(
+        probe?.ok && (probe.headers.get('content-type') || '').includes('application/json')
+      );
     }
 
     if (serverReachable) {
       const blob = await fetchBlobWithProgress(serverDownloadUrl, option.mimeType, onProgress);
-      if (blob.size >= 4096 && !blob.type.includes('text/html')) {
+      if (blob.size >= 4096 && !blob.type.toLowerCase().includes('text/html')) {
         triggerBrowserFileDownload(blob, targetFilename);
         return {
           filename: targetFilename,
@@ -589,18 +858,46 @@ export async function downloadTrackToLocalDevice(
           actualFormatLabel: option.title,
         };
       }
+      serverError = new Error('Download returned an invalid or empty media response.');
     }
   } catch (err) {
-    if (!hasNativePublicDownloadBridge()) {
-      throw err instanceof Error ? err : new Error('Failed to download file.');
-    }
+    serverError = err instanceof Error ? err : new Error('Failed to download file.');
   }
 
   // Standalone Android APK fallback: write directly to MediaStore.Downloads/kaGO.PIaY
   if (hasNativePublicDownloadBridge()) {
     const resolved = await resolveTrackDirectMediaNative(track);
     if (!resolved) {
-      throw new Error('Could not resolve direct media stream on device.');
+      const audiusUrl =
+        option.category === 'music' ? await resolveBrowserAudiusMirrorUrl(track) : null;
+      if (audiusUrl) {
+        const nativeFilename = sanitizeDownloadFilename(track.title, track.artist, 'mp3');
+        const nativeResult = await saveNativeMediaToPublicDownloads({
+          primaryUrl: audiusUrl,
+          fileName: nativeFilename,
+          mimeType: 'audio/mpeg',
+          onProgress: (loadedBytes, totalBytes) => {
+            const percent =
+              totalBytes > 0 ? Math.min(99, Math.round((loadedBytes / totalBytes) * 100)) : 50;
+            onProgress?.({ percent, loadedBytes, totalBytes });
+          },
+        });
+        if (nativeResult.ok) {
+          onProgress?.({
+            percent: 100,
+            loadedBytes: nativeResult.totalBytes,
+            totalBytes: nativeResult.totalBytes,
+          });
+          return {
+            filename: nativeFilename,
+            sizeBytes: nativeResult.totalBytes,
+            actualFormatLabel: 'Classic MP3',
+          };
+        }
+      }
+      throw new Error(
+        serverError?.message || 'Could not resolve direct media stream on device.'
+      );
     }
 
     if (option.category === 'video' && option.resolutionLabel) {
@@ -666,5 +963,33 @@ export async function downloadTrackToLocalDevice(
     };
   }
 
-  throw new Error('Download service unavailable.');
+  // Web browser direct CORS audio fallback when static hosting or offline SW returned HTML
+  if (option.category === 'music') {
+    const corsAudioUrl =
+      (track.streamUrl && track.streamUrl.startsWith('http') ? track.streamUrl : null) ||
+      (serverError instanceof HtmlResponseFallbackError
+        ? await resolveBrowserAudiusMirrorUrl(track)
+        : null);
+
+    if (corsAudioUrl) {
+      try {
+        const fallbackBlob = await fetchBlobWithProgress(corsAudioUrl, 'audio/mpeg', onProgress);
+        if (fallbackBlob.size >= 4096 && !fallbackBlob.type.toLowerCase().includes('text/html')) {
+          const actualExt = fallbackBlob.type.includes('mp4') ? 'm4a' : 'mp3';
+          const fallbackName = sanitizeDownloadFilename(track.title, track.artist, actualExt);
+          triggerBrowserFileDownload(fallbackBlob, fallbackName);
+          return {
+            filename: fallbackName,
+            sizeBytes: fallbackBlob.size,
+            actualFormatLabel: actualExt === 'm4a' ? 'Fast M4A (128K)' : 'Classic MP3',
+          };
+        }
+      } catch {
+        // Fall through to report primary server error
+      }
+    }
+  }
+
+  throw serverError || new Error('Could not complete download on this device.');
 }
+
