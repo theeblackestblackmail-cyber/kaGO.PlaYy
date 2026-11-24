@@ -2795,6 +2795,139 @@ test('MainActivity declares public onSaveInstanceState matching Capacitor Bridge
   assert.ok(!javaSrc.includes('getContentLengthLong()'));
 });
 
+test('aiAssistant parses all Siri-style tool calls with strict clamping, filtering, and sanitization', async () => {
+  const {
+    buildAiTrackSearchQuery,
+    formatRecordingTimer,
+    isAllowedAudioMimeType,
+    normalizeAudioMimeType,
+    parseFunctionCallsToActions,
+    sanitizeHttpUrl,
+  } = await import('./aiAssistant');
+
+  assert.equal(normalizeAudioMimeType('audio/webm;codecs=opus'), 'audio/webm');
+  assert.equal(isAllowedAudioMimeType('audio/webm;codecs=opus'), true);
+  assert.equal(isAllowedAudioMimeType('audio/mp4'), true);
+  assert.equal(isAllowedAudioMimeType('application/javascript'), false);
+
+  assert.equal(sanitizeHttpUrl('https://whosampled.com/sample/123'), 'https://whosampled.com/sample/123');
+  assert.equal(sanitizeHttpUrl('javascript:alert(1)'), null);
+  assert.equal(sanitizeHttpUrl('data:text/html,<script>'), null);
+
+  assert.equal(formatRecordingTimer(0), '0:00');
+  assert.equal(formatRecordingTimer(65), '1:05');
+  assert.equal(buildAiTrackSearchQuery({ artist: 'Drake', title: 'Hotline Bling' }), 'Drake - Hotline Bling');
+
+  const actions = parseFunctionCallsToActions([
+    { name: 'play_song', args: { artist: 'Daft Punk', title: 'One More Time', mode: 'play_next' } },
+    {
+      name: 'identify_song_candidates',
+      args: {
+        candidates: [
+          { title: 'Africa', artist: 'Toto', reason: 'Chorus lyrics match', confidence: 'high' },
+          { title: '', artist: 'Invalid' },
+        ],
+      },
+    },
+    {
+      name: 'create_playlist',
+      args: {
+        name: 'Late Night Afro',
+        description: 'Chill afrobeats mix',
+        trackQueries: Array.from({ length: 20 }, (_, i) => `Artist ${i} - Song ${i}`),
+        autoPlay: true,
+      },
+    },
+    { name: 'control_playback', args: { command: 'seek_relative', valueSeconds: 9999 } },
+    { name: 'control_playback', args: { command: 'not_a_real_command' } },
+    {
+      name: 'update_dsp',
+      args: {
+        eqPreset: 'Heavy Bass',
+        bassBoostEnabled: true,
+        bassBoostDb: 99,
+        crossfadeSeconds: 20,
+      },
+    },
+    {
+      name: 'update_dsp',
+      args: { eqPreset: 'BogusPreset' },
+    },
+    {
+      name: 'navigate_tab',
+      args: { tab: 'search', searchQuery: 'Burna Boy' },
+    },
+    {
+      name: 'download_current_track',
+      args: { destination: 'device', formatId: 'mp3-320' },
+    },
+    { name: 'toggle_favorite_current', args: { favorite: true } },
+    { name: 'play_library_match', args: { query: 'Cyber Resonance', mode: 'queue' } },
+  ]);
+
+  assert.equal(actions.length, 9);
+  assert.deepEqual(actions[0], {
+    type: 'play_song',
+    query: 'Daft Punk - One More Time',
+    title: 'One More Time',
+    artist: 'Daft Punk',
+    mode: 'play_next',
+  });
+  assert.equal(actions[1].type, 'identify_song_candidates');
+  if (actions[1].type === 'identify_song_candidates') {
+    assert.equal(actions[1].candidates.length, 1);
+  }
+  assert.equal(actions[2].type, 'create_playlist');
+  if (actions[2].type === 'create_playlist') {
+    assert.equal(actions[2].trackQueries.length, 15);
+    assert.equal(actions[2].autoPlay, true);
+  }
+  assert.deepEqual(actions[3], {
+    type: 'control_playback',
+    command: 'seek_relative',
+    valueSeconds: 600,
+  });
+  assert.deepEqual(actions[4], {
+    type: 'update_dsp',
+    eqPreset: 'Heavy Bass',
+    bassBoostEnabled: true,
+    bassBoostDb: 14,
+    crossfadeSeconds: 12,
+  });
+  assert.deepEqual(actions[5], {
+    type: 'navigate_tab',
+    tab: 'search',
+    librarySubTab: undefined,
+    searchQuery: 'Burna Boy',
+  });
+  assert.deepEqual(actions[6], {
+    type: 'download_current_track',
+    destination: 'device',
+    formatId: 'mp3-320',
+  });
+  assert.deepEqual(actions[7], {
+    type: 'toggle_favorite_current',
+    favorite: true,
+  });
+  assert.deepEqual(actions[8], {
+    type: 'play_library_match',
+    query: 'Cyber Resonance',
+    mode: 'queue',
+  });
+});
+
+test('setup-android-native patches RECORD_AUDIO and MODIFY_AUDIO_SETTINGS for AI microphone capture', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const setupSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'scripts/setup-android-native.mjs'),
+    'utf8'
+  );
+  assert.ok(setupSrc.includes('android.permission.RECORD_AUDIO'));
+  assert.ok(setupSrc.includes('android.permission.MODIFY_AUDIO_SETTINGS'));
+});
+
+
 
 
 

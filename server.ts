@@ -8,8 +8,18 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { fileURLToPath } from 'node:url';
+import { GoogleGenAI, Type, type Content, type FunctionDeclaration } from '@google/genai';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createServer as createViteServer } from 'vite';
+import {
+  isAllowedAudioMimeType,
+  normalizeAudioMimeType,
+  parseFunctionCallsToActions,
+  sanitizeHttpUrl,
+  type AiAssistantContextPayload,
+  type AiAssistantHistoryItem,
+  type AiAssistantSource,
+} from './src/utils/aiAssistant';
 import {
   buildCategorySearchPlan,
   buildInnertubeBrowseBody,
@@ -863,8 +873,483 @@ function runFfmpegToFile(args: string[], signal?: AbortSignal): Promise<void> {
   });
 }
 
+function getGeminiClient(): GoogleGenAI | null {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey) return null;
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+const AI_ASSISTANT_SYSTEM_INSTRUCTION = `You are the built-in Siri-style AI music assistant inside kaGO.PIaY, a hi-fi offline & streaming audio player.
+
+What you can help users with:
+1. Identify songs from typed or spoken lyrics, song descriptions, vibe hints, or hummed/sung/played audio clips sent via the microphone.
+   - Listen closely to hummed melodies, rhythm, pitch contour, or sung fragments in audio recordings. Listen first, provide your best matching song candidate(s) with artist names via identify_song_candidates (up to 3 plausible matches) and play_song when the match is clear and the user wants to hear it or asked to find/play it.
+   - If hummed audio is completely silent, pure noise, or too ambiguous to identify confidently, be honest and suggest humming slightly louder/closer to the mic or adding a lyric clue.
+2. Answer music knowledge questions thoroughly and accurately using Google Search grounding (e.g., where a beat or song was sampled from, producers, release year, chart trivia, meaning of lyrics, or details about the currently playing track shown in context).
+3. Create playlists for any artist, genre, mood, activity, or era using create_playlist with 6 to 12 diverse, real, well-known song search queries in "Artist - Title" format.
+4. Control the kaGO.PIaY app on command: play/pause/skip/previous/rewind/forward/shuffle/autoplay radio/fullscreen/sync lyrics (control_playback), EQ presets & Bass Boost & Crossfade (update_dsp), navigate tabs or open Search (navigate_tab), favorite/unfavorite current track (toggle_favorite_current), download the current track to the app or local device (download_current_track), or play offline library tracks (play_library_match).
+
+Rules:
+- Never fabricate sample credits, producers, or song identities—rely on Google Search when verifying facts, samples, or lyric matches.
+- Keep spoken/chat replies concise, warm, direct, and easy to skim on mobile.
+- When you call an app-control tool, state clearly what you did or queued.`;
+
+const AI_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
+  {
+    name: 'play_song',
+    description:
+      'Search and play, play next, or queue a specific song in kaGO.PIaY streaming player.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        query: {
+          type: Type.STRING,
+          description: 'Search query in "Artist - Song Title" format.',
+        },
+        title: { type: Type.STRING, description: 'Track title if known.' },
+        artist: { type: Type.STRING, description: 'Artist name if known.' },
+        mode: {
+          type: Type.STRING,
+          enum: ['play_now', 'play_next', 'add_to_queue'],
+          description: 'Whether to play immediately, insert as Play Next, or append to queue.',
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'identify_song_candidates',
+    description:
+      'Return top candidate song matches identified from typed lyrics, descriptions, or hummed/sung microphone audio.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        candidates: {
+          type: Type.ARRAY,
+          description: 'Up to 3 ranked song candidates.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              title: { type: Type.STRING },
+              artist: { type: Type.STRING },
+              reason: {
+                type: Type.STRING,
+                description: 'Brief explanation (matching lyric phrase, melody, or sample).',
+              },
+              confidence: {
+                type: Type.STRING,
+                enum: ['high', 'medium', 'low'],
+              },
+            },
+            required: ['title', 'artist'],
+          },
+        },
+      },
+      required: ['candidates'],
+    },
+  },
+  {
+    name: 'create_playlist',
+    description:
+      'Create and save a playable playlist inside kaGO.PIaY populated with real songs.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        name: { type: Type.STRING, description: 'Short catchy playlist title.' },
+        description: { type: Type.STRING, description: 'Brief 1-sentence playlist description.' },
+        trackQueries: {
+          type: Type.ARRAY,
+          description: 'List of 6 to 12 real song queries in "Artist - Song Title" format.',
+          items: { type: Type.STRING },
+        },
+        autoPlay: {
+          type: Type.BOOLEAN,
+          description: 'Set true if user asked to play/start the playlist immediately.',
+        },
+      },
+      required: ['name', 'trackQueries'],
+    },
+  },
+  {
+    name: 'control_playback',
+    description: 'Control current audio playback state, queue navigation, fullscreen, or lyrics.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        command: {
+          type: Type.STRING,
+          enum: [
+            'play',
+            'pause',
+            'toggle',
+            'next',
+            'previous',
+            'seek_relative',
+            'toggle_shuffle',
+            'toggle_autoplay_radio',
+            'open_fullscreen',
+            'open_lyrics',
+          ],
+        },
+        valueSeconds: {
+          type: Type.NUMBER,
+          description: 'Signed seconds offset when command is seek_relative (e.g. 15 or -15).',
+        },
+      },
+      required: ['command'],
+    },
+  },
+  {
+    name: 'update_dsp',
+    description: 'Update the kaGO.PIaY equalizer preset, hardware bass boost, or crossfade duration.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        eqPreset: {
+          type: Type.STRING,
+          enum: [
+            'Flat',
+            'Bass',
+            'Heavy Bass',
+            'Rock',
+            'Pop',
+            'Classical',
+            'Jazz',
+            'Electronic',
+            'Hip-Hop',
+            'Vocal Boost',
+            'Acoustic',
+            'Treble Boost',
+          ],
+        },
+        bassBoostEnabled: { type: Type.BOOLEAN },
+        bassBoostDb: { type: Type.NUMBER, description: '0 to 14 dB' },
+        crossfadeSeconds: { type: Type.NUMBER, description: '0 to 12 seconds' },
+      },
+    },
+  },
+  {
+    name: 'navigate_tab',
+    description: 'Switch the active screen/tab in kaGO.PIaY or launch Search.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        tab: {
+          type: Type.STRING,
+          enum: ['dashboard', 'stream', 'library', 'settings', 'search', 'scanner', 'lyrics'],
+        },
+        librarySubTab: {
+          type: Type.STRING,
+          enum: ['all', 'downloads', 'folders', 'playlists', 'albums', 'artists', 'favorites'],
+        },
+        searchQuery: {
+          type: Type.STRING,
+          description: 'Optional query to run when opening search tab.',
+        },
+      },
+      required: ['tab'],
+    },
+  },
+  {
+    name: 'download_current_track',
+    description: 'Save or download the currently playing track offline in the app or to device.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        destination: {
+          type: Type.STRING,
+          enum: ['app', 'device'],
+        },
+        formatId: {
+          type: Type.STRING,
+          enum: [
+            'm4a-128',
+            'mp3-70',
+            'mp3-128',
+            'mp3-160',
+            'mp3-320',
+            'mp4-144p',
+            'mp4-240p',
+            'mp4-360p',
+            'mp4-480p',
+            'mp4-720p',
+          ],
+        },
+      },
+      required: ['destination'],
+    },
+  },
+  {
+    name: 'toggle_favorite_current',
+    description: 'Like/favorite or unfavorite the currently playing track.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        favorite: { type: Type.BOOLEAN },
+      },
+      required: ['favorite'],
+    },
+  },
+  {
+    name: 'play_library_match',
+    description: 'Play or queue an offline/downloaded song from the user library by title or artist.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        query: { type: Type.STRING },
+        mode: { type: Type.STRING, enum: ['play_now', 'queue'] },
+      },
+      required: ['query'],
+    },
+  },
+];
+
+function formatAiContextSummary(context?: AiAssistantContextPayload | null): string {
+  if (!context) return '';
+  const parts: string[] = [];
+  if (context.currentTrack) {
+    const t = context.currentTrack;
+    parts.push(
+      `Now Playing: "${t.title}" by ${t.artist} (Album: ${t.album || 'Unknown'}, Source: ${t.source}, ${Math.round(
+        t.currentTime
+      )}s / ${Math.round(t.duration)}s, ${context.isPlaying ? 'playing' : 'paused'})`
+    );
+  } else {
+    parts.push('Now Playing: Nothing currently loaded.');
+  }
+  parts.push(`Active Tab: ${context.activeTab}${context.isFullscreenOpen ? ' (Fullscreen Player open)' : ''}`);
+  if (context.dsp) {
+    parts.push(
+      `DSP: EQ=${context.dsp.preset}, BassBoost=${
+        context.dsp.bassBoostEnabled ? `ON (${context.dsp.bassBoostDb}dB)` : 'OFF'
+      }, Crossfade=${context.dsp.crossfadeSeconds}s`
+    );
+  }
+  if (Array.isArray(context.playlistNames) && context.playlistNames.length > 0) {
+    parts.push(`Saved Playlists: ${context.playlistNames.slice(0, 12).join(', ')}`);
+  }
+  parts.push(`Offline Library Count: ${context.libraryTracksCount || 0} tracks`);
+  return parts.join('\n');
+}
+
+function extractGroundedSources(response: {
+  candidates?: Array<{
+    groundingMetadata?: {
+      groundingChunks?: Array<{ web?: { uri?: string; title?: string } }>;
+    };
+  }>;
+}): AiAssistantSource[] {
+  const chunks = response?.candidates?.[0]?.groundingMetadata?.groundingChunks;
+  if (!Array.isArray(chunks)) return [];
+  const seen = new Set<string>();
+  const out: AiAssistantSource[] = [];
+  for (const ch of chunks) {
+    const uri = ch?.web?.uri ? sanitizeHttpUrl(ch.web.uri) : null;
+    if (!uri || seen.has(uri)) continue;
+    seen.add(uri);
+    const title = (ch.web?.title || '').trim() || new URL(uri).hostname;
+    out.push({ title: title.slice(0, 120), uri });
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
 async function startServer() {
   const app = express();
+
+  app.post('/api/ai/assist', express.json({ limit: '6mb' }), async (req, res) => {
+    const ai = getGeminiClient();
+    if (!ai) {
+      return res.status(503).json({
+        error: 'AI assistant requires GEMINI_API_KEY to be configured on the server.',
+      });
+    }
+
+    const body = (req.body && typeof req.body === 'object' ? req.body : {}) as {
+      prompt?: unknown;
+      audioBase64?: unknown;
+      audioMimeType?: unknown;
+      history?: unknown;
+      context?: AiAssistantContextPayload;
+    };
+
+    const rawPrompt = typeof body.prompt === 'string' ? body.prompt.trim().slice(0, 2000) : '';
+    const rawAudio = typeof body.audioBase64 === 'string' ? body.audioBase64.trim() : '';
+    const rawMime = typeof body.audioMimeType === 'string' ? body.audioMimeType : 'audio/webm';
+
+    if (!rawPrompt && !rawAudio) {
+      return res.status(400).json({ error: 'Please type a message or record audio to ask the AI assistant.' });
+    }
+
+    let cleanAudioBase64 = '';
+    let audioMimeType = '';
+    if (rawAudio) {
+      if (!isAllowedAudioMimeType(rawMime)) {
+        return res.status(400).json({ error: 'Unsupported audio recording format.' });
+      }
+      const stripped = rawAudio.replace(/^data:audio\/[a-zA-Z0-9.+_-]+;base64,/, '');
+      if (!/^[A-Za-z0-9+/=]+$/.test(stripped)) {
+        return res.status(400).json({ error: 'Invalid base64 audio payload.' });
+      }
+      const decodedBytes = Buffer.from(stripped, 'base64').byteLength;
+      if (decodedBytes === 0 || decodedBytes > 4.5 * 1024 * 1024) {
+        return res.status(400).json({ error: 'Audio clip must be between 1 byte and 4.5 MB.' });
+      }
+      cleanAudioBase64 = stripped;
+      audioMimeType = normalizeAudioMimeType(rawMime);
+    }
+
+    const historyItems: AiAssistantHistoryItem[] = Array.isArray(body.history)
+      ? body.history
+          .filter(
+            (h): h is AiAssistantHistoryItem =>
+              Boolean(h) &&
+              typeof h === 'object' &&
+              ((h as AiAssistantHistoryItem).role === 'user' ||
+                (h as AiAssistantHistoryItem).role === 'model') &&
+              typeof (h as AiAssistantHistoryItem).text === 'string' &&
+              (h as AiAssistantHistoryItem).text.trim().length > 0
+          )
+          .slice(-8)
+          .map((h) => ({
+            role: h.role,
+            text: h.text.trim().slice(0, 1200),
+          }))
+      : [];
+
+    const contextSummary = formatAiContextSummary(body.context);
+    const effectivePrompt =
+      rawPrompt ||
+      'Listen to this microphone audio recording carefully. Identify the hummed, sung, or spoken song/lyrics or fulfill the spoken voice request.';
+
+    const userParts: Content['parts'] = [];
+    if (cleanAudioBase64) {
+      userParts.push({
+        inlineData: {
+          mimeType: audioMimeType,
+          data: cleanAudioBase64,
+        },
+      });
+    }
+    userParts.push({
+      text: contextSummary ? `[App Context]\n${contextSummary}\n\n[User Request]\n${effectivePrompt}` : effectivePrompt,
+    });
+
+    const contents: Content[] = [
+      ...historyItems.map((h) => ({
+        role: h.role,
+        parts: [{ text: h.text }],
+      })),
+      {
+        role: 'user',
+        parts: userParts,
+      },
+    ];
+
+    const aiConfig = {
+      systemInstruction: AI_ASSISTANT_SYSTEM_INSTRUCTION,
+      tools: [{ googleSearch: {} }, { functionDeclarations: AI_FUNCTION_DECLARATIONS }],
+      toolConfig: { includeServerSideToolInvocations: true },
+    };
+
+    try {
+      const turn1 = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents,
+        config: aiConfig,
+      });
+
+      const collectedCalls: Array<{ name?: string; args?: Record<string, unknown> }> = [
+        ...(turn1.functionCalls || []).map((fc) => ({
+          name: fc.name,
+          args: (fc.args || {}) as Record<string, unknown>,
+        })),
+      ];
+      let replyText = (turn1.text || '').trim();
+      const sourceMap = new Map<string, AiAssistantSource>();
+      for (const s of extractGroundedSources(turn1)) {
+        sourceMap.set(s.uri, s);
+      }
+
+      if ((turn1.functionCalls?.length || 0) > 0 && !replyText) {
+        const previousContent = turn1.candidates?.[0]?.content;
+        const turn2Contents: Content[] = [
+          ...contents,
+          ...(previousContent ? [previousContent] : []),
+          {
+            role: 'user',
+            parts: (turn1.functionCalls || []).map((fc) => ({
+              functionResponse: {
+                name: fc.name || 'action',
+                id: fc.id,
+                response: { ok: true, executedInApp: true },
+              },
+            })),
+          },
+        ];
+
+        try {
+          const turn2 = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: turn2Contents,
+            config: aiConfig,
+          });
+          if (turn2.text?.trim()) {
+            replyText = turn2.text.trim();
+          }
+          for (const fc of turn2.functionCalls || []) {
+            collectedCalls.push({
+              name: fc.name,
+              args: (fc.args || {}) as Record<string, unknown>,
+            });
+          }
+          for (const s of extractGroundedSources(turn2)) {
+            sourceMap.set(s.uri, s);
+          }
+        } catch {
+          // Keep collected actions if follow-up turn fails
+        }
+      }
+
+      const actions = parseFunctionCallsToActions(collectedCalls);
+      if (!replyText && actions.length > 0) {
+        replyText = 'Done — applied that in kaGO.PIaY.';
+      } else if (!replyText) {
+        replyText = 'I heard you, but could not find a clear answer. Try humming closer or adding a lyric clue.';
+      }
+
+      return res.json({
+        reply: replyText,
+        actions,
+        sources: Array.from(sourceMap.values()),
+      });
+    } catch (err) {
+      const status =
+        typeof (err as { status?: unknown })?.status === 'number'
+          ? (err as { status: number }).status
+          : 502;
+      const rawMsg = err instanceof Error ? err.message : 'AI service error.';
+      if (status === 429) {
+        return res.status(429).json({
+          error: 'AI rate limit reached right now. Please wait a moment and try again.',
+        });
+      }
+      if (status === 400 || status === 403 || status === 404) {
+        return res.status(status).json({ error: rawMsg.slice(0, 260) });
+      }
+      return res.status(502).json({
+        error: 'Unable to reach Gemini right now. Please try again in a moment.',
+      });
+    }
+  });
+
   app.use(express.json());
 
   app.get('/api/health', (_req, res) => {

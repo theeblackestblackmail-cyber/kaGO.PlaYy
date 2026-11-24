@@ -284,6 +284,8 @@ export function applyAndroidNativeOverrides(rootDir = process.cwd()) {
     '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
     '<uses-permission android:name="android.permission.WAKE_LOCK" />',
     '<uses-permission android:name="android.permission.VIBRATE" />',
+    '<uses-permission android:name="android.permission.RECORD_AUDIO" />',
+    '<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />',
     '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />',
   ];
 

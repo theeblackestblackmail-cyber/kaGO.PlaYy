@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CheckCircle2, Download, Loader2, Radio, WifiOff, X } from 'lucide-react';
 import { audioEngine } from './audio/AudioEngine';
+import { AiAssistantWidget } from './components/AiAssistantWidget';
 import { DashboardView } from './components/DashboardView';
 import { DownloadSheetModal, type DownloadTarget } from './components/DownloadSheetModal';
 import { DspStudioModal } from './components/DspStudioModal';
@@ -118,6 +119,10 @@ export default function App() {
   const [visualizerPalette, setVisualizerPalette] = useState<VisualizerPaletteId>(() =>
     loadVisualizerPalette()
   );
+  const [externalSearchRequest, setExternalSearchRequest] = useState<{
+    query: string;
+    nonce: number;
+  } | null>(null);
   const [libraryFocusRequest, setLibraryFocusRequest] = useState<{
     subTab: LibrarySubTab;
     groupName?: string | null;
@@ -1599,6 +1604,7 @@ export default function App() {
             libraryTracks={allLibraryTracks}
             downloadedTrackIds={downloadedTrackIdSet}
             engine={engine}
+            externalSearch={externalSearchRequest}
             onPlayTrack={playTrack}
             onTogglePlay={() => void audioEngine.togglePlay()}
             onPlayNext={(t) => handlePlayNext(t)}
@@ -1869,6 +1875,42 @@ export default function App() {
         onClose={() => setIsLiveStudioOpen(false)}
         availableTracks={studioCandidateTracks}
         onPlayTrack={playTrack}
+      />
+
+      <AiAssistantWidget
+        engine={engine}
+        activeTab={activeTab}
+        isFullscreenOpen={isFullscreenOpen}
+        dsp={dsp}
+        playlists={playlists}
+        savedTracks={allLibraryTracks}
+        onPlayTrack={playTrack}
+        onPlayCollection={playCollection}
+        onPlayNext={(tr) => handlePlayNext(tr)}
+        onQueueTracks={handleAddMultipleToQueue}
+        onCreatePlaylist={handleCreatePlaylistWithTracks}
+        onTogglePlay={() => void audioEngine.togglePlay()}
+        onPlay={() => void audioEngine.play()}
+        onPause={() => audioEngine.pause()}
+        onNext={handleNext}
+        onPrev={handlePrev}
+        onSeekBy={(sec) => audioEngine.seekBy(sec)}
+        onToggleShuffle={handleToggleShuffle}
+        onToggleAutoplayRadio={handleToggleAutoplayRadio}
+        onOpenFullscreen={setIsFullscreenOpen}
+        onNavigateTab={(tab, librarySubTab, searchQuery) => {
+          if (tab === 'library' && librarySubTab) {
+            setLibraryFocusRequest({ subTab: librarySubTab, nonce: Date.now() });
+          }
+          if (tab === 'search' && searchQuery?.trim()) {
+            setExternalSearchRequest({ query: searchQuery.trim(), nonce: Date.now() });
+          }
+          setActiveTab(tab);
+        }}
+        onUpdateDsp={handleUpdateDsp}
+        onToggleFavorite={handleToggleFavorite}
+        onDownloadToApp={handleDownloadToApp}
+        onDownloadToDevice={handleDownloadToDevice}
       />
     </div>
   );

@@ -45,6 +45,7 @@ interface SearchViewProps {
   libraryTracks: Track[];
   downloadedTrackIds?: Set<string>;
   engine: AudioEngineSnapshot;
+  externalSearch?: { query: string; nonce: number } | null;
   onPlayTrack: (track: Track) => void;
   onTogglePlay: () => void;
   onPlayNext?: (track: Track) => void;
@@ -64,6 +65,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
   libraryTracks,
   downloadedTrackIds,
   engine,
+  externalSearch,
   onPlayTrack,
   onTogglePlay,
   onPlayNext,
@@ -251,7 +253,7 @@ export const SearchView: React.FC<SearchViewProps> = ({
     });
   }, [currentContentProfile]);
 
-  const executeOnlineSearch = async (searchText: string) => {
+  const executeOnlineSearch = useCallback(async (searchText: string) => {
     const cleanQ = searchText.trim();
     setShowSuggestions(false);
     if (!cleanQ) {
@@ -283,7 +285,17 @@ export const SearchView: React.FC<SearchViewProps> = ({
         setIsSearching(false);
       }
     }
-  };
+  }, [engine.currentTrack, loadDiverseRecommendations, visitSeed]);
+
+  const lastExternalNonceRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!externalSearch?.query.trim()) return;
+    if (lastExternalNonceRef.current === externalSearch.nonce) return;
+    lastExternalNonceRef.current = externalSearch.nonce;
+    const clean = externalSearch.query.trim();
+    setQuery(clean);
+    void executeOnlineSearch(clean);
+  }, [executeOnlineSearch, externalSearch]);
 
   return (
     <div className="space-y-5 sm:space-y-6">
