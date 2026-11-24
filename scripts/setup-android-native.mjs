@@ -386,6 +386,7 @@ export function applyAndroidNativeOverrides(rootDir = process.cwd()) {
   if (fs.existsSync(varsGradlePath)) {
     let vars = fs.readFileSync(varsGradlePath, 'utf8');
     vars = vars
+      .replace(/minSdkVersion\s*=\s*\d+/g, 'minSdkVersion = 24')
       .replace(/compileSdkVersion\s*=\s*\d+/g, 'compileSdkVersion = 34')
       .replace(/targetSdkVersion\s*=\s*\d+/g, 'targetSdkVersion = 34');
     fs.writeFileSync(varsGradlePath, vars, 'utf8');

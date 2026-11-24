@@ -101,7 +101,7 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
-    protected void onSaveInstanceState(Bundle outState) {
+    public void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
         if (pendingFolderRequestId != null) {
             outState.putString(KEY_PENDING_REQ, pendingFolderRequestId);
@@ -573,7 +573,17 @@ public class MainActivity extends BridgeActivity {
             if (status < 200 || status >= 300) {
                 throw new Exception("HTTP " + status + " downloading media");
             }
-            long contentLength = conn.getContentLengthLong();
+            long contentLength = -1L;
+            String contentLengthHeader = conn.getHeaderField("Content-Length");
+            if (contentLengthHeader != null) {
+                try {
+                    contentLength = Long.parseLong(contentLengthHeader.trim());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            if (contentLength < 0L) {
+                contentLength = conn.getContentLength();
+            }
             long effectiveTotal = knownCombinedTotal > 0 ? knownCombinedTotal : contentLength;
             long written = 0L;
             long lastEmitMs = 0L;

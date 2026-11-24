@@ -2713,6 +2713,89 @@ test('insertPlayNextTracks inserts directly after current track, deduplicates ex
   assert.deepEqual(afterIdle.map((t) => t.id), ['z', 'a', 'b', 'c', 'd']);
 });
 
+test('pickVerifiedAudioMirrorCandidate selects exact verified mirrors and rejects snippets, remixes, and duration mismatches', async () => {
+  const { pickVerifiedAudioMirrorCandidate, sanitizeDownloadFilename } = await import('./streamDownloads');
+
+  assert.equal(sanitizeDownloadFilename('Passionfruit (Live)?', 'Drake', 'mp3'), 'Drake - Passionfruit (Live).mp3');
+
+  const picked = pickVerifiedAudioMirrorCandidate(
+    [
+      {
+        provider: 'soundcloud',
+        title: 'Passionfruit',
+        artist: 'Drake',
+        durationSec: 30,
+        streamUrl: 'https://sc/snippet',
+      },
+      {
+        provider: 'audius',
+        title: 'Passionfruit (Slowed + Reverb Remix)',
+        artist: 'Drake',
+        durationSec: 298,
+        streamUrl: 'https://audius/remix',
+      },
+      {
+        provider: 'soundcloud',
+        title: 'Drake - Passionfruit (Acoustic Cover)',
+        artist: 'CoverBand',
+        durationSec: 295,
+        streamUrl: 'https://sc/cover',
+      },
+      {
+        provider: 'audius',
+        title: 'Passionfruit',
+        artist: 'Drake',
+        durationSec: 299,
+        streamUrl: 'https://api.audius.co/v1/tracks/abc/stream',
+      },
+      {
+        provider: 'soundcloud',
+        title: 'Passionfruit',
+        artist: 'Drake',
+        durationSec: 299,
+        streamUrl: 'https://sc/exact',
+      },
+    ],
+    'Passionfruit',
+    'Drake',
+    299
+  );
+
+  assert.ok(picked);
+  assert.equal(picked.provider, 'audius');
+  assert.equal(picked.streamUrl, 'https://api.audius.co/v1/tracks/abc/stream');
+
+  // Reject candidates whose duration diverges widely from expected official track length
+  const mismatched = pickVerifiedAudioMirrorCandidate(
+    [
+      {
+        provider: 'audius',
+        title: 'Passionfruit',
+        artist: 'Drake',
+        durationSec: 85,
+        streamUrl: 'https://api.audius.co/v1/tracks/short/stream',
+      },
+    ],
+    'Passionfruit',
+    'Drake',
+    299
+  );
+  assert.equal(mismatched, null);
+});
+
+test('MainActivity declares public onSaveInstanceState matching Capacitor BridgeActivity and avoids minSdk<24 getContentLengthLong', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const javaSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'android-native/java/com/kagoplay/workstation/MainActivity.java'),
+    'utf8'
+  );
+  assert.ok(javaSrc.includes('public void onSaveInstanceState(Bundle outState)'));
+  assert.ok(!javaSrc.includes('protected void onSaveInstanceState(Bundle outState)'));
+  assert.ok(!javaSrc.includes('getContentLengthLong()'));
+});
+
+
 
 
 

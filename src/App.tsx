@@ -1748,7 +1748,7 @@ export default function App() {
                   <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
                 )}
                 <span
-                  className={`truncate font-medium ${
+                  className={`line-clamp-2 font-medium leading-snug ${
                     downloadToast.isError ? 'text-red-300' : 'text-[#F4F3F0]'
                   }`}
                 >
