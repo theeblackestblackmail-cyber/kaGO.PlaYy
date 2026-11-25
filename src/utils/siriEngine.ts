@@ -65,6 +65,14 @@ const VALID_EQ_NAMES: EqPresetName[] = [
   'Treble Boost',
 ];
 
+export function mergeDictatedPrompt(baseText: string, dictatedText: string): string {
+  const base = (baseText || '').trim();
+  const spoken = (dictatedText || '').replace(/\s+/g, ' ').trim();
+  if (!spoken) return base;
+  if (!base) return spoken;
+  return `${base} ${spoken}`;
+}
+
 function formatCompactCount(count?: number): string {
   if (!count || !Number.isFinite(count) || count <= 0) return '';
   if (count >= 1_000_000_000) return `${(count / 1_000_000_000).toFixed(1).replace(/\.0$/, '')}B views`;

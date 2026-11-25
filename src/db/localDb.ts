@@ -133,13 +133,41 @@ async function deleteByKey(storeName: string, key: IDBValidKey): Promise<void> {
   }
 }
 
+export const LEGACY_SYNTH_STEM_IDS = new Set([
+  'stem-cyber-resonance',
+  'stem-neon-drive',
+  'stem-midnight-drift',
+  'stem-tokyo-2099',
+]);
+
+export function isLegacyOrSynthTrack(track: Track | null | undefined): boolean {
+  if (!track) return false;
+  if (LEGACY_SYNTH_STEM_IDS.has(track.id)) return true;
+  if (track.source === 'synth' || track.streamProvider === 'synth') return true;
+  if (track.id.startsWith('stem-') || track.id.startsWith('curated-')) return true;
+  return false;
+}
+
 export const localDb = {
   async loadTracks(): Promise<Track[]> {
     const tracks = await getAllFromStore<Track>(STORES.TRACKS);
+    const removedIds: string[] = [];
+    const keptTracks: Track[] = [];
+    for (const track of tracks) {
+      if (isLegacyOrSynthTrack(track)) {
+        removedIds.push(track.id);
+      } else {
+        keptTracks.push(track);
+      }
+    }
+    if (removedIds.length > 0) {
+      void this.deleteTracksBatch(removedIds);
+    }
+
     const fixedUpdates: Track[] = [];
 
     const hydrated = await Promise.all(
-      tracks.map(async (track) => {
+      keptTracks.map(async (track) => {
         if (
           track.source === 'local' &&
           (looksLikeMojibake(track.title) ||

@@ -1,4 +1,3 @@
-import { CURATED_STREAM_BANK } from '../data/presetsAndStems';
 import type { Track } from '../types/audio';
 import {
   hasNativeHttpBridge,
@@ -162,13 +161,5 @@ export async function fetchRelatedRadioTracks(
     // Offline fallback below
   }
 
-  // 4. Offline curated bank fallback matching specific genre only (never mix unrelated genres)
-  const seedGenre = (seedTrack.genre || '').toLowerCase();
-  if (seedGenre && !['youtube', 'stream', 'radio', 'local'].includes(seedGenre)) {
-    const matched = CURATED_STREAM_BANK.filter(
-      (t) => !excluded.has(t.id) && (t.genre || '').toLowerCase() === seedGenre
-    );
-    return matched.slice(0, 6).map((t) => ({ ...t, autoQueued: true }));
-  }
   return [];
 }

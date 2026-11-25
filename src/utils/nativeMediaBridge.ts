@@ -44,6 +44,16 @@ export interface NativeMediaBridgeApi {
     fileName: string,
     mimeType: string
   ) => void;
+  startSpeechDictation?: (requestId: string) => void;
+  stopSpeechDictation?: (discard: boolean) => void;
+}
+
+export interface NativeSpeechEvent {
+  requestId: string;
+  phase: 'listening' | 'partial' | 'final' | 'rms' | 'error' | 'cancelled';
+  transcript: string;
+  error: string;
+  rms?: number;
 }
 
 export type NativeMediaActionDetail =
@@ -88,6 +98,13 @@ export function hasNativePublicDownloadBridge(): boolean {
   return (
     typeof window !== 'undefined' &&
     typeof window.KaGoNative?.saveMediaToPublicDownloadsAsync === 'function'
+  );
+}
+
+export function hasNativeSpeechDictation(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.KaGoNative?.startSpeechDictation === 'function'
   );
 }
 
@@ -656,4 +673,40 @@ export function subscribeNativeKeepalive(
   window.addEventListener('kago-native-keepalive', listener);
   return () => window.removeEventListener('kago-native-keepalive', listener);
 }
+
+export function startNativeSpeechDictation(requestId: string): boolean {
+  if (!hasNativeSpeechDictation()) return false;
+  try {
+    window.KaGoNative?.startSpeechDictation?.(requestId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function stopNativeSpeechDictation(discard = false): void {
+  if (typeof window === 'undefined' || typeof window.KaGoNative?.stopSpeechDictation !== 'function') {
+    return;
+  }
+  try {
+    window.KaGoNative.stopSpeechDictation(discard);
+  } catch {
+    // Ignore
+  }
+}
+
+export function subscribeNativeSpeechEvents(
+  handler: (detail: NativeSpeechEvent) => void
+): () => void {
+  if (typeof window === 'undefined') return () => {};
+  const listener = (ev: Event) => {
+    const custom = ev as CustomEvent<NativeSpeechEvent>;
+    if (custom?.detail) {
+      handler(custom.detail);
+    }
+  };
+  window.addEventListener('kago-native-speech', listener);
+  return () => window.removeEventListener('kago-native-speech', listener);
+}
+
 

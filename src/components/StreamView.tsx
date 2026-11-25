@@ -20,7 +20,7 @@ import {
   Trash2,
   UserCheck,
 } from 'lucide-react';
-import { CURATED_STREAM_BANK, STREAM_GENRES } from '../data/presetsAndStems';
+import { STREAM_GENRES } from '../data/presetsAndStems';
 import { localDb } from '../db/localDb';
 import type {
   AudioEngineSnapshot,
@@ -35,11 +35,8 @@ import {
   analyzeTrackContentProfile,
   nextDiscoveryVisitSeed,
   pickContentBasedPopularSearches,
-  rankContentBasedCandidates,
   readDiscoveryHistory,
   readDiscoveryText,
-  readSessionSeenSongKeys,
-  rotateCuratedFallbackTracks,
   writeDiscoveryHistory,
   writeDiscoveryText,
 } from '../utils/streamDiscovery';
@@ -211,18 +208,6 @@ export const StreamView: React.FC<StreamViewProps> = ({
 
     const loadInitialFeed = async () => {
       setIsLoading(true);
-      const buildFallback = () => {
-        const profile = analyzeTrackContentProfile(engine.currentTrack, selectedGenre);
-        const seenKeys = readSessionSeenSongKeys(STREAM_SESSION_SEEN_KEY);
-        const ranked = rankContentBasedCandidates(CURATED_STREAM_BANK, profile, {
-          seenSongKeys: seenKeys,
-          visitSeed: effectiveSeed,
-          maxResults: 9,
-        });
-        return ranked.length > 0
-          ? ranked
-          : rotateCuratedFallbackTracks(CURATED_STREAM_BANK, effectiveSeed);
-      };
 
       try {
         const feed = await fetchDiverseDiscoveryFeed({
@@ -243,12 +228,15 @@ export const StreamView: React.FC<StreamViewProps> = ({
           writeDiscoveryHistory(STREAM_SEEDS_STORAGE_KEY, feed.usedSeeds);
         }
         setArtistResults(feed.artists);
-        setResults(feed.tracks.length > 0 ? feed.tracks : buildFallback());
+        setResults(feed.tracks);
+        if (feed.tracks.length === 0 && feed.artists.length === 0) {
+          setStatusNote('No online streams available right now — check connection or play from Library.');
+        }
       } catch {
         if (searchRequestIdRef.current !== reqId) return;
         setArtistResults([]);
-        setResults(buildFallback());
-        setStatusNote('Offline fallback active — rotating content-matched mix.');
+        setResults([]);
+        setStatusNote('You appear offline — switch to Library to play your saved songs.');
       } finally {
         if (searchRequestIdRef.current === reqId) {
           setIsLoading(false);
@@ -317,7 +305,6 @@ export const StreamView: React.FC<StreamViewProps> = ({
 
     try {
       const freshSeed = nextDiscoveryVisitSeed('kago_stream_visit_seed');
-      const rotatedFallback = rotateCuratedFallbackTracks(CURATED_STREAM_BANK, freshSeed);
 
       if (!cleanQ) {
         const prevFeedQuery = readDiscoveryText(FEED_QUERY_STORAGE_KEY);
@@ -340,19 +327,9 @@ export const StreamView: React.FC<StreamViewProps> = ({
           writeDiscoveryHistory(STREAM_SEEDS_STORAGE_KEY, feed.usedSeeds);
         }
         setArtistResults(feed.artists);
-        const profile = analyzeTrackContentProfile(engine.currentTrack, genreFilter);
-        const seenKeys = readSessionSeenSongKeys(STREAM_SESSION_SEEN_KEY);
-        const localMatches = rankContentBasedCandidates(
-          CURATED_STREAM_BANK.filter(
-            (item) => !genreFilter || item.genre?.toLowerCase() === genreFilter.toLowerCase()
-          ),
-          profile,
-          { seenSongKeys: seenKeys, visitSeed: freshSeed, maxResults: 9 }
-        );
-        const merged = feed.tracks.length > 0 ? feed.tracks : localMatches;
-        setResults(merged.length > 0 ? merged : category === 'artists' ? [] : rotatedFallback);
+        setResults(feed.tracks);
         if (feed.source === 'fallback' && feed.tracks.length === 0 && feed.artists.length === 0) {
-          setStatusNote('Showing rotated offline sound bank tracks.');
+          setStatusNote('No online streams available right now — check connection or play from Library.');
         }
         return;
       }
@@ -367,33 +344,15 @@ export const StreamView: React.FC<StreamViewProps> = ({
       if (searchRequestIdRef.current !== reqId) return;
 
       setArtistResults(liveArtists);
-
-      const localMatches = rotatedFallback.filter((item) => {
-        const matchesGenre = !genreFilter || item.genre?.toLowerCase() === genreFilter.toLowerCase();
-        const matchesQuery =
-          !cleanQ ||
-          item.title.toLowerCase().includes(cleanQ.toLowerCase()) ||
-          item.artist.toLowerCase().includes(cleanQ.toLowerCase()) ||
-          (item.genre || '').toLowerCase().includes(cleanQ.toLowerCase());
-        return matchesGenre && matchesQuery;
-      });
-
-      const merged = liveSongs.length > 0 ? liveSongs : localMatches;
-      setResults(merged.length > 0 ? merged : category === 'artists' ? [] : rotatedFallback);
+      setResults(liveSongs);
       if (sourceFlag === 'fallback' && liveSongs.length === 0 && liveArtists.length === 0) {
-        setStatusNote(
-          `No YouTube stream matched "${cleanQ}". Showing rotated offline sound bank.`
-        );
+        setStatusNote(`No online stream matched "${cleanQ}". Try another query or check connection.`);
       }
     } catch {
       if (searchRequestIdRef.current !== reqId) return;
       setArtistResults([]);
-      const rotatedFallback = rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed);
-      const localMatches = rotatedFallback.filter(
-        (item) => !genreFilter || item.genre?.toLowerCase() === genreFilter.toLowerCase()
-      );
-      setResults(localMatches.length > 0 ? localMatches : rotatedFallback);
-      setStatusNote('Offline fallback active — sound bank loaded.');
+      setResults([]);
+      setStatusNote('Unable to reach online streams right now — check your connection.');
     } finally {
       if (searchRequestIdRef.current === reqId) {
         setIsLoading(false);
@@ -577,20 +536,10 @@ export const StreamView: React.FC<StreamViewProps> = ({
       }
 
       if (!recoveredTrack) {
-        recoveredTrack = {
-          ...track,
-          youtubeId: undefined,
-          streamUrl: undefined,
-          streamProvider: 'synth',
-          recoveredFrom: 'Local Synth Engine Stem',
-          synthProfile: track.synthProfile || {
-            bpm: 118,
-            rootFreq: 55,
-            scale: [0, 3, 7, 10, 12],
-            patternStyle: 'neon',
-            description: 'Auto-recovered procedural synth stream',
-          },
-        };
+        setStatusNote(
+          `No playable online mirror found for "${track.title}". Check your internet or switch to offline library.`
+        );
+        return;
       }
 
       setResults((prev) => prev.map((t) => (t.id === track.id ? recoveredTrack! : t)));

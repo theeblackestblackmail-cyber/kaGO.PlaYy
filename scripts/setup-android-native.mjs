@@ -357,6 +357,21 @@ export function applyAndroidNativeOverrides(rootDir = process.cwd()) {
     manifest = manifest.replace('</application>', serviceBlock);
   }
 
+  // Declare Android 11+ Speech Recognition package visibility so SpeechRecognizer works cleanly
+  if (!manifest.includes('android.speech.RecognitionService')) {
+    const speechQueries = `
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+        <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+    </queries>
+</manifest>`;
+    manifest = manifest.replace('</manifest>', speechQueries);
+  }
+
   fs.writeFileSync(manifestPath, manifest, 'utf8');
 
   // Patch android/app/build.gradle to ensure androidx.media:media:1.7.0 and Java 17 compileOptions

@@ -10,6 +10,9 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
@@ -41,6 +44,25 @@ public class KaGoMediaService extends Service {
     private static volatile boolean isServiceRunning = false;
 
     private MediaSessionCompat mediaSession;
+    private AudioManager audioManager;
+    private AudioFocusRequest audioFocusRequest;
+    private volatile boolean hasAudioFocus = false;
+    private final AudioManager.OnAudioFocusChangeListener audioFocusChangeListener = focusChange -> {
+        if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+            hasAudioFocus = true;
+            if (isCurrentlyPlaying) {
+                MainActivity.dispatchMediaActionToWeb("play", 0L);
+            }
+        } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
+            hasAudioFocus = false;
+            isCurrentlyPlaying = false;
+            currentIsPlaying = false;
+            MainActivity.dispatchMediaActionToWeb("pause", 0L);
+            updatePlaybackState();
+            postForegroundNotification();
+            releaseWakeAndWifiLocks();
+        }
+    };
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private final ExecutorService artworkExecutor = Executors.newSingleThreadExecutor();
@@ -148,10 +170,12 @@ public class KaGoMediaService extends Service {
                 isCurrentlyPlaying = currentIsPlaying;
 
                 if (currentIsPlaying) {
+                    requestAudioFocus();
                     acquireWakeAndWifiLocks();
                     startKeepaliveHeartbeat();
                 } else {
                     stopKeepaliveHeartbeat();
+                    abandonAudioFocus();
                     releaseWakeAndWifiLocks();
                 }
 
@@ -179,6 +203,7 @@ public class KaGoMediaService extends Service {
         isServiceRunning = false;
         isCurrentlyPlaying = false;
         stopKeepaliveHeartbeat();
+        abandonAudioFocus();
         releaseWakeAndWifiLocks();
         artworkExecutor.shutdownNow();
         if (mediaSession != null) {
@@ -385,6 +410,54 @@ public class KaGoMediaService extends Service {
                 wifiLock.release();
             } catch (Exception ignored) {
             }
+        }
+        abandonAudioFocus();
+    }
+
+    private void requestAudioFocus() {
+        try {
+            if (audioManager == null) {
+                audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            }
+            if (audioManager == null || hasAudioFocus) return;
+            int result;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (audioFocusRequest == null) {
+                    AudioAttributes attrs = new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build();
+                    audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(attrs)
+                        .setAcceptsDelayedFocusGain(true)
+                        .setWillPauseWhenDucked(false)
+                        .setOnAudioFocusChangeListener(audioFocusChangeListener, keepaliveHandler)
+                        .build();
+                }
+                result = audioManager.requestAudioFocus(audioFocusRequest);
+            } else {
+                result = audioManager.requestAudioFocus(
+                    audioFocusChangeListener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN
+                );
+            }
+            hasAudioFocus = (result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void abandonAudioFocus() {
+        try {
+            if (!hasAudioFocus || audioManager == null) return;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest(audioFocusRequest);
+            } else {
+                audioManager.abandonAudioFocus(audioFocusChangeListener);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            hasAudioFocus = false;
         }
     }
 

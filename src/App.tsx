@@ -17,8 +17,7 @@ import { SharedLiveStudioModal } from './components/SharedLiveStudioModal';
 import { StreamView } from './components/StreamView';
 import { SyncLyricsView } from './components/SyncLyricsView';
 import { TopBar } from './components/TopBar';
-import { CURATED_STREAM_BANK, PROCEDURAL_STEMS } from './data/presetsAndStems';
-import { localDb } from './db/localDb';
+import { isLegacyOrSynthTrack, LEGACY_SYNTH_STEM_IDS, localDb } from './db/localDb';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import type {
   ActiveTab,
@@ -185,23 +184,56 @@ export default function App() {
       ]);
       if (!active) return;
 
-      const legacyStemIds = new Set([
-        'stem-cyber-resonance',
-        'stem-neon-drive',
-        'stem-midnight-drift',
-        'stem-tokyo-2099',
-        ...PROCEDURAL_STEMS.map((s) => s.id),
-      ]);
-      const cleanedTracks = dbTracks.filter((t) => !legacyStemIds.has(t.id));
+      const cleanedTracks = dbTracks.filter((t) => !isLegacyOrSynthTrack(t));
+
+      const isLegacyId = (id: string) =>
+        LEGACY_SYNTH_STEM_IDS.has(id) || id.startsWith('stem-') || id.startsWith('curated-');
+
+      const cleanedPlaylists: Playlist[] = [];
+      const modifiedPlaylists: Playlist[] = [];
+      for (const pl of dbPlaylists) {
+        const nextIds = pl.trackIds.filter((id) => !isLegacyId(id));
+        if (nextIds.length !== pl.trackIds.length) {
+          const updated = { ...pl, trackIds: nextIds };
+          cleanedPlaylists.push(updated);
+          modifiedPlaylists.push(updated);
+        } else {
+          cleanedPlaylists.push(pl);
+        }
+      }
+      for (const updated of modifiedPlaylists) {
+        void localDb.savePlaylist(updated);
+      }
+
+      try {
+        const rawHist = localStorage.getItem('kagoplay_playback_history');
+        if (rawHist) {
+          const histIds = JSON.parse(rawHist) as string[];
+          const cleanHist = histIds.filter((id) => !isLegacyId(id));
+          if (cleanHist.length !== histIds.length) {
+            localStorage.setItem('kagoplay_playback_history', JSON.stringify(cleanHist));
+          }
+        }
+      } catch {
+        // Ignore storage errors
+      }
+
+      setFavoriteIds((prev) => {
+        const cleanFavs = prev.filter((id) => !isLegacyId(id));
+        if (cleanFavs.length !== prev.length) {
+          localDb.saveFavorites(cleanFavs);
+        }
+        return cleanFavs;
+      });
 
       setSavedTracks(cleanedTracks);
-      setPlaylists(dbPlaylists);
+      setPlaylists(cleanedPlaylists);
       setLyricsMap(dbLyrics);
       setLyricsHydrated(true);
 
       // Seed saved user songs into the queue on startup so Quick Play & Next play them automatically
       if (cleanedTracks.length > 0 && !audioEngine.getSnapshot().currentTrack) {
-        setQueue((prev) => enqueueImportedOfflineTracks(prev, cleanedTracks, legacyStemIds));
+        setQueue((prev) => enqueueImportedOfflineTracks(prev, cleanedTracks, LEGACY_SYNTH_STEM_IDS));
       }
     })();
     return () => {
@@ -212,10 +244,7 @@ export default function App() {
   // Combined user track catalog
   const allLibraryTracks = useMemo(() => savedTracks, [savedTracks]);
 
-  const studioCandidateTracks = useMemo(() => {
-    const seen = new Set(allLibraryTracks.map((t) => t.id));
-    return [...allLibraryTracks, ...CURATED_STREAM_BANK.filter((c) => !seen.has(c.id))];
-  }, [allLibraryTracks]);
+  const studioCandidateTracks = useMemo(() => allLibraryTracks, [allLibraryTracks]);
 
   const syncLyricsTracks = useMemo(() => {
     const cur = engine.currentTrack;
@@ -295,9 +324,8 @@ export default function App() {
           setShuffleEnabled(false);
           setPreShuffleOrderIds(null);
           setQueue((prev) => {
-            const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
             const preserved = prev.filter(
-              (t) => t.id !== track.id && !t.autoQueued && !stemIds.has(t.id)
+              (t) => t.id !== track.id && !t.autoQueued && !isLegacyOrSynthTrack(t)
             );
             const seeded = [track, ...preserved];
             if (smartShuffleEnabled && !autoplayRadioEnabled) {
@@ -309,9 +337,8 @@ export default function App() {
         }
       } else {
         setQueue((prev) => {
-          const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
           let next: Track[];
-          if (track.source === 'local' && prev.every((t) => stemIds.has(t.id))) {
+          if (track.source === 'local' && prev.every((t) => isLegacyOrSynthTrack(t))) {
             next = [track];
           } else {
             next = prev.some((t) => t.id === track.id) ? prev : [...prev, track];
@@ -515,7 +542,57 @@ export default function App() {
     isOnline,
   ]);
 
-  // Prompt user to switch to offline listening after 30s of poor/stalled connection while streaming
+  const offlineFallbackCount = useMemo(() => {
+    return savedTracks.filter(
+      (t) => (t.source === 'local' || Boolean(t.isAppDownload)) && !isLegacyOrSynthTrack(t)
+    ).length;
+  }, [savedTracks]);
+
+  const showDownloadToast = useCallback((text: string, isError = false) => {
+    if (downloadToastTimerRef.current !== null) {
+      window.clearTimeout(downloadToastTimerRef.current);
+    }
+    setDownloadToast({ text, isError });
+    downloadToastTimerRef.current = window.setTimeout(() => {
+      setDownloadToast(null);
+      downloadToastTimerRef.current = null;
+    }, 4200);
+  }, []);
+
+  const handleSwitchToOfflineListening = useCallback(() => {
+    triggerHaptic('success');
+    dismissedBadSinceRef.current = badConnSinceRef.current ?? Date.now();
+    setShowOfflineSwitchPrompt(false);
+
+    const localSongs = savedTracks.filter(
+      (t) => (t.source === 'local' || Boolean(t.isAppDownload)) && !isLegacyOrSynthTrack(t)
+    );
+    if (localSongs.length === 0) return;
+
+    const orderedPool = smartShuffleEnabled
+      ? selectSmartLibraryTracks(localSongs, localDb.loadPlayCounts(), new Set(), localSongs.length).map(
+          (t) => ({ ...t, autoQueued: false })
+        )
+      : localSongs;
+
+    const { queue: offlineQueue, startTrack } = buildCollectionQueue(orderedPool, 0);
+    if (!startTrack) return;
+
+    playedHistoryIdsRef.current.add(startTrack.id);
+    setShuffleEnabled(false);
+    setPreShuffleOrderIds(null);
+    setQueue(offlineQueue);
+    void audioEngine.playTrack(startTrack);
+  }, [savedTracks, smartShuffleEnabled]);
+
+  const offlineFallbackCountRef = useRef(offlineFallbackCount);
+  offlineFallbackCountRef.current = offlineFallbackCount;
+  const handleSwitchToOfflineListeningRef = useRef(handleSwitchToOfflineListening);
+  handleSwitchToOfflineListeningRef.current = handleSwitchToOfflineListening;
+  const showDownloadToastRef = useRef(showDownloadToast);
+  showDownloadToastRef.current = showDownloadToast;
+
+  // Automatically continue with offline Library playback after 30s of poor/stalled connection while streaming
   useEffect(() => {
     if (engine.currentTrack?.source !== 'stream' || engine.currentTrack?.isAppDownload) return;
 
@@ -533,7 +610,20 @@ export default function App() {
         thresholdMs: POOR_CONNECTION_THRESHOLD_MS,
       });
       badConnSinceRef.current = result.nextBadSinceMs;
-      setShowOfflineSwitchPrompt(result.shouldPromptOffline);
+      if (result.shouldPromptOffline) {
+        if (offlineFallbackCountRef.current > 0) {
+          dismissedBadSinceRef.current = result.nextBadSinceMs ?? Date.now();
+          setShowOfflineSwitchPrompt(false);
+          handleSwitchToOfflineListeningRef.current();
+          showDownloadToastRef.current(
+            'Low internet for 30s — continuing with offline library playback.'
+          );
+          return;
+        }
+        setShowOfflineSwitchPrompt(true);
+      } else {
+        setShowOfflineSwitchPrompt(false);
+      }
     };
 
     evaluate();
@@ -548,34 +638,6 @@ export default function App() {
     engine.streamErrorCount,
     isOnline,
   ]);
-
-  const offlineFallbackCount = useMemo(() => {
-    const localCount = savedTracks.filter((t) => t.source === 'local' || Boolean(t.isAppDownload)).length;
-    return localCount > 0 ? localCount : PROCEDURAL_STEMS.length;
-  }, [savedTracks]);
-
-  const handleSwitchToOfflineListening = useCallback(() => {
-    triggerHaptic('success');
-    dismissedBadSinceRef.current = badConnSinceRef.current ?? Date.now();
-    setShowOfflineSwitchPrompt(false);
-
-    const localSongs = savedTracks.filter((t) => t.source === 'local' || Boolean(t.isAppDownload));
-    const sourcePool = localSongs.length > 0 ? localSongs : PROCEDURAL_STEMS;
-    const orderedPool = smartShuffleEnabled
-      ? selectSmartLibraryTracks(sourcePool, localDb.loadPlayCounts(), new Set(), sourcePool.length).map(
-          (t) => ({ ...t, autoQueued: false })
-        )
-      : sourcePool;
-
-    const { queue: offlineQueue, startTrack } = buildCollectionQueue(orderedPool, 0);
-    if (!startTrack) return;
-
-    playedHistoryIdsRef.current.add(startTrack.id);
-    setShuffleEnabled(false);
-    setPreShuffleOrderIds(null);
-    setQueue(offlineQueue);
-    void audioEngine.playTrack(startTrack);
-  }, [savedTracks, smartShuffleEnabled]);
 
   const handleDismissOfflinePrompt = useCallback(() => {
     triggerHaptic('light');
@@ -809,8 +871,7 @@ export default function App() {
       return e.track;
     });
     setSavedTracks((prev) => mergeImportedTracks(prev, importedTracks));
-    const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
-    setQueue((prev) => enqueueImportedOfflineTracks(prev, importedTracks, stemIds));
+    setQueue((prev) => enqueueImportedOfflineTracks(prev, importedTracks, LEGACY_SYNTH_STEM_IDS));
 
     await localDb.saveTracksBatch(importedTracks);
     for (const { track, file } of entries) {
@@ -933,7 +994,6 @@ export default function App() {
     if (hasNativeFolderPicker()) {
       setFolderImportStatus('Opening Android folder picker...');
       try {
-        const stemIds = new Set(PROCEDURAL_STEMS.map((s) => s.id));
         const result = await importFromNativeFolderPicker({
           onProgress: (p) => {
             setFolderImportStatus(`Importing ${p.scanned} / ${p.found}: ${p.currentFile}`);
@@ -942,7 +1002,7 @@ export default function App() {
             // Persist each track + blob right away so File bytes can be garbage-collected on Android WebView
             await localDb.saveTrack(track, file);
             setSavedTracks((prev) => mergeImportedTracks(prev, [track]));
-            setQueue((prev) => enqueueImportedOfflineTracks(prev, [track], stemIds));
+            setQueue((prev) => enqueueImportedOfflineTracks(prev, [track], LEGACY_SYNTH_STEM_IDS));
           },
         });
         if (result.cancelled) {
@@ -1162,17 +1222,6 @@ export default function App() {
     () => new Set(savedTracks.filter((t) => Boolean(t.isAppDownload)).map((t) => t.id)),
     [savedTracks]
   );
-
-  const showDownloadToast = useCallback((text: string, isError = false) => {
-    if (downloadToastTimerRef.current !== null) {
-      window.clearTimeout(downloadToastTimerRef.current);
-    }
-    setDownloadToast({ text, isError });
-    downloadToastTimerRef.current = window.setTimeout(() => {
-      setDownloadToast(null);
-      downloadToastTimerRef.current = null;
-    }, 4200);
-  }, []);
 
   const handleDownloadToApp = useCallback(
     async (tracksToDownload: Track[]) => {
@@ -1812,12 +1861,17 @@ export default function App() {
                 </button>
               </div>
               <p className="mt-1 text-xs leading-relaxed text-[#9CA3AF]">
-                Streaming has been interrupted for 30s. Switch to your offline library (
-                <span className="font-mono-tabular text-[#F4F3F0]">
-                  {offlineFallbackCount}{' '}
-                  {savedTracks.some((t) => t.source === 'local') ? 'offline songs' : 'offline stems'}
-                </span>
-                ) instead?
+                {offlineFallbackCount > 0 ? (
+                  <>
+                    Streaming has been interrupted for 30s. Switch to your offline library (
+                    <span className="font-mono-tabular text-[#F4F3F0]">
+                      {offlineFallbackCount} {offlineFallbackCount === 1 ? 'offline song' : 'offline songs'}
+                    </span>
+                    ) instead?
+                  </>
+                ) : (
+                  'Streaming has been interrupted for 30s and no offline songs are saved in your Library yet.'
+                )}
               </p>
 
               <div className="mt-3 flex flex-wrap items-center gap-2">

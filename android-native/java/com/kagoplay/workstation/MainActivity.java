@@ -24,6 +24,9 @@ import android.os.Vibrator;
 import android.os.VibratorManager;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
 import android.util.Base64;
 import android.util.Rational;
 import android.view.HapticFeedbackConstants;
@@ -53,6 +56,7 @@ import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Deque;
 import java.util.HashSet;
@@ -66,6 +70,8 @@ import java.util.regex.Pattern;
 public class MainActivity extends BridgeActivity {
     private static final int REQ_POST_NOTIFICATIONS = 8801;
     private static final int REQ_PICK_FOLDER = 8802;
+    private static final int REQ_RECORD_AUDIO = 8803;
+    private static final int REQ_SPEECH_INTENT = 8804;
     private static final int MAX_FOLDER_SCAN_DEPTH = 10;
     private static final int MAX_FOLDER_AUDIO_FILES = 500;
     private static final int MAX_CHUNK_BYTES = 192 * 1024;
@@ -79,6 +85,11 @@ public class MainActivity extends BridgeActivity {
     private volatile boolean isVideoModeActive = false;
     private boolean bridgeAttached = false;
     private volatile String pendingFolderRequestId = null;
+    private volatile String pendingSpeechPermissionRequestId = null;
+    private volatile String pendingSpeechIntentRequestId = null;
+    private volatile String activeSpeechRequestId = null;
+    private volatile String lastPartialSpeech = "";
+    private SpeechRecognizer activeSpeechRecognizer = null;
     private final ExecutorService networkExecutor = Executors.newFixedThreadPool(4);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Set<String> allowedDocumentUris =
@@ -135,6 +146,15 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onDestroy() {
         mainHandler.removeCallbacksAndMessages(null);
+        activeSpeechRequestId = null;
+        if (activeSpeechRecognizer != null) {
+            try {
+                activeSpeechRecognizer.cancel();
+                activeSpeechRecognizer.destroy();
+            } catch (Exception ignored) {
+            }
+            activeSpeechRecognizer = null;
+        }
         super.onDestroy();
         networkExecutor.shutdownNow();
     }
@@ -149,6 +169,9 @@ public class MainActivity extends BridgeActivity {
         settings.setDomStorageEnabled(true);
         settings.setMediaPlaybackRequiresUserGesture(false);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            settings.setOffscreenPreRaster(true);
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             try {
                 webView.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false);
@@ -179,6 +202,22 @@ public class MainActivity extends BridgeActivity {
     }
 
     @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_RECORD_AUDIO) {
+            String reqId = pendingSpeechPermissionRequestId;
+            pendingSpeechPermissionRequestId = null;
+            if (reqId == null) return;
+            boolean granted = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (granted) {
+                launchNativeSpeechRecognizer(reqId);
+            } else {
+                startSpeechIntentFallback(reqId);
+            }
+        }
+    }
+
+    @Override
     public void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (requestCode == REQ_PICK_FOLDER) {
             String reqId = pendingFolderRequestId;
@@ -205,6 +244,23 @@ public class MainActivity extends BridgeActivity {
             }
 
             networkExecutor.execute(() -> scanDocumentTreeAndEmit(resolvedReqId, treeUri));
+            return;
+        }
+        if (requestCode == REQ_SPEECH_INTENT) {
+            String reqId = pendingSpeechIntentRequestId;
+            pendingSpeechIntentRequestId = null;
+            if (reqId == null) return;
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                ArrayList<String> matches = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+                String text = (matches != null && !matches.isEmpty() && matches.get(0) != null)
+                    ? matches.get(0).trim()
+                    : "";
+                if (!text.isEmpty()) {
+                    emitSpeechEvent(reqId, "final", text, "", 0.0);
+                    return;
+                }
+            }
+            emitSpeechEvent(reqId, "cancelled", "", "", 0.0);
             return;
         }
         super.onActivityResult(requestCode, resultCode, data);
@@ -367,6 +423,178 @@ public class MainActivity extends BridgeActivity {
         }
     }
 
+    private void emitSpeechEvent(
+        String requestId,
+        String phase,
+        String transcript,
+        String error,
+        double rms
+    ) {
+        try {
+            JSONObject payload = new JSONObject();
+            payload.put("requestId", requestId != null ? requestId : "");
+            payload.put("phase", phase != null ? phase : "");
+            payload.put("transcript", transcript != null ? transcript : "");
+            payload.put("error", error != null ? error : "");
+            payload.put("rms", rms);
+            dispatchJsEvent("kago-native-speech", payload.toString());
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void startSpeechIntentFallback(final String requestId) {
+        runOnUiThread(() -> {
+            try {
+                pendingSpeechIntentRequestId = requestId;
+                Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toString());
+                intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak your song, lyrics, or command...");
+                startActivityForResult(intent, REQ_SPEECH_INTENT);
+            } catch (Exception ex) {
+                pendingSpeechIntentRequestId = null;
+                emitSpeechEvent(
+                    requestId,
+                    "error",
+                    "",
+                    "Speech recognition is unavailable on this device. Type your request below.",
+                    0.0
+                );
+            }
+        });
+    }
+
+    private void launchNativeSpeechRecognizer(final String requestId) {
+        runOnUiThread(() -> {
+            try {
+                if (activeSpeechRecognizer != null) {
+                    try {
+                        activeSpeechRecognizer.cancel();
+                        activeSpeechRecognizer.destroy();
+                    } catch (Exception ignored) {
+                    }
+                    activeSpeechRecognizer = null;
+                }
+
+                if (!SpeechRecognizer.isRecognitionAvailable(MainActivity.this)) {
+                    startSpeechIntentFallback(requestId);
+                    return;
+                }
+
+                activeSpeechRequestId = requestId;
+                lastPartialSpeech = "";
+
+                final SpeechRecognizer recognizer = SpeechRecognizer.createSpeechRecognizer(MainActivity.this);
+                activeSpeechRecognizer = recognizer;
+                emitSpeechEvent(requestId, "listening", "", "", 0.0);
+
+                recognizer.setRecognitionListener(new RecognitionListener() {
+                    @Override public void onReadyForSpeech(Bundle params) {}
+                    @Override public void onBeginningOfSpeech() {}
+                    @Override public void onRmsChanged(float rmsdB) {
+                        if (requestId.equals(activeSpeechRequestId)) {
+                            emitSpeechEvent(requestId, "rms", "", "", rmsdB);
+                        }
+                    }
+                    @Override public void onBufferReceived(byte[] buffer) {}
+                    @Override public void onEndOfSpeech() {}
+                    @Override public void onEvent(int eventType, Bundle params) {}
+
+                    @Override
+                    public void onPartialResults(Bundle partialResults) {
+                        if (!requestId.equals(activeSpeechRequestId)) return;
+                        ArrayList<String> matches = partialResults != null
+                            ? partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            : null;
+                        if (matches != null && !matches.isEmpty()) {
+                            String text = matches.get(0) != null ? matches.get(0).trim() : "";
+                            if (!text.isEmpty()) {
+                                lastPartialSpeech = text;
+                                emitSpeechEvent(requestId, "partial", text, "", 0.0);
+                            }
+                        }
+                    }
+
+                    @Override
+                    public void onResults(Bundle results) {
+                        if (!requestId.equals(activeSpeechRequestId)) return;
+                        String text = lastPartialSpeech;
+                        ArrayList<String> matches = results != null
+                            ? results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            : null;
+                        if (matches != null && !matches.isEmpty() && matches.get(0) != null) {
+                            String top = matches.get(0).trim();
+                            if (!top.isEmpty()) text = top;
+                        }
+                        activeSpeechRequestId = null;
+                        lastPartialSpeech = "";
+                        try {
+                            recognizer.destroy();
+                        } catch (Exception ignored) {
+                        }
+                        if (activeSpeechRecognizer == recognizer) {
+                            activeSpeechRecognizer = null;
+                        }
+                        if (!text.isEmpty()) {
+                            emitSpeechEvent(requestId, "final", text, "", 0.0);
+                        } else {
+                            emitSpeechEvent(
+                                requestId,
+                                "error",
+                                "",
+                                "No speech detected. Tap the mic and speak clearly.",
+                                0.0
+                            );
+                        }
+                    }
+
+                    @Override
+                    public void onError(int error) {
+                        if (!requestId.equals(activeSpeechRequestId)) return;
+                        String partial = lastPartialSpeech;
+                        activeSpeechRequestId = null;
+                        lastPartialSpeech = "";
+                        try {
+                            recognizer.destroy();
+                        } catch (Exception ignored) {
+                        }
+                        if (activeSpeechRecognizer == recognizer) {
+                            activeSpeechRecognizer = null;
+                        }
+                        if (partial != null && !partial.trim().isEmpty()) {
+                            emitSpeechEvent(requestId, "final", partial.trim(), "", 0.0);
+                            return;
+                        }
+                        if (error == SpeechRecognizer.ERROR_CLIENT
+                            || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                            || error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                            startSpeechIntentFallback(requestId);
+                            return;
+                        }
+                        String msg = "Could not catch that. Please tap the mic and speak clearly.";
+                        if (error == SpeechRecognizer.ERROR_NO_MATCH
+                            || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                            msg = "No speech detected. Tap the mic and speak your request.";
+                        } else if (error == SpeechRecognizer.ERROR_NETWORK
+                            || error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT) {
+                            msg = "Voice dictation needs an internet connection on this device.";
+                        }
+                        emitSpeechEvent(requestId, "error", "", msg, 0.0);
+                    }
+                });
+
+                Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toString());
+                intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+                intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+                recognizer.startListening(intent);
+            } catch (Exception ex) {
+                startSpeechIntentFallback(requestId);
+            }
+        });
+    }
+
     private boolean isInPipCompat() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             return isInPictureInPictureMode();
@@ -400,13 +628,27 @@ public class MainActivity extends BridgeActivity {
         keepWebViewAwakeNow();
         dispatchJsEvent("kago-native-keepalive", "{\"phase\":\"" + phase + "\"}");
 
-        final long[] delays = new long[]{160L, 520L, 1200L, 2400L};
+        mainHandler.postAtFrontOfQueue(() -> {
+            if (isFinishing() || isDestroyed() || !KaGoMediaService.isCurrentlyPlaying) return;
+            keepWebViewAwakeNow();
+            dispatchJsEvent("kago-native-keepalive", "{\"phase\":\"" + phase + "_front\"}");
+        });
+
+        final long[] delays = new long[]{25L, 80L, 180L, 380L, 700L, 1200L};
         for (final long delay : delays) {
             mainHandler.postDelayed(() -> {
                 if (isFinishing() || isDestroyed() || !KaGoMediaService.isCurrentlyPlaying) return;
                 keepWebViewAwakeNow();
                 dispatchJsEvent("kago-native-keepalive", "{\"phase\":\"" + phase + "_retry\"}");
             }, delay);
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (!hasFocus && KaGoMediaService.isCurrentlyPlaying && !isFinishing() && !isChangingConfigurations()) {
+            scheduleBackgroundKeepalive("focus_lost");
         }
     }
 
@@ -425,6 +667,9 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     public void onUserLeaveHint() {
+        if (KaGoMediaService.isCurrentlyPlaying && !isFinishing() && !isChangingConfigurations()) {
+            scheduleBackgroundKeepalive("leave");
+        }
         super.onUserLeaveHint();
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             if (isVideoModeActive && KaGoMediaService.isCurrentlyPlaying) {
@@ -921,6 +1166,54 @@ public class MainActivity extends BridgeActivity {
                     }
                 });
             }
+        }
+
+        @JavascriptInterface
+        public void startSpeechDictation(final String requestId) {
+            runOnUiThread(() -> {
+                if (
+                    ContextCompat.checkSelfPermission(
+                        MainActivity.this,
+                        "android.permission.RECORD_AUDIO"
+                    ) != PackageManager.PERMISSION_GRANTED
+                ) {
+                    pendingSpeechPermissionRequestId = requestId;
+                    ActivityCompat.requestPermissions(
+                        MainActivity.this,
+                        new String[]{"android.permission.RECORD_AUDIO"},
+                        REQ_RECORD_AUDIO
+                    );
+                    return;
+                }
+                launchNativeSpeechRecognizer(requestId);
+            });
+        }
+
+        @JavascriptInterface
+        public void stopSpeechDictation(final boolean discard) {
+            runOnUiThread(() -> {
+                String reqId = activeSpeechRequestId;
+                if (discard) {
+                    activeSpeechRequestId = null;
+                    lastPartialSpeech = "";
+                    if (activeSpeechRecognizer != null) {
+                        try {
+                            activeSpeechRecognizer.cancel();
+                            activeSpeechRecognizer.destroy();
+                        } catch (Exception ignored) {
+                        }
+                        activeSpeechRecognizer = null;
+                    }
+                    if (reqId != null) {
+                        emitSpeechEvent(reqId, "cancelled", "", "", 0.0);
+                    }
+                } else if (activeSpeechRecognizer != null) {
+                    try {
+                        activeSpeechRecognizer.stopListening();
+                    } catch (Exception ignored) {
+                    }
+                }
+            });
         }
 
         @JavascriptInterface

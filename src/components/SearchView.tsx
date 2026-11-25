@@ -16,7 +16,6 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react';
-import { CURATED_STREAM_BANK } from '../data/presetsAndStems';
 import { localDb } from '../db/localDb';
 import type { AudioEngineSnapshot, Track } from '../types/audio';
 import { formatDuration } from '../utils/lrcParser';
@@ -25,11 +24,8 @@ import {
   analyzeTrackContentProfile,
   nextDiscoveryVisitSeed,
   pickContentBasedPopularSearches,
-  rankContentBasedCandidates,
   readDiscoveryHistory,
   readDiscoveryText,
-  readSessionSeenSongKeys,
-  rotateCuratedFallbackTracks,
   writeDiscoveryHistory,
   writeDiscoveryText,
 } from '../utils/streamDiscovery';
@@ -132,19 +128,6 @@ export const SearchView: React.FC<SearchViewProps> = ({
       loadedAnchorTrackIdRef.current = anchorTrack?.id ?? null;
       setIsSearching(true);
 
-      const fallbackForAnchor = () => {
-        const profile = analyzeTrackContentProfile(anchorTrack);
-        const seenKeys = readSessionSeenSongKeys(SEARCH_SESSION_SEEN_KEY);
-        const rankedFallback = rankContentBasedCandidates(CURATED_STREAM_BANK, profile, {
-          seenSongKeys: seenKeys,
-          visitSeed: seed,
-          maxResults: 9,
-        });
-        return rankedFallback.length > 0
-          ? rankedFallback
-          : rotateCuratedFallbackTracks(CURATED_STREAM_BANK, seed);
-      };
-
       try {
         const prevFeedQuery = readDiscoveryText(SEARCH_FEED_STORAGE_KEY);
         const prevSeeds = readDiscoveryHistory(SEARCH_SEEDS_STORAGE_KEY);
@@ -163,10 +146,10 @@ export const SearchView: React.FC<SearchViewProps> = ({
         if (feed.usedSeeds.length > 0) {
           writeDiscoveryHistory(SEARCH_SEEDS_STORAGE_KEY, feed.usedSeeds);
         }
-        setStreamResults(feed.tracks.length > 0 ? feed.tracks : fallbackForAnchor());
+        setStreamResults(feed.tracks);
       } catch {
         if (searchRequestIdRef.current !== reqId) return;
-        setStreamResults(fallbackForAnchor());
+        setStreamResults([]);
       } finally {
         if (searchRequestIdRef.current === reqId) {
           setIsSearching(false);
@@ -275,17 +258,13 @@ export const SearchView: React.FC<SearchViewProps> = ({
         category: 'all',
       });
       if (searchRequestIdRef.current !== reqId) return;
-      setStreamResults(
-        liveSongs.length > 0
-          ? liveSongs
-          : rotateCuratedFallbackTracks(CURATED_STREAM_BANK, visitSeed)
-      );
+      setStreamResults(liveSongs);
     } finally {
       if (searchRequestIdRef.current === reqId) {
         setIsSearching(false);
       }
     }
-  }, [engine.currentTrack, loadDiverseRecommendations, visitSeed]);
+  }, [engine.currentTrack, loadDiverseRecommendations]);
 
   const lastExternalNonceRef = useRef<number | null>(null);
   useEffect(() => {

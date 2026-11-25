@@ -386,6 +386,9 @@ test('setup-android-native patches AndroidManifest, Gradle, and copies Java Medi
     assert.ok(manifest.includes('android:supportsPictureInPicture="true"'));
     assert.ok(manifest.includes('.KaGoMediaService'));
     assert.ok(manifest.includes('smallestScreenSize'));
+    assert.ok(manifest.includes('android.speech.RecognitionService'));
+    assert.ok(manifest.includes('android.speech.action.RECOGNIZE_SPEECH'));
+    assert.equal(manifest.match(/android\.speech\.RecognitionService/g)?.length, 1);
 
     const gradle = fs.readFileSync(path.join(androidMain, '..', '..', 'build.gradle'), 'utf8');
     assert.equal(gradle.match(/androidx\.media:media:1\.7\.0/g)?.length, 1);
@@ -3053,7 +3056,7 @@ test('siriEngine extracts natural song queries, mixes, confirmations, DSP contro
   });
 });
 
-test('MainActivity allows Wikipedia, iTunes, MusicBrainz, and LRCLIB URLs for standalone APK AI assistant', async () => {
+test('MainActivity allows Wikipedia, iTunes, MusicBrainz, and LRCLIB URLs and exposes native speech dictation bridge', async () => {
   const fs = await import('node:fs');
   const path = await import('node:path');
   const javaSrc = fs.readFileSync(
@@ -3064,12 +3067,131 @@ test('MainActivity allows Wikipedia, iTunes, MusicBrainz, and LRCLIB URLs for st
   assert.ok(javaSrc.includes('https://itunes.apple.com/'));
   assert.ok(javaSrc.includes('https://musicbrainz.org/'));
   assert.ok(javaSrc.includes('https://lrclib.net/'));
+
+  assert.ok(javaSrc.includes('startSpeechDictation'));
+  assert.ok(javaSrc.includes('stopSpeechDictation'));
+  assert.ok(javaSrc.includes('SpeechRecognizer'));
+  assert.ok(javaSrc.includes('RecognizerIntent'));
+  assert.ok(javaSrc.includes('onRequestPermissionsResult'));
+  assert.ok(javaSrc.includes('kago-native-speech'));
 });
 
+test('mergeDictatedPrompt merges spoken dictation into existing draft cleanly for review before sending', async () => {
+  const { mergeDictatedPrompt } = await import('./siriEngine');
 
+  assert.equal(
+    mergeDictatedPrompt('', '  find a drake   song called started from the bottom  '),
+    'find a drake song called started from the bottom'
+  );
+  assert.equal(
+    mergeDictatedPrompt('play   ', 'dua lipa levitating'),
+    'play dua lipa levitating'
+  );
+  assert.equal(mergeDictatedPrompt('play dua lipa', ''), 'play dua lipa');
+  assert.equal(mergeDictatedPrompt('', '   '), '');
+});
 
+test('isLegacyOrSynthTrack filters removed built-in stems/curated tracks and AudioEngine avoids synth fallback', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { isLegacyOrSynthTrack } = await import('../db/localDb');
+  const { CURATED_STREAM_BANK, PROCEDURAL_STEMS } = await import('../data/presetsAndStems');
 
+  assert.equal(PROCEDURAL_STEMS.length, 0);
+  assert.equal(CURATED_STREAM_BANK.length, 0);
 
+  const legacyStem: Track = {
+    id: 'stem-cyber-resonance',
+    title: 'Cyber Resonance',
+    artist: 'kaGO Synth',
+    album: 'Stems',
+    duration: 180,
+    source: 'local',
+    addedAt: 1,
+  };
+  const legacyCurated: Track = {
+    id: 'curated-neon-01',
+    title: 'Neon Drive',
+    artist: 'Synth',
+    album: 'Curated',
+    duration: 180,
+    source: 'stream',
+    streamProvider: 'synth',
+    addedAt: 1,
+  };
+  const realLocal: Track = {
+    id: 'local-1234',
+    title: 'Started From The Bottom',
+    artist: 'Drake',
+    album: 'Nothing Was The Same',
+    duration: 174,
+    source: 'local',
+    addedAt: 2,
+  };
 
+  assert.equal(isLegacyOrSynthTrack(legacyStem), true);
+  assert.equal(isLegacyOrSynthTrack(legacyCurated), true);
+  assert.equal(isLegacyOrSynthTrack(realLocal), false);
 
+  const engineSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'src/audio/AudioEngine.ts'),
+    'utf8'
+  );
+  assert.ok(!engineSrc.includes('startSynthOnStrip('));
+  assert.ok(!engineSrc.includes('Local Synth Engine Fallback'));
+});
 
+test('evaluatePoorConnectionState reaches offline threshold cleanly at 30s and App auto-switches to Library', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+
+  const start = 1_000_000;
+  const before30s = evaluatePoorConnectionState({
+    isStreamingTrack: true,
+    isPlaying: true,
+    isOnline: true,
+    isBuffering: true,
+    lastProgressAtMs: start,
+    badSinceMs: start,
+    nowMs: start + POOR_CONNECTION_THRESHOLD_MS - 1000,
+    dismissedSinceMs: null,
+  });
+  assert.equal(before30s.shouldPromptOffline, false);
+
+  const at30s = evaluatePoorConnectionState({
+    isStreamingTrack: true,
+    isPlaying: true,
+    isOnline: true,
+    isBuffering: true,
+    lastProgressAtMs: start,
+    badSinceMs: start,
+    nowMs: start + POOR_CONNECTION_THRESHOLD_MS,
+    dismissedSinceMs: null,
+  });
+  assert.equal(at30s.shouldPromptOffline, true);
+
+  const appSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/App.tsx'), 'utf8');
+  assert.ok(appSrc.includes('handleSwitchToOfflineListeningRef.current()'));
+  assert.ok(!appSrc.includes('offline stems'));
+});
+
+test('MainActivity and KaGoMediaService configure smooth zero-glitch background focus and WebView keepalive', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+
+  const mainJava = fs.readFileSync(
+    path.resolve(process.cwd(), 'android-native/java/com/kagoplay/workstation/MainActivity.java'),
+    'utf8'
+  );
+  const serviceJava = fs.readFileSync(
+    path.resolve(process.cwd(), 'android-native/java/com/kagoplay/workstation/KaGoMediaService.java'),
+    'utf8'
+  );
+
+  assert.ok(mainJava.includes('setOffscreenPreRaster(true)'));
+  assert.ok(mainJava.includes('public void onWindowFocusChanged(boolean hasFocus)'));
+  assert.ok(mainJava.includes('postAtFrontOfQueue'));
+  assert.ok(serviceJava.includes('AudioManager.AUDIOFOCUS_GAIN'));
+  assert.ok(serviceJava.includes('requestAudioFocus()'));
+  assert.ok(serviceJava.includes('abandonAudioFocus()'));
+});

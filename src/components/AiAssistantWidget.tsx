@@ -39,10 +39,17 @@ import {
 } from '../utils/aiAssistant';
 import { triggerHaptic } from '../utils/haptics';
 import { formatDuration } from '../utils/lrcParser';
-import { isNativeAndroidApp } from '../utils/nativeMediaBridge';
+import {
+  hasNativeSpeechDictation,
+  isNativeAndroidApp,
+  startNativeSpeechDictation,
+  stopNativeSpeechDictation,
+  subscribeNativeSpeechEvents,
+} from '../utils/nativeMediaBridge';
 import {
   formatTrackSummaryLine,
   matchPendingConfirmation,
+  mergeDictatedPrompt,
   runSiriAssistantTurn,
   type PendingSiriAction,
 } from '../utils/siriEngine';
@@ -162,16 +169,6 @@ function getSpeechRecognitionCtor(): (new () => BrowserSpeechRecognition) | null
   return w.SpeechRecognition || w.webkitSpeechRecognition || null;
 }
 
-function isMeaningfulSpokenCommand(transcript: string): boolean {
-  const clean = transcript.trim().toLowerCase();
-  if (clean.length < 2) return false;
-  // Ignore pure humming/vocalise syllables so hum-recognition stays intact on web
-  if (/^(?:hmm+|mmm+|hmmm+|la(?:\s+la)+|na(?:\s+na)+|da(?:\s+da)+|oh+|ah+|ooh+)$/i.test(clean)) {
-    return false;
-  }
-  return /[a-z0-9]{2,}/i.test(clean);
-}
-
 export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
   engine,
   activeTab,
@@ -220,8 +217,9 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
     h: typeof window !== 'undefined' ? window.innerHeight : 844,
   }));
 
-  // Microphone recording + real audio visualizer bars + speech recognition
+  // Microphone dictation / hum recording + real audio visualizer bars
   const [isRecording, setIsRecording] = useState(false);
+  const [voiceMode, setVoiceMode] = useState<'dictate' | 'hum'>('dictate');
   const [recordingSec, setRecordingSec] = useState(0);
   const [liveTranscript, setLiveTranscript] = useState('');
   const [micBars, setMicBars] = useState<number[]>([0.18, 0.24, 0.3, 0.24, 0.18, 0.26, 0.2]);
@@ -232,6 +230,10 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const speechRecRef = useRef<BrowserSpeechRecognition | null>(null);
+  const nativeSpeechReqIdRef = useRef<string | null>(null);
+  const nativeSpeechUnsubRef = useRef<(() => void) | null>(null);
+  const nativeSpeechTimeoutRef = useRef<number | null>(null);
+  const dictationBaseTextRef = useRef<string>('');
   const speechTranscriptRef = useRef<string>('');
   const chunksRef = useRef<Blob[]>([]);
   const discardRecordingRef = useRef(false);
@@ -264,6 +266,10 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
       window.clearInterval(recordTimerRef.current);
       recordTimerRef.current = null;
     }
+    if (nativeSpeechTimeoutRef.current !== null) {
+      window.clearTimeout(nativeSpeechTimeoutRef.current);
+      nativeSpeechTimeoutRef.current = null;
+    }
     if (analyserRafRef.current !== null) {
       window.cancelAnimationFrame(analyserRafRef.current);
       analyserRafRef.current = null;
@@ -272,8 +278,16 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
       void analyserCtxRef.current.close().catch(() => {});
       analyserCtxRef.current = null;
     }
+    if (nativeSpeechUnsubRef.current) {
+      nativeSpeechUnsubRef.current();
+      nativeSpeechUnsubRef.current = null;
+    }
+    nativeSpeechReqIdRef.current = null;
     if (speechRecRef.current) {
       try {
+        speechRecRef.current.onresult = null;
+        speechRecRef.current.onerror = null;
+        speechRecRef.current.onend = null;
         speechRecRef.current.abort();
       } catch {
         // Ignore teardown
@@ -294,6 +308,11 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
   useEffect(() => {
     return () => {
       discardRecordingRef.current = true;
+      try {
+        stopNativeSpeechDictation(true);
+      } catch {
+        // Ignore
+      }
       try {
         if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
           mediaRecorderRef.current.stop();
@@ -1132,6 +1151,19 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
     ]
   );
 
+  const finishDictationToInput = useCallback(
+    (spokenText: string) => {
+      const merged = mergeDictatedPrompt(dictationBaseTextRef.current, spokenText);
+      cleanupRecordingResources();
+      if (merged) {
+        setInputText(merged);
+        triggerHaptic('success');
+      }
+      window.setTimeout(() => inputRef.current?.focus(), 60);
+    },
+    [cleanupRecordingResources]
+  );
+
   const stopRecording = useCallback(
     (discard = false) => {
       discardRecordingRef.current = discard;
@@ -1139,14 +1171,52 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
         window.clearInterval(recordTimerRef.current);
         recordTimerRef.current = null;
       }
-      if (speechRecRef.current) {
-        try {
-          if (discard) speechRecRef.current.abort();
-          else speechRecRef.current.stop();
-        } catch {
-          // Ignore
+
+      if (nativeSpeechReqIdRef.current) {
+        if (discard) {
+          stopNativeSpeechDictation(true);
+          setInputText(dictationBaseTextRef.current);
+          cleanupRecordingResources();
+          return;
         }
+        const captured = speechTranscriptRef.current.trim();
+        stopNativeSpeechDictation(false);
+        if (captured) {
+          finishDictationToInput(captured);
+          return;
+        }
+        // Wait briefly for Android onResults after stopListening()
+        if (nativeSpeechTimeoutRef.current === null) {
+          nativeSpeechTimeoutRef.current = window.setTimeout(() => {
+            nativeSpeechTimeoutRef.current = null;
+            finishDictationToInput(speechTranscriptRef.current);
+          }, 900);
+        }
+        return;
       }
+
+      if (speechRecRef.current) {
+        const sr = speechRecRef.current;
+        if (discard) {
+          try {
+            sr.abort();
+          } catch {
+            // Ignore
+          }
+          setInputText(dictationBaseTextRef.current);
+          cleanupRecordingResources();
+        } else {
+          const captured = speechTranscriptRef.current.trim();
+          try {
+            sr.stop();
+          } catch {
+            // Ignore
+          }
+          finishDictationToInput(captured);
+        }
+        return;
+      }
+
       const recorder = mediaRecorderRef.current;
       if (recorder && recorder.state !== 'inactive') {
         try {
@@ -1155,185 +1225,312 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
           cleanupRecordingResources();
         }
       } else {
+        if (discard) {
+          setInputText(dictationBaseTextRef.current);
+        }
         cleanupRecordingResources();
       }
     },
-    [cleanupRecordingResources]
+    [cleanupRecordingResources, finishDictationToInput]
   );
 
-  const startRecording = useCallback(async () => {
-    setMicError(null);
-    setIsOpen(true);
-    setIsDrawerMinimized(false);
-    speechTranscriptRef.current = '';
-    setLiveTranscript('');
-
-    if (
-      typeof navigator === 'undefined' ||
-      !navigator.mediaDevices ||
-      typeof navigator.mediaDevices.getUserMedia !== 'function'
-    ) {
-      setMicError('Microphone recording is not supported in this browser/device.');
-      return;
-    }
-
-    if (typeof MediaRecorder === 'undefined') {
-      setMicError('Audio recording (MediaRecorder) is unavailable here.');
-      return;
-    }
-
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      mediaStreamRef.current = stream;
-      chunksRef.current = [];
+  const startRecording = useCallback(
+    async (requestedMode: 'dictate' | 'hum' = 'dictate') => {
+      setMicError(null);
+      setIsOpen(true);
+      setIsDrawerMinimized(false);
+      setVoiceMode(requestedMode);
+      speechTranscriptRef.current = '';
+      dictationBaseTextRef.current = inputText.trim();
+      setLiveTranscript('');
       discardRecordingRef.current = false;
 
-      // Start parallel speech recognition so spoken commands ("Play Wakadinali Blow") transcribe cleanly even offline/APK
-      const SpeechCtor = getSpeechRecognitionCtor();
-      if (SpeechCtor) {
-        try {
-          const sr = new SpeechCtor();
-          sr.continuous = true;
-          sr.interimResults = true;
-          sr.lang = 'en-US';
-          sr.onresult = (ev) => {
-            const parts: string[] = [];
-            for (let i = 0; i < ev.results.length; i++) {
-              const seg = ev.results[i]?.[0]?.transcript;
-              if (seg) parts.push(seg.trim());
+      // 1. Voice Dictation -> transcribes straight into the editable input field & waits for user to tap Send
+      if (requestedMode === 'dictate') {
+        // 1A. Native Android SpeechRecognizer + RecognizerIntent (works cleanly inside Android APK WebView)
+        if (hasNativeSpeechDictation()) {
+          const reqId = `sp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+          nativeSpeechReqIdRef.current = reqId;
+          recordStartedAtRef.current = Date.now();
+          setRecordingSec(0);
+          setIsRecording(true);
+          triggerHaptic('medium');
+
+          nativeSpeechUnsubRef.current = subscribeNativeSpeechEvents((ev) => {
+            if (ev.requestId !== reqId) return;
+
+            if (ev.phase === 'rms') {
+              const norm = Math.max(0.18, Math.min(1, ((ev.rms ?? -2) + 2) / 11));
+              setMicBars([
+                Math.max(0.16, norm * 0.65),
+                Math.max(0.2, norm * 0.85),
+                norm,
+                Math.max(0.22, norm * 0.92),
+                Math.max(0.18, norm * 0.78),
+                Math.max(0.2, norm * 0.88),
+                Math.max(0.16, norm * 0.6),
+              ]);
+              return;
             }
-            const joined = parts.join(' ').trim();
-            speechTranscriptRef.current = joined;
-            setLiveTranscript(joined);
-          };
-          sr.onerror = () => {
-            // Non-fatal: MediaRecorder audio capture continues smoothly
-          };
-          speechRecRef.current = sr;
-          sr.start();
-        } catch {
-          speechRecRef.current = null;
+
+            if (ev.phase === 'partial' && ev.transcript.trim()) {
+              const spoken = ev.transcript.trim();
+              speechTranscriptRef.current = spoken;
+              setLiveTranscript(spoken);
+              setInputText(mergeDictatedPrompt(dictationBaseTextRef.current, spoken));
+              return;
+            }
+
+            if (ev.phase === 'final') {
+              const spoken = ev.transcript.trim() || speechTranscriptRef.current.trim();
+              speechTranscriptRef.current = spoken;
+              finishDictationToInput(spoken);
+              return;
+            }
+
+            if (ev.phase === 'cancelled') {
+              if (speechTranscriptRef.current.trim()) {
+                finishDictationToInput(speechTranscriptRef.current);
+              } else {
+                cleanupRecordingResources();
+              }
+              return;
+            }
+
+            if (ev.phase === 'error') {
+              const partial = speechTranscriptRef.current.trim();
+              if (partial) {
+                finishDictationToInput(partial);
+              } else {
+                cleanupRecordingResources();
+                if (ev.error) setMicError(ev.error);
+              }
+            }
+          });
+
+          const launched = startNativeSpeechDictation(reqId);
+          if (launched) {
+            recordTimerRef.current = window.setInterval(() => {
+              const elapsed = Math.floor((Date.now() - recordStartedAtRef.current) / 1000);
+              setRecordingSec(elapsed);
+              if (elapsed >= MAX_RECORDING_SECONDS) {
+                stopRecording(false);
+              }
+            }, 250);
+            return;
+          }
+          cleanupRecordingResources();
         }
-      }
 
-      const mimeType = pickSupportedRecorderMimeType();
-      const recorder = mimeType
-        ? new MediaRecorder(stream, { mimeType })
-        : new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
+        // 1B. Web browser SpeechRecognition -> types straight into the editable input field & waits for Send
+        const SpeechCtor = getSpeechRecognitionCtor();
+        if (SpeechCtor) {
+          try {
+            const sr = new SpeechCtor();
+            sr.continuous = true;
+            sr.interimResults = true;
+            sr.lang = typeof navigator !== 'undefined' && navigator.language ? navigator.language : 'en-US';
+            speechRecRef.current = sr;
+            recordStartedAtRef.current = Date.now();
+            setRecordingSec(0);
+            setIsRecording(true);
+            triggerHaptic('medium');
 
-      recorder.ondataavailable = (ev) => {
-        if (ev.data && ev.data.size > 0) {
-          chunksRef.current.push(ev.data);
+            sr.onresult = (ev) => {
+              const parts: string[] = [];
+              for (let i = 0; i < ev.results.length; i++) {
+                const seg = ev.results[i]?.[0]?.transcript;
+                if (seg) parts.push(seg.trim());
+              }
+              const joined = parts.join(' ').trim();
+              if (!joined) return;
+              speechTranscriptRef.current = joined;
+              setLiveTranscript(joined);
+              setInputText(mergeDictatedPrompt(dictationBaseTextRef.current, joined));
+              setMicBars([0.45, 0.72, 0.95, 0.8, 0.9, 0.68, 0.42]);
+            };
+
+            sr.onerror = () => {
+              const partial = speechTranscriptRef.current.trim();
+              if (partial) {
+                finishDictationToInput(partial);
+              } else {
+                cleanupRecordingResources();
+                setMicError('Could not catch voice clearly. Tap the mic again or type below.');
+              }
+            };
+
+            sr.onend = () => {
+              if (discardRecordingRef.current) {
+                cleanupRecordingResources();
+                return;
+              }
+              if (speechRecRef.current === sr) {
+                finishDictationToInput(speechTranscriptRef.current);
+              }
+            };
+
+            sr.start();
+            recordTimerRef.current = window.setInterval(() => {
+              const elapsed = Math.floor((Date.now() - recordStartedAtRef.current) / 1000);
+              setRecordingSec(elapsed);
+              setMicBars((prev) =>
+                prev.map((_, idx) => 0.24 + ((Math.sin(Date.now() / 160 + idx) + 1) / 2) * 0.56)
+              );
+              if (elapsed >= MAX_RECORDING_SECONDS) {
+                stopRecording(false);
+              }
+            }, 220);
+            return;
+          } catch {
+            speechRecRef.current = null;
+          }
         }
-      };
 
-      recorder.onerror = () => {
-        setMicError('Microphone capture failed. Check app permissions.');
-        cleanupRecordingResources();
-      };
-
-      recorder.onstop = async () => {
-        const shouldDiscard = discardRecordingRef.current;
-        const durationElapsed = Math.max(
-          1,
-          Math.round((Date.now() - recordStartedAtRef.current) / 1000)
-        );
-        const capturedTranscript = speechTranscriptRef.current.trim();
-        speechTranscriptRef.current = '';
-        const recordedMime = recorder.mimeType || mimeType || 'audio/webm';
-        const blob = new Blob(chunksRef.current, { type: recordedMime });
-        chunksRef.current = [];
-        cleanupRecordingResources();
-
-        if (shouldDiscard) return;
-
-        const typedHint = inputText.trim();
-        if (!typedHint && isMeaningfulSpokenCommand(capturedTranscript)) {
-          await sendAssistantRequest({ prompt: capturedTranscript });
+        // On standalone APK without speech recognizer, never trap user into silent MediaRecorder clip
+        if (isNativeAndroidApp()) {
+          setMicError('Voice dictation service unavailable on this device. Please type your request below.');
           return;
         }
+      }
 
-        if (blob.size < 256) return;
+      // 2. Raw Audio / Hum Melody Capture (when explicitly humming on web or browser lacks SpeechRecognition)
+      setVoiceMode('hum');
+      if (
+        typeof navigator === 'undefined' ||
+        !navigator.mediaDevices ||
+        typeof navigator.mediaDevices.getUserMedia !== 'function'
+      ) {
+        setMicError('Microphone recording is not supported in this browser/device.');
+        return;
+      }
 
-        try {
-          const base64 = await blobToBase64(blob);
-          await sendAssistantRequest({
-            prompt: typedHint || (isNativeAndroidApp() ? capturedTranscript : ''),
-            audioBase64: base64,
-            audioMimeType: recordedMime,
-            audioDurationSec: durationElapsed,
-          });
-        } catch {
-          setMicError('Could not process audio clip. Please try again.');
-        }
-      };
+      if (typeof MediaRecorder === 'undefined') {
+        setMicError('Audio recording (MediaRecorder) is unavailable here.');
+        return;
+      }
 
-      const AudioCtx =
-        window.AudioContext ||
-        (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (AudioCtx) {
-        try {
-          const ctx = new AudioCtx();
-          analyserCtxRef.current = ctx;
-          const src = ctx.createMediaStreamSource(stream);
-          const analyser = ctx.createAnalyser();
-          analyser.fftSize = 32;
-          src.connect(analyser);
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-          const tickLevels = () => {
-            analyser.getByteFrequencyData(dataArray);
-            const bars = [0, 1, 2, 3, 4, 5, 6].map((idx) => {
-              const raw = dataArray[idx % dataArray.length] ?? 20;
-              return Math.max(0.16, Math.min(1, raw / 180));
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        });
+        mediaStreamRef.current = stream;
+        chunksRef.current = [];
+
+        const mimeType = pickSupportedRecorderMimeType();
+        const recorder = mimeType
+          ? new MediaRecorder(stream, { mimeType })
+          : new MediaRecorder(stream);
+        mediaRecorderRef.current = recorder;
+
+        recorder.ondataavailable = (ev) => {
+          if (ev.data && ev.data.size > 0) {
+            chunksRef.current.push(ev.data);
+          }
+        };
+
+        recorder.onerror = () => {
+          setMicError('Microphone capture failed. Check app permissions.');
+          cleanupRecordingResources();
+        };
+
+        recorder.onstop = async () => {
+          const shouldDiscard = discardRecordingRef.current;
+          const durationElapsed = Math.max(
+            1,
+            Math.round((Date.now() - recordStartedAtRef.current) / 1000)
+          );
+          const recordedMime = recorder.mimeType || mimeType || 'audio/webm';
+          const blob = new Blob(chunksRef.current, { type: recordedMime });
+          chunksRef.current = [];
+          cleanupRecordingResources();
+
+          if (shouldDiscard || blob.size < 256) return;
+
+          try {
+            const base64 = await blobToBase64(blob);
+            await sendAssistantRequest({
+              prompt: dictationBaseTextRef.current,
+              audioBase64: base64,
+              audioMimeType: recordedMime,
+              audioDurationSec: durationElapsed,
             });
-            setMicBars(bars);
+          } catch {
+            setMicError('Could not process audio clip. Please try again.');
+          }
+        };
+
+        const AudioCtx =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (AudioCtx) {
+          try {
+            const ctx = new AudioCtx();
+            analyserCtxRef.current = ctx;
+            const src = ctx.createMediaStreamSource(stream);
+            const analyser = ctx.createAnalyser();
+            analyser.fftSize = 32;
+            src.connect(analyser);
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            const tickLevels = () => {
+              analyser.getByteFrequencyData(dataArray);
+              const bars = [0, 1, 2, 3, 4, 5, 6].map((idx) => {
+                const raw = dataArray[idx % dataArray.length] ?? 20;
+                return Math.max(0.16, Math.min(1, raw / 180));
+              });
+              setMicBars(bars);
+              analyserRafRef.current = window.requestAnimationFrame(tickLevels);
+            };
             analyserRafRef.current = window.requestAnimationFrame(tickLevels);
-          };
-          analyserRafRef.current = window.requestAnimationFrame(tickLevels);
-        } catch {
-          // Non-fatal
+          } catch {
+            // Non-fatal
+          }
+        }
+
+        recordStartedAtRef.current = Date.now();
+        setRecordingSec(0);
+        setIsRecording(true);
+        triggerHaptic('medium');
+        recorder.start(250);
+
+        recordTimerRef.current = window.setInterval(() => {
+          const elapsed = Math.floor((Date.now() - recordStartedAtRef.current) / 1000);
+          setRecordingSec(elapsed);
+          if (elapsed >= MAX_RECORDING_SECONDS) {
+            stopRecording(false);
+          }
+        }, 250);
+      } catch (err) {
+        cleanupRecordingResources();
+        const name = err instanceof DOMException ? err.name : '';
+        if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+          setMicError(
+            'Microphone permission denied. Allow microphone access to speak or hum requests.'
+          );
+        } else {
+          setMicError('Could not access microphone on this device.');
         }
       }
-
-      recordStartedAtRef.current = Date.now();
-      setRecordingSec(0);
-      setIsRecording(true);
-      triggerHaptic('medium');
-      recorder.start(250);
-
-      recordTimerRef.current = window.setInterval(() => {
-        const elapsed = Math.floor((Date.now() - recordStartedAtRef.current) / 1000);
-        setRecordingSec(elapsed);
-        if (elapsed >= MAX_RECORDING_SECONDS) {
-          stopRecording(false);
-        }
-      }, 250);
-    } catch (err) {
-      cleanupRecordingResources();
-      const name = err instanceof DOMException ? err.name : '';
-      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
-        setMicError(
-          'Microphone permission denied. Allow microphone access to hum or speak requests.'
-        );
-      } else {
-        setMicError('Could not access microphone on this device.');
-      }
-    }
-  }, [cleanupRecordingResources, inputText, sendAssistantRequest, stopRecording]);
+    },
+    [
+      cleanupRecordingResources,
+      finishDictationToInput,
+      inputText,
+      sendAssistantRequest,
+      stopRecording,
+    ]
+  );
 
   const handleMicToggle = () => {
     if (isSending) return;
     if (isRecording) {
       stopRecording(false);
     } else {
-      void startRecording();
+      void startRecording('dictate');
     }
   };
 
@@ -1585,12 +1782,14 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
               </div>
             )}
 
-            {/* Live Hum / Voice Recording Panel */}
+            {/* Live Voice Dictation / Hum Recording Panel */}
             {isRecording && (
               <div className="rounded-xl border border-[#E11D48]/50 bg-[#15090E] p-3 space-y-2.5">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-[#F4F3F0]">
-                    Listening — speak a command or hum...
+                    {voiceMode === 'dictate'
+                      ? 'Listening — speak now, words type into box below...'
+                      : 'Listening — hum a melody...'}
                   </span>
                   <span className="font-mono-tabular text-xs font-semibold text-[#FF4D6D]">
                     {formatRecordingTimer(recordingSec)} / {formatRecordingTimer(MAX_RECORDING_SECONDS)}
@@ -1610,22 +1809,40 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
                     />
                   ))}
                 </div>
-                <div className="flex items-center justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={() => stopRecording(true)}
-                    className="min-h-[38px] rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs font-semibold text-[#C7C9D1] hover:text-white cursor-pointer"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => stopRecording(false)}
-                    className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
-                  >
-                    <Square className="h-3 w-3 fill-current" />
-                    <span>Send</span>
-                  </button>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  {voiceMode === 'dictate' && (!isNativeAndroidApp() || Boolean(import.meta.env.VITE_AI_API_URL)) ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        stopRecording(true);
+                        void startRecording('hum');
+                      }}
+                      className="min-h-[36px] rounded-lg border border-[#282B36] bg-[#14161D] px-2.5 py-1 text-[11px] font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
+                    >
+                      Hum melody instead
+                    </button>
+                  ) : (
+                    <span className="text-[11px] text-[#9CA3AF]">
+                      {voiceMode === 'dictate' ? 'Edit text & tap Send when ready' : ''}
+                    </span>
+                  )}
+                  <div className="flex items-center gap-2 ml-auto">
+                    <button
+                      type="button"
+                      onClick={() => stopRecording(true)}
+                      className="min-h-[38px] rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs font-semibold text-[#C7C9D1] hover:text-white cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => stopRecording(false)}
+                      className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
+                    >
+                      <Check className="h-3.5 w-3.5" />
+                      <span>{voiceMode === 'dictate' ? 'Done' : 'Identify Hum'}</span>
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
@@ -1634,7 +1851,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
             {messages.length === 0 && !isRecording && !isSending && (
               <div className="space-y-2">
                 <p className="text-xs leading-relaxed text-[#9CA3AF]">
-                  Ask me like Siri: find & confirm songs or YouTube mixes, identify lyrics, check samples, control EQ, or build playlists.
+                  Ask me like Siri: tap the mic to dictate into the box, find & confirm songs or mixes, identify lyrics, control EQ, or build playlists.
                 </p>
                 <div className="grid grid-cols-1 gap-1.5">
                   <button
@@ -1651,11 +1868,11 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={() => void startRecording()}
+                    onClick={() => void startRecording('dictate')}
                     className="flex min-h-[44px] items-center gap-2.5 rounded-xl border border-[#222530] bg-[#14161D] px-3 py-2 text-left text-xs font-medium text-[#F4F3F0] hover:border-[#E11D48]/60 cursor-pointer"
                   >
                     <Mic className="h-4 w-4 shrink-0 text-[#FF4D6D]" />
-                    <span>Speak a command or hum a song</span>
+                    <span>Speak to type a song or command</span>
                   </button>
                   <button
                     type="button"
@@ -1956,8 +2173,20 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
           type="button"
           onClick={handleMicToggle}
           disabled={isSending}
-          aria-label={isRecording ? 'Stop recording audio' : 'Hum or speak to Ai'}
-          title={isRecording ? 'Tap to send spoken/hummed audio' : 'Speak a command or hum a song'}
+          aria-label={
+            isRecording
+              ? voiceMode === 'dictate'
+                ? 'Done speaking'
+                : 'Stop recording audio'
+              : 'Speak a command to Ai'
+          }
+          title={
+            isRecording
+              ? voiceMode === 'dictate'
+                ? 'Tap when done speaking'
+                : 'Tap to send hummed audio'
+              : 'Speak to type your prompt'
+          }
           data-testid="ai-mic-button"
           className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition-colors cursor-pointer disabled:opacity-50 ${
             isRecording
@@ -1983,7 +2212,9 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
             pendingAction
               ? 'Reply "yes", "play next", or ask anything...'
               : isRecording
-                ? 'Listening... tap stop when done'
+                ? voiceMode === 'dictate'
+                  ? 'Listening... tap Done when finished'
+                  : 'Listening... tap stop when done'
                 : 'Ask anything, find a song or mix, lyrics...'
           }
           disabled={isSending}
