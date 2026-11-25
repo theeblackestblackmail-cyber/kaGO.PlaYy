@@ -479,7 +479,10 @@ public class MainActivity extends BridgeActivity {
             || urlString.startsWith("https://youtubei.googleapis.com/")
             || urlString.startsWith("https://suggestqueries.google.com/")
             || urlString.startsWith("https://api.audius.co/")
-            || urlString.startsWith("https://lrclib.net/")) {
+            || urlString.startsWith("https://lrclib.net/")
+            || urlString.startsWith("https://en.wikipedia.org/")
+            || urlString.startsWith("https://itunes.apple.com/")
+            || urlString.startsWith("https://musicbrainz.org/")) {
             return true;
         }
         return isAllowedDownloadMediaUrl(urlString);

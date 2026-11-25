@@ -1898,6 +1898,10 @@ export default function App() {
         onToggleShuffle={handleToggleShuffle}
         onToggleAutoplayRadio={handleToggleAutoplayRadio}
         onOpenFullscreen={setIsFullscreenOpen}
+        onOpenDsp={() => setIsDspOpen(true)}
+        onOpenLiveStudio={() => setIsLiveStudioOpen(true)}
+        onPickSong={() => songPickerRef.current?.click()}
+        onPickFolder={() => void handlePickFolder()}
         onNavigateTab={(tab, librarySubTab, searchQuery) => {
           if (tab === 'library' && librarySubTab) {
             setLibraryFocusRequest({ subTab: librarySubTab, nonce: Date.now() });

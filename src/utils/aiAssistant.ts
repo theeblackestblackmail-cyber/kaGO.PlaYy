@@ -20,7 +20,7 @@ export type AiAssistantAction =
       query: string;
       title?: string;
       artist?: string;
-      mode: 'play_now' | 'play_next' | 'add_to_queue';
+      mode: 'ask_confirm' | 'play_now' | 'play_next' | 'add_to_queue';
     }
   | {
       type: 'identify_song_candidates';
@@ -45,7 +45,11 @@ export type AiAssistantAction =
         | 'toggle_shuffle'
         | 'toggle_autoplay_radio'
         | 'open_fullscreen'
-        | 'open_lyrics';
+        | 'open_lyrics'
+        | 'open_dsp'
+        | 'open_live_studio'
+        | 'pick_song'
+        | 'pick_folder';
       valueSeconds?: number;
     }
   | {
@@ -173,6 +177,10 @@ const VALID_PLAYBACK_COMMANDS = new Set<
   'toggle_autoplay_radio',
   'open_fullscreen',
   'open_lyrics',
+  'open_dsp',
+  'open_live_studio',
+  'pick_song',
+  'pick_folder',
 ]);
 
 export function normalizeAudioMimeType(rawMime: string): string {
@@ -266,8 +274,10 @@ export function parseFunctionCallsToActions(
       const query = asTrimmedString(args.query, 200) || buildAiTrackSearchQuery({ title, artist });
       if (!query) continue;
       const rawMode = asTrimmedString(args.mode, 32);
-      const mode: 'play_now' | 'play_next' | 'add_to_queue' =
-        rawMode === 'play_next' || rawMode === 'add_to_queue' ? rawMode : 'play_now';
+      const mode: 'ask_confirm' | 'play_now' | 'play_next' | 'add_to_queue' =
+        rawMode === 'play_now' || rawMode === 'play_next' || rawMode === 'add_to_queue'
+          ? rawMode
+          : 'ask_confirm';
       actions.push({
         type: 'play_song',
         query,

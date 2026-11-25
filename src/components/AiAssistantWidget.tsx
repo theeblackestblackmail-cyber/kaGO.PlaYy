@@ -38,6 +38,14 @@ import {
   type AiIdentifiedCandidate,
 } from '../utils/aiAssistant';
 import { triggerHaptic } from '../utils/haptics';
+import { formatDuration } from '../utils/lrcParser';
+import { isNativeAndroidApp } from '../utils/nativeMediaBridge';
+import {
+  formatTrackSummaryLine,
+  matchPendingConfirmation,
+  runSiriAssistantTurn,
+  type PendingSiriAction,
+} from '../utils/siriEngine';
 import type { DownloadFormatId } from '../utils/streamDownloads';
 import { searchStreamsUnified } from '../utils/streamSearch';
 
@@ -64,9 +72,22 @@ interface AssistantMessage {
   audioDurationSec?: number;
   sources?: AiAssistantSource[];
   candidates?: ResolvedCandidateCard[];
+  awaitingConfirm?: boolean;
   createdPlaylists?: CreatedPlaylistCard[];
   appliedBadges?: string[];
   error?: string;
+}
+
+interface BrowserSpeechRecognition {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((ev: { results: ArrayLike<{ isFinal: boolean; 0: { transcript: string } }> }) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
 }
 
 export interface AiAssistantWidgetProps {
@@ -90,6 +111,10 @@ export interface AiAssistantWidgetProps {
   onToggleShuffle: () => void;
   onToggleAutoplayRadio: () => void;
   onOpenFullscreen: (open: boolean) => void;
+  onOpenDsp: () => void;
+  onOpenLiveStudio: () => void;
+  onPickSong: () => void;
+  onPickFolder: () => void;
   onNavigateTab: (tab: ActiveTab, librarySubTab?: LibrarySubTab, searchQuery?: string) => void;
   onUpdateDsp: (next: DspSettings) => void;
   onToggleFavorite: (trackId: string) => void;
@@ -128,6 +153,25 @@ function loadSavedFabPosition(): SavedFabPosition | null {
   return null;
 }
 
+function getSpeechRecognitionCtor(): (new () => BrowserSpeechRecognition) | null {
+  if (typeof window === 'undefined') return null;
+  const w = window as unknown as {
+    SpeechRecognition?: new () => BrowserSpeechRecognition;
+    webkitSpeechRecognition?: new () => BrowserSpeechRecognition;
+  };
+  return w.SpeechRecognition || w.webkitSpeechRecognition || null;
+}
+
+function isMeaningfulSpokenCommand(transcript: string): boolean {
+  const clean = transcript.trim().toLowerCase();
+  if (clean.length < 2) return false;
+  // Ignore pure humming/vocalise syllables so hum-recognition stays intact on web
+  if (/^(?:hmm+|mmm+|hmmm+|la(?:\s+la)+|na(?:\s+na)+|da(?:\s+da)+|oh+|ah+|ooh+)$/i.test(clean)) {
+    return false;
+  }
+  return /[a-z0-9]{2,}/i.test(clean);
+}
+
 export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
   engine,
   activeTab,
@@ -149,6 +193,10 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
   onToggleShuffle,
   onToggleAutoplayRadio,
   onOpenFullscreen,
+  onOpenDsp,
+  onOpenLiveStudio,
+  onPickSong,
+  onPickFolder,
   onNavigateTab,
   onUpdateDsp,
   onToggleFavorite,
@@ -160,6 +208,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
   const [inputText, setInputText] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [messages, setMessages] = useState<AssistantMessage[]>([]);
+  const [pendingAction, setPendingAction] = useState<PendingSiriAction | null>(null);
 
   // Draggable small round floating button position
   const [savedFabPos, setSavedFabPos] = useState<SavedFabPosition | null>(() =>
@@ -171,9 +220,10 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
     h: typeof window !== 'undefined' ? window.innerHeight : 844,
   }));
 
-  // Microphone recording + real audio visualizer bars
+  // Microphone recording + real audio visualizer bars + speech recognition
   const [isRecording, setIsRecording] = useState(false);
   const [recordingSec, setRecordingSec] = useState(0);
+  const [liveTranscript, setLiveTranscript] = useState('');
   const [micBars, setMicBars] = useState<number[]>([0.18, 0.24, 0.3, 0.24, 0.18, 0.26, 0.2]);
   const [micError, setMicError] = useState<string | null>(null);
 
@@ -181,6 +231,8 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
   const scrollEndRef = useRef<HTMLDivElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const speechRecRef = useRef<BrowserSpeechRecognition | null>(null);
+  const speechTranscriptRef = useRef<string>('');
   const chunksRef = useRef<Blob[]>([]);
   const discardRecordingRef = useRef(false);
   const recordTimerRef = useRef<number | null>(null);
@@ -220,6 +272,14 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
       void analyserCtxRef.current.close().catch(() => {});
       analyserCtxRef.current = null;
     }
+    if (speechRecRef.current) {
+      try {
+        speechRecRef.current.abort();
+      } catch {
+        // Ignore teardown
+      }
+      speechRecRef.current = null;
+    }
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((tr) => tr.stop());
       mediaStreamRef.current = null;
@@ -227,6 +287,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
     mediaRecorderRef.current = null;
     setIsRecording(false);
     setRecordingSec(0);
+    setLiveTranscript('');
     setMicBars([0.18, 0.24, 0.3, 0.24, 0.18, 0.26, 0.2]);
   }, []);
 
@@ -300,17 +361,71 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
     savedTracks.length,
   ]);
 
-  const resolveStreamTrack = useCallback(async (query: string): Promise<Track | null> => {
+  const resolveStreamTracks = useCallback(async (query: string, limit = 1): Promise<Track[]> => {
     const clean = query.trim();
-    if (!clean) return null;
+    if (!clean) return [];
     try {
-      const { tracks } = await searchStreamsUnified({ query: clean, category: 'songs' });
-      if (tracks.length > 0) return tracks[0];
-      const fallback = await searchStreamsUnified({ query: clean, category: 'all' });
-      return fallback.tracks[0] ?? null;
+      const primary = await searchStreamsUnified({ query: clean, category: 'all' });
+      if (primary.tracks.length > 0) return primary.tracks.slice(0, limit);
+      const songsFallback = await searchStreamsUnified({ query: clean, category: 'songs' });
+      return songsFallback.tracks.slice(0, limit);
     } catch {
-      return null;
+      return [];
     }
+  }, []);
+
+  const resolveStreamTrack = useCallback(
+    async (query: string): Promise<Track | null> => {
+      const list = await resolveStreamTracks(query, 1);
+      return list[0] ?? null;
+    },
+    [resolveStreamTracks]
+  );
+
+  const handleConfirmTrackDecision = useCallback(
+    (messageId: string, track: Track, mode: 'play_now' | 'play_next' | 'add_to_queue') => {
+      triggerHaptic('success');
+      let badge = '';
+      if (mode === 'play_now') {
+        onPlayTrack(track);
+        badge = `Playing "${track.title}"`;
+      } else if (mode === 'play_next') {
+        onPlayNext(track);
+        badge = `Playing "${track.title}" next`;
+      } else {
+        onQueueTracks([track]);
+        badge = `Queued "${track.title}"`;
+      }
+      setPendingAction(null);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id !== messageId
+            ? m
+            : {
+                ...m,
+                awaitingConfirm: false,
+                appliedBadges: [...(m.appliedBadges || []), badge],
+              }
+        )
+      );
+    },
+    [onPlayNext, onPlayTrack, onQueueTracks]
+  );
+
+  const handleCancelConfirmation = useCallback((messageId: string) => {
+    triggerHaptic('light');
+    setPendingAction(null);
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id !== messageId
+          ? m
+          : {
+              ...m,
+              awaitingConfirm: false,
+              appliedBadges: [...(m.appliedBadges || []), 'Cancelled'],
+            }
+      )
+    );
   }, []);
 
   const executeAssistantActions = useCallback(
@@ -318,7 +433,13 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
       if (actions.length === 0) return;
 
       const appliedBadges: string[] = [];
-      const candidateSeeds: Array<{ query: string; label: string; sublabel: string; reason?: string; autoMode?: 'play_now' | 'play_next' | 'add_to_queue' }> = [];
+      const candidateSeeds: Array<{
+        query: string;
+        label: string;
+        sublabel: string;
+        reason?: string;
+        autoMode?: 'ask_confirm' | 'play_now' | 'play_next' | 'add_to_queue';
+      }> = [];
       const playlistActions: Array<Extract<AiAssistantAction, { type: 'create_playlist' }>> = [];
 
       for (const action of actions) {
@@ -366,6 +487,22 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
               onNavigateTab('lyrics');
               appliedBadges.push('Opened Sync Lyrics');
               break;
+            case 'open_dsp':
+              onOpenDsp();
+              appliedBadges.push('Opened DSP Equalizer');
+              break;
+            case 'open_live_studio':
+              onOpenLiveStudio();
+              appliedBadges.push('Opened Shared Live Studio');
+              break;
+            case 'pick_song':
+              onPickSong();
+              appliedBadges.push('Opened Song Picker');
+              break;
+            case 'pick_folder':
+              onPickFolder();
+              appliedBadges.push('Opened Folder Picker');
+              break;
           }
           continue;
         }
@@ -408,7 +545,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
             appliedBadges.push(
               action.favorite
                 ? `Favorited "${engine.currentTrack.title}"`
-                : `Updated favorite`
+                : 'Removed from favorites'
             );
           }
           continue;
@@ -448,7 +585,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
               query: action.query,
               label: action.query,
               sublabel: 'Streaming Search',
-              autoMode: action.mode === 'queue' ? 'add_to_queue' : 'play_now',
+              autoMode: action.mode === 'queue' ? 'add_to_queue' : 'ask_confirm',
             });
           }
           continue;
@@ -465,13 +602,12 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
         }
 
         if (action.type === 'identify_song_candidates') {
-          action.candidates.forEach((c: AiIdentifiedCandidate, idx: number) => {
+          action.candidates.forEach((c: AiIdentifiedCandidate) => {
             candidateSeeds.push({
               query: buildAiTrackSearchQuery(c),
               label: c.title,
               sublabel: c.artist,
               reason: c.reason,
-              autoMode: idx === 0 && actions.some((a) => a.type === 'play_song') ? undefined : undefined,
             });
           });
           continue;
@@ -522,43 +658,118 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
       );
 
       if (uniqueSeeds.length > 0) {
-        const resolvedTracks = await Promise.all(
-          uniqueSeeds.map((seed) => resolveStreamTrack(seed.query))
-        );
+        // When single play_song asks confirmation, pull up to 3 playable options
+        const singleConfirm =
+          uniqueSeeds.length === 1 && uniqueSeeds[0].autoMode === 'ask_confirm';
 
-        let triggeredAutoPlay = false;
-        resolvedTracks.forEach((tr, idx) => {
-          const mode = uniqueSeeds[idx]?.autoMode;
-          if (!tr || !mode) return;
-          if (mode === 'play_now' && !triggeredAutoPlay) {
-            triggeredAutoPlay = true;
-            onPlayTrack(tr);
-          } else if (mode === 'play_next') {
-            onPlayNext(tr);
-          } else if (mode === 'add_to_queue') {
-            onQueueTracks([tr]);
+        if (singleConfirm) {
+          const foundList = await resolveStreamTracks(uniqueSeeds[0].query, 3);
+          const valid = foundList.filter(Boolean);
+          if (valid.length > 0) {
+            setPendingAction({
+              kind: 'tracks',
+              tracks: valid,
+              label: uniqueSeeds[0].label,
+            });
           }
-        });
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id !== messageId
+                ? m
+                : {
+                    ...m,
+                    text:
+                      valid.length > 0
+                        ? `Found ${formatTrackSummaryLine(valid[0])}. Would you like me to play it now?`
+                        : `I searched YouTube for "${uniqueSeeds[0].query}", but didn't find a playable stream right now.`,
+                    awaitingConfirm: valid.length > 0,
+                    candidates:
+                      valid.length > 0
+                        ? valid.map((tr) => ({
+                            label: tr.title,
+                            sublabel: `${tr.artist}${tr.duration > 0 ? ` · ${formatDuration(tr.duration)}` : ''}`,
+                            track: tr,
+                            resolving: false,
+                          }))
+                        : [
+                            {
+                              label: uniqueSeeds[0].label,
+                              sublabel: 'No live stream found',
+                              track: null,
+                              resolving: false,
+                            },
+                          ],
+                  }
+            )
+          );
+        } else {
+          const resolvedTracks = await Promise.all(
+            uniqueSeeds.map((seed) => resolveStreamTrack(seed.query))
+          );
 
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id !== messageId
-              ? m
-              : {
-                  ...m,
-                  candidates: uniqueSeeds.map((s, idx) => {
-                    const tr = resolvedTracks[idx];
-                    return {
-                      label: tr?.title || s.label,
-                      sublabel: tr?.artist || s.sublabel,
-                      reason: s.reason,
-                      track: tr,
-                      resolving: false,
-                    };
-                  }),
-                }
-          )
-        );
+          let triggeredAutoPlay = false;
+          const confirmTracks: Track[] = [];
+          const newBadges: string[] = [];
+
+          resolvedTracks.forEach((tr, idx) => {
+            const mode = uniqueSeeds[idx]?.autoMode;
+            if (!tr) return;
+            if (mode === 'ask_confirm') {
+              confirmTracks.push(tr);
+            } else if (mode === 'play_now' && !triggeredAutoPlay) {
+              triggeredAutoPlay = true;
+              onPlayTrack(tr);
+              newBadges.push(`Playing "${tr.title}"`);
+            } else if (mode === 'play_next') {
+              onPlayNext(tr);
+              newBadges.push(`Playing "${tr.title}" next`);
+            } else if (mode === 'add_to_queue') {
+              onQueueTracks([tr]);
+              newBadges.push(`Queued "${tr.title}"`);
+            }
+          });
+
+          if (confirmTracks.length > 0) {
+            setPendingAction({
+              kind: 'tracks',
+              tracks: confirmTracks,
+            });
+          } else {
+            const allResolved = resolvedTracks.filter((t): t is Track => Boolean(t));
+            if (allResolved.length > 0 && !triggeredAutoPlay && newBadges.length === 0) {
+              setPendingAction({ kind: 'tracks', tracks: allResolved });
+            }
+          }
+
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id !== messageId
+                ? m
+                : {
+                    ...m,
+                    awaitingConfirm:
+                      confirmTracks.length > 0 ||
+                      (newBadges.length === 0 && resolvedTracks.some(Boolean)),
+                    appliedBadges:
+                      newBadges.length > 0
+                        ? [...(m.appliedBadges || []), ...newBadges]
+                        : m.appliedBadges,
+                    candidates: uniqueSeeds.map((s, idx) => {
+                      const tr = resolvedTracks[idx];
+                      return {
+                        label: tr?.title || s.label,
+                        sublabel: tr
+                          ? `${tr.artist}${tr.duration > 0 ? ` · ${formatDuration(tr.duration)}` : ''}`
+                          : s.sublabel,
+                        reason: s.reason,
+                        track: tr,
+                        resolving: false,
+                      };
+                    }),
+                  }
+            )
+          );
+        }
       }
 
       for (let pIdx = 0; pIdx < playlistActions.length; pIdx++) {
@@ -582,6 +793,13 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
           );
           if (plAction.autoPlay) {
             onPlayCollection(dedupedTracks, 0);
+          } else {
+            setPendingAction({
+              kind: 'playlist',
+              name: plAction.name,
+              description: plAction.description,
+              tracks: dedupedTracks,
+            });
           }
           triggerHaptic('success');
         }
@@ -613,8 +831,12 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
       onDownloadToDevice,
       onNavigateTab,
       onNext,
+      onOpenDsp,
       onOpenFullscreen,
+      onOpenLiveStudio,
       onPause,
+      onPickFolder,
+      onPickSong,
       onPlay,
       onPlayCollection,
       onPlayNext,
@@ -628,6 +850,124 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
       onToggleShuffle,
       onUpdateDsp,
       resolveStreamTrack,
+      resolveStreamTracks,
+      savedTracks,
+    ]
+  );
+
+  const applySiriFallbackResult = useCallback(
+    async (messageId: string, prompt: string, contextPayload: AiAssistantContextPayload) => {
+      const result = await runSiriAssistantTurn({
+        prompt,
+        context: contextPayload,
+        savedTracks,
+        pendingAction,
+      });
+
+      if (result.clearPending) {
+        setPendingAction(null);
+      } else if (result.nextPending !== undefined) {
+        setPendingAction(result.nextPending);
+      }
+
+      // Handle already-resolved tracks directly (from confirmation or play_next/queue)
+      const resolvedDirect = result.resolvedTracks || [];
+      const directBadges: string[] = [];
+      let didAutoPlay = false;
+
+      if (resolvedDirect.length > 0) {
+        const primaryAction = result.actions.find((a) => a.type === 'play_song');
+        const mode =
+          primaryAction && primaryAction.type === 'play_song'
+            ? primaryAction.mode
+            : 'play_now';
+        const tr = resolvedDirect[0];
+        if (mode === 'play_next') {
+          onPlayNext(tr);
+          directBadges.push(`Playing "${tr.title}" next`);
+        } else if (mode === 'add_to_queue') {
+          onQueueTracks([tr]);
+          directBadges.push(`Queued "${tr.title}"`);
+        } else if (!didAutoPlay) {
+          didAutoPlay = true;
+          onPlayTrack(tr);
+          directBadges.push(`Playing "${tr.title}"`);
+        }
+        triggerHaptic('success');
+      }
+
+      let playlistCards: CreatedPlaylistCard[] | undefined;
+      if (result.createdPlaylist) {
+        const { name, description, tracks, autoPlay } = result.createdPlaylist;
+        if (tracks.length > 0) {
+          await onCreatePlaylist(name, description, tracks);
+          if (autoPlay) {
+            onPlayCollection(tracks, 0);
+            directBadges.push(`Playing "${name}"`);
+          } else {
+            directBadges.push(`Saved playlist "${name}"`);
+          }
+          triggerHaptic('success');
+        }
+        playlistCards = [
+          {
+            name,
+            description,
+            tracks,
+            resolving: false,
+          },
+        ];
+      }
+
+      const displayTracks =
+        result.awaitingConfirmTracks && result.awaitingConfirmTracks.length > 0
+          ? result.awaitingConfirmTracks
+          : resolvedDirect;
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: messageId,
+          role: 'model',
+          text: result.reply,
+          sources: result.sources,
+          awaitingConfirm: Boolean(
+            result.awaitingConfirmTracks &&
+              result.awaitingConfirmTracks.length > 0 &&
+              !result.clearPending
+          ),
+          appliedBadges: directBadges.length > 0 ? directBadges : undefined,
+          candidates:
+            displayTracks.length > 0
+              ? displayTracks.map((tr) => ({
+                  label: tr.title,
+                  sublabel: `${tr.artist}${tr.duration > 0 ? ` · ${formatDuration(tr.duration)}` : ''}`,
+                  track: tr,
+                  resolving: false,
+                }))
+              : undefined,
+          createdPlaylists: playlistCards,
+        },
+      ]);
+
+      // Execute remaining non-track actions (playback controls, DSP, tabs, favorites, downloads)
+      const nonTrackActions =
+        resolvedDirect.length > 0
+          ? result.actions.filter((a) => a.type !== 'play_song')
+          : result.actions;
+
+      if (nonTrackActions.length > 0) {
+        await executeAssistantActions(messageId, nonTrackActions);
+      }
+    },
+    [
+      executeAssistantActions,
+      onCreatePlaylist,
+      onPlayCollection,
+      onPlayNext,
+      onPlayTrack,
+      onQueueTracks,
+      pendingAction,
       savedTracks,
     ]
   );
@@ -674,49 +1014,102 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
       setIsSending(true);
       triggerHaptic('selection');
 
+      const contextPayload = buildContextPayload();
+
       try {
-        const res = await fetch('/api/ai/assist', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt,
-            audioBase64: options.audioBase64,
-            audioMimeType: options.audioMimeType,
-            history: priorHistory,
-            context: buildContextPayload(),
-          }),
-        });
-
-        const data = (await res.json().catch(() => ({}))) as Partial<AiAssistantResponse> & {
-          error?: string;
-        };
-
-        if (!res.ok) {
-          throw new Error(data.error || `AI request failed (${res.status}).`);
+        // 1. Instant handling of conversational confirmations ("yes", "play next", "2nd one", "no")
+        if (prompt && pendingAction && matchPendingConfirmation(prompt, pendingAction)) {
+          await applySiriFallbackResult(modelMsgId, prompt, contextPayload);
+          return;
         }
 
-        const replyText = (data.reply || '').trim() || 'Done.';
-        const actions = Array.isArray(data.actions) ? data.actions : [];
-        const sources = Array.isArray(data.sources) ? data.sources : [];
+        const customApiBase = (import.meta.env.VITE_AI_API_URL || '').trim().replace(/\/$/, '');
+        const assistEndpoint = customApiBase ? `${customApiBase}/api/ai/assist` : '/api/ai/assist';
+        const canCallBackend = !isNativeAndroidApp() || Boolean(customApiBase);
 
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: modelMsgId,
-            role: 'model',
-            text: replyText,
-            sources,
-          },
-        ]);
+        // Standalone Android APK without external backend: handle raw hum clips honestly & voice/text with live Siri engine
+        if (!canCallBackend) {
+          if (!prompt && hasAudio) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: modelMsgId,
+                role: 'model',
+                text: 'Voice speech commands and lyrics searches work right now on your phone! For raw melody humming without words, please speak the song lyrics, artist, or title aloud (e.g. "Play Wakadinali Blow") or type it below.',
+              },
+            ]);
+            return;
+          }
+          await applySiriFallbackResult(modelMsgId, prompt, contextPayload);
+          return;
+        }
 
-        if (actions.length > 0) {
-          void executeAssistantActions(modelMsgId, actions);
+        // 2. Web or configured backend: call Gemini /api/ai/assist first with strict JSON validation
+        let backendSucceeded = false;
+        let backendErrorMsg = '';
+        try {
+          const res = await fetch(assistEndpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              prompt,
+              audioBase64: options.audioBase64,
+              audioMimeType: options.audioMimeType,
+              history: priorHistory,
+              context: contextPayload,
+            }),
+          });
+
+          const contentType = (res.headers.get('content-type') || '').toLowerCase();
+          if (contentType.includes('application/json')) {
+            const data = (await res.json().catch(() => ({}))) as Partial<AiAssistantResponse> & {
+              error?: string;
+            };
+            const validReply = typeof data.reply === 'string' ? data.reply.trim() : '';
+            const actions = Array.isArray(data.actions) ? data.actions : [];
+            const sources = Array.isArray(data.sources) ? data.sources : [];
+
+            if (res.ok && (validReply.length > 0 || actions.length > 0)) {
+              backendSucceeded = true;
+              const fallbackIntro =
+                actions.length > 0 ? 'Searching and executing your request...' : '';
+              setMessages((prev) => [
+                ...prev,
+                {
+                  id: modelMsgId,
+                  role: 'model',
+                  text: validReply || fallbackIntro,
+                  sources,
+                },
+              ]);
+              if (actions.length > 0) {
+                void executeAssistantActions(modelMsgId, actions);
+              }
+            } else if (data.error) {
+              backendErrorMsg = data.error;
+            }
+          }
+        } catch (netErr) {
+          backendErrorMsg =
+            netErr instanceof Error ? netErr.message : 'Could not reach AI backend.';
+        }
+
+        // 3. Seamless fallback to client/APK interactive Siri engine whenever backend is unavailable/HTML/503/429
+        if (!backendSucceeded) {
+          if (prompt) {
+            await applySiriFallbackResult(modelMsgId, prompt, contextPayload);
+          } else {
+            throw new Error(
+              backendErrorMsg ||
+                'Audio hum analysis is temporarily unavailable right now. Try speaking or typing the lyrics or song name.'
+            );
+          }
         }
       } catch (err) {
         const errText =
           err instanceof Error && err.message
             ? err.message
-            : 'Could not reach the AI assistant right now.';
+            : 'Could not complete your request right now.';
         setMessages((prev) => [
           ...prev,
           {
@@ -730,31 +1123,50 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
         setIsSending(false);
       }
     },
-    [buildContextPayload, executeAssistantActions, messages]
+    [
+      applySiriFallbackResult,
+      buildContextPayload,
+      executeAssistantActions,
+      messages,
+      pendingAction,
+    ]
   );
 
-  const stopRecording = useCallback((discard = false) => {
-    discardRecordingRef.current = discard;
-    if (recordTimerRef.current !== null) {
-      window.clearInterval(recordTimerRef.current);
-      recordTimerRef.current = null;
-    }
-    const recorder = mediaRecorderRef.current;
-    if (recorder && recorder.state !== 'inactive') {
-      try {
-        recorder.stop();
-      } catch {
+  const stopRecording = useCallback(
+    (discard = false) => {
+      discardRecordingRef.current = discard;
+      if (recordTimerRef.current !== null) {
+        window.clearInterval(recordTimerRef.current);
+        recordTimerRef.current = null;
+      }
+      if (speechRecRef.current) {
+        try {
+          if (discard) speechRecRef.current.abort();
+          else speechRecRef.current.stop();
+        } catch {
+          // Ignore
+        }
+      }
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== 'inactive') {
+        try {
+          recorder.stop();
+        } catch {
+          cleanupRecordingResources();
+        }
+      } else {
         cleanupRecordingResources();
       }
-    } else {
-      cleanupRecordingResources();
-    }
-  }, [cleanupRecordingResources]);
+    },
+    [cleanupRecordingResources]
+  );
 
   const startRecording = useCallback(async () => {
     setMicError(null);
     setIsOpen(true);
     setIsDrawerMinimized(false);
+    speechTranscriptRef.current = '';
+    setLiveTranscript('');
 
     if (
       typeof navigator === 'undefined' ||
@@ -782,6 +1194,34 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
       chunksRef.current = [];
       discardRecordingRef.current = false;
 
+      // Start parallel speech recognition so spoken commands ("Play Wakadinali Blow") transcribe cleanly even offline/APK
+      const SpeechCtor = getSpeechRecognitionCtor();
+      if (SpeechCtor) {
+        try {
+          const sr = new SpeechCtor();
+          sr.continuous = true;
+          sr.interimResults = true;
+          sr.lang = 'en-US';
+          sr.onresult = (ev) => {
+            const parts: string[] = [];
+            for (let i = 0; i < ev.results.length; i++) {
+              const seg = ev.results[i]?.[0]?.transcript;
+              if (seg) parts.push(seg.trim());
+            }
+            const joined = parts.join(' ').trim();
+            speechTranscriptRef.current = joined;
+            setLiveTranscript(joined);
+          };
+          sr.onerror = () => {
+            // Non-fatal: MediaRecorder audio capture continues smoothly
+          };
+          speechRecRef.current = sr;
+          sr.start();
+        } catch {
+          speechRecRef.current = null;
+        }
+      }
+
       const mimeType = pickSupportedRecorderMimeType();
       const recorder = mimeType
         ? new MediaRecorder(stream, { mimeType })
@@ -805,18 +1245,27 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
           1,
           Math.round((Date.now() - recordStartedAtRef.current) / 1000)
         );
+        const capturedTranscript = speechTranscriptRef.current.trim();
+        speechTranscriptRef.current = '';
         const recordedMime = recorder.mimeType || mimeType || 'audio/webm';
         const blob = new Blob(chunksRef.current, { type: recordedMime });
         chunksRef.current = [];
         cleanupRecordingResources();
 
-        if (shouldDiscard || blob.size < 256) return;
+        if (shouldDiscard) return;
+
+        const typedHint = inputText.trim();
+        if (!typedHint && isMeaningfulSpokenCommand(capturedTranscript)) {
+          await sendAssistantRequest({ prompt: capturedTranscript });
+          return;
+        }
+
+        if (blob.size < 256) return;
 
         try {
           const base64 = await blobToBase64(blob);
-          const typedHint = inputText.trim();
           await sendAssistantRequest({
-            prompt: typedHint,
+            prompt: typedHint || (isNativeAndroidApp() ? capturedTranscript : ''),
             audioBase64: base64,
             audioMimeType: recordedMime,
             audioDurationSec: durationElapsed,
@@ -1095,6 +1544,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
                   onClick={() => {
                     triggerHaptic('light');
                     setMessages([]);
+                    setPendingAction(null);
                     setMicError(null);
                   }}
                   aria-label="Clear assistant conversation"
@@ -1140,12 +1590,17 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
               <div className="rounded-xl border border-[#E11D48]/50 bg-[#15090E] p-3 space-y-2.5">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-semibold text-[#F4F3F0]">
-                    Listening — hum a melody or speak...
+                    Listening — speak a command or hum...
                   </span>
                   <span className="font-mono-tabular text-xs font-semibold text-[#FF4D6D]">
                     {formatRecordingTimer(recordingSec)} / {formatRecordingTimer(MAX_RECORDING_SECONDS)}
                   </span>
                 </div>
+                {liveTranscript && (
+                  <p className="rounded-lg bg-black/40 px-2.5 py-1.5 text-xs italic text-[#F4F3F0]">
+                    "{liveTranscript}"
+                  </p>
+                )}
                 <div className="flex h-8 items-end justify-center gap-1.5 px-2">
                   {micBars.map((level, idx) => (
                     <span
@@ -1169,7 +1624,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
                     className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
                   >
                     <Square className="h-3 w-3 fill-current" />
-                    <span>Send Audio</span>
+                    <span>Send</span>
                   </button>
                 </div>
               </div>
@@ -1179,16 +1634,28 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
             {messages.length === 0 && !isRecording && !isSending && (
               <div className="space-y-2">
                 <p className="text-xs leading-relaxed text-[#9CA3AF]">
-                  Ask anything, type lyrics, hum or sing with the mic, inspect samples, or build playlists.
+                  Ask me like Siri: find & confirm songs or YouTube mixes, identify lyrics, check samples, control EQ, or build playlists.
                 </p>
                 <div className="grid grid-cols-1 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void sendAssistantRequest({
+                        prompt: 'Play a Kenyan popular song by Wakadinali called Blow',
+                      })
+                    }
+                    className="flex min-h-[44px] items-center gap-2.5 rounded-xl border border-[#222530] bg-[#14161D] px-3 py-2 text-left text-xs font-medium text-[#F4F3F0] hover:border-[#E11D48]/60 cursor-pointer"
+                  >
+                    <Play className="h-4 w-4 shrink-0 text-[#FF4D6D]" />
+                    <span className="truncate">Play a Kenyan popular song by Wakadinali called Blow</span>
+                  </button>
                   <button
                     type="button"
                     onClick={() => void startRecording()}
                     className="flex min-h-[44px] items-center gap-2.5 rounded-xl border border-[#222530] bg-[#14161D] px-3 py-2 text-left text-xs font-medium text-[#F4F3F0] hover:border-[#E11D48]/60 cursor-pointer"
                   >
                     <Mic className="h-4 w-4 shrink-0 text-[#FF4D6D]" />
-                    <span>Hum a song or speak a voice command</span>
+                    <span>Speak a command or hum a song</span>
                   </button>
                   <button
                     type="button"
@@ -1265,72 +1732,127 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
                   </div>
                 )}
 
-                {/* Playable Track Results / Identified Song Matches */}
+                {/* Playable Track Results / Interactive Confirmation Cards */}
                 {msg.candidates && msg.candidates.length > 0 && (
                   <div className="w-full space-y-1.5">
                     {msg.candidates.map((cand, idx) => (
                       <div
                         key={idx}
-                        className="flex items-center justify-between gap-2.5 rounded-xl border border-[#222530] bg-[#12141B] p-2.5"
+                        className={`rounded-xl border p-2.5 space-y-2 ${
+                          idx === 0 && msg.awaitingConfirm
+                            ? 'border-[#E11D48]/55 bg-[#15090E]'
+                            : 'border-[#222530] bg-[#12141B]'
+                        }`}
                       >
-                        <div className="flex min-w-0 flex-1 items-center gap-2.5">
-                          {cand.track?.artworkUrl ? (
-                            <img
-                              src={cand.track.artworkUrl}
-                              alt={cand.label}
-                              referrerPolicy="no-referrer"
-                              className="h-10 w-10 shrink-0 rounded-lg object-cover border border-[#262936]"
-                            />
-                          ) : (
-                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#262936] bg-[#1A1C24] text-[#FF4D6D]">
-                              {cand.resolving ? (
-                                <Loader2 className="h-4 w-4 animate-spin" />
-                              ) : (
-                                <Music2 className="h-4 w-4" />
+                        <div className="flex items-center justify-between gap-2.5">
+                          <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                            {cand.track?.artworkUrl ? (
+                              <img
+                                src={cand.track.artworkUrl}
+                                alt={cand.label}
+                                referrerPolicy="no-referrer"
+                                className="h-10 w-10 shrink-0 rounded-lg object-cover border border-[#262936]"
+                              />
+                            ) : (
+                              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[#262936] bg-[#1A1C24] text-[#FF4D6D]">
+                                {cand.resolving ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <Music2 className="h-4 w-4" />
+                                )}
+                              </div>
+                            )}
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-xs font-semibold text-[#F4F3F0]">
+                                {cand.label}
+                              </p>
+                              <p className="truncate text-[11px] text-[#8E929B]">{cand.sublabel}</p>
+                              {cand.reason && (
+                                <p className="mt-0.5 line-clamp-1 text-[10px] text-[#9CA3AF]">
+                                  {cand.reason}
+                                </p>
                               )}
                             </div>
-                          )}
-                          <div className="min-w-0 flex-1">
-                            <p className="truncate text-xs font-semibold text-[#F4F3F0]">
-                              {cand.label}
-                            </p>
-                            <p className="truncate text-[11px] text-[#8E929B]">{cand.sublabel}</p>
-                            {cand.reason && (
-                              <p className="mt-0.5 line-clamp-1 text-[10px] text-[#9CA3AF]">
-                                {cand.reason}
-                              </p>
-                            )}
                           </div>
+
+                          {cand.track && !(idx === 0 && msg.awaitingConfirm) && (
+                            <div className="flex shrink-0 items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleConfirmTrackDecision(msg.id, cand.track!, 'play_next')
+                                }
+                                aria-label={`Play ${cand.track.title} next`}
+                                title="Play Next"
+                                className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#282B36] bg-[#14161D] text-[#C7C9D1] hover:border-[#E11D48] hover:text-white cursor-pointer"
+                              >
+                                <ListStart className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleConfirmTrackDecision(msg.id, cand.track!, 'add_to_queue')
+                                }
+                                aria-label={`Add ${cand.track.title} to queue`}
+                                title="Queue"
+                                className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#282B36] bg-[#14161D] text-[#C7C9D1] hover:border-[#E11D48] hover:text-white cursor-pointer"
+                              >
+                                <ListPlus className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleConfirmTrackDecision(msg.id, cand.track!, 'play_now')
+                                }
+                                aria-label={`Play ${cand.track.title}`}
+                                className="inline-flex h-9 items-center gap-1 rounded-lg bg-[#E11D48] px-2.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
+                              >
+                                <Play className="h-3.5 w-3.5 fill-current" />
+                                <span>Play</span>
+                              </button>
+                            </div>
+                          )}
                         </div>
 
-                        {cand.track && (
-                          <div className="flex shrink-0 items-center gap-1">
+                        {/* Interactive Confirmation Bar on Top Match */}
+                        {cand.track && idx === 0 && msg.awaitingConfirm && (
+                          <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                             <button
                               type="button"
-                              onClick={() => onPlayNext(cand.track!)}
-                              aria-label={`Play ${cand.track.title} next`}
-                              title="Play Next"
-                              className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#282B36] bg-[#14161D] text-[#C7C9D1] hover:border-[#E11D48] hover:text-white cursor-pointer"
-                            >
-                              <ListStart className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => onQueueTracks([cand.track!])}
-                              aria-label={`Add ${cand.track.title} to queue`}
-                              title="Queue"
-                              className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#282B36] bg-[#14161D] text-[#C7C9D1] hover:border-[#E11D48] hover:text-white cursor-pointer"
-                            >
-                              <ListPlus className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => onPlayTrack(cand.track!)}
-                              aria-label={`Play ${cand.track.title}`}
-                              className="inline-flex h-9 items-center gap-1 rounded-lg bg-[#E11D48] px-2.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
+                              onClick={() =>
+                                handleConfirmTrackDecision(msg.id, cand.track!, 'play_now')
+                              }
+                              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#E11D48] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
                             >
                               <Play className="h-3.5 w-3.5 fill-current" />
-                              <span>Play</span>
+                              <span>Yes, Play Now</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleConfirmTrackDecision(msg.id, cand.track!, 'play_next')
+                              }
+                              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-2.5 py-1.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer"
+                            >
+                              <ListStart className="h-3.5 w-3.5 text-[#FF4D6D]" />
+                              <span>Play Next</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleConfirmTrackDecision(msg.id, cand.track!, 'add_to_queue')
+                              }
+                              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-2.5 py-1.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer"
+                            >
+                              <ListPlus className="h-3.5 w-3.5 text-[#FF4D6D]" />
+                              <span>Queue</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleCancelConfirmation(msg.id)}
+                              className="inline-flex min-h-[38px] items-center rounded-lg border border-[#282B36] bg-[#14161D] px-2.5 py-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
+                            >
+                              No
                             </button>
                           </div>
                         )}
@@ -1366,7 +1888,10 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
                           <div className="flex flex-wrap items-center gap-2">
                             <button
                               type="button"
-                              onClick={() => onPlayCollection(pl.tracks, 0)}
+                              onClick={() => {
+                                setPendingAction(null);
+                                onPlayCollection(pl.tracks, 0);
+                              }}
                               className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#E11D48] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
                             >
                               <Play className="h-3.5 w-3.5 fill-current" />
@@ -1413,7 +1938,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
             {isSending && (
               <div className="flex items-center gap-2 text-xs text-[#9CA3AF]">
                 <Loader2 className="h-3.5 w-3.5 animate-spin text-[#FF4D6D]" />
-                <span>Thinking & searching...</span>
+                <span>Searching & working on it...</span>
               </div>
             )}
 
@@ -1422,7 +1947,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
         </div>
       )}
 
-      {/* Capsule Input Bar (Figma design: Mic icon left + input field + send/close) */}
+      {/* Capsule Input Bar (Mic icon left + input field + send/close) */}
       <form
         onSubmit={handleFormSubmit}
         className="flex w-full items-center gap-1.5 rounded-full border border-[#262936] bg-[#0C0D12]/95 px-2 py-1.5 shadow-[0_18px_48px_rgba(0,0,0,0.88)] backdrop-blur-xl"
@@ -1432,7 +1957,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
           onClick={handleMicToggle}
           disabled={isSending}
           aria-label={isRecording ? 'Stop recording audio' : 'Hum or speak to Ai'}
-          title={isRecording ? 'Tap to send hummed/spoken audio' : 'Hum a song or speak'}
+          title={isRecording ? 'Tap to send spoken/hummed audio' : 'Speak a command or hum a song'}
           data-testid="ai-mic-button"
           className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full transition-colors cursor-pointer disabled:opacity-50 ${
             isRecording
@@ -1455,9 +1980,11 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
             if (isDrawerMinimized) setIsDrawerMinimized(false);
           }}
           placeholder={
-            isRecording
-              ? 'Listening... tap stop or press Send'
-              : 'Ask anything, hum a song, type lyrics...'
+            pendingAction
+              ? 'Reply "yes", "play next", or ask anything...'
+              : isRecording
+                ? 'Listening... tap stop when done'
+                : 'Ask anything, find a song or mix, lyrics...'
           }
           disabled={isSending}
           data-testid="ai-text-input"

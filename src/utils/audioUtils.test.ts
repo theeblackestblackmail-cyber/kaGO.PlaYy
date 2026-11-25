@@ -2927,6 +2927,146 @@ test('setup-android-native patches RECORD_AUDIO and MODIFY_AUDIO_SETTINGS for AI
   assert.ok(setupSrc.includes('android.permission.MODIFY_AUDIO_SETTINGS'));
 });
 
+test('siriEngine extracts natural song queries, mixes, confirmations, DSP controls, and playlist intents accurately', async () => {
+  const {
+    extractAppControlAction,
+    extractDspDirective,
+    extractLyricsSnippet,
+    extractPlaylistDirective,
+    extractSongSearchQuery,
+    isMusicKnowledgeQuestion,
+    matchPendingConfirmation,
+  } = await import('./siriEngine');
+
+  // Natural sentence -> clean YouTube artist + title query with ask_confirm default
+  const kenyanSong = extractSongSearchQuery('play a kenyan popular song by wakadinali called blow');
+  assert.equal(kenyanSong.query.toLowerCase(), 'wakadinali blow');
+  assert.equal(kenyanSong.requestedMode, 'ask_confirm');
+  assert.equal(kenyanSong.wantsMix, false);
+
+  // Reverse wording ("called ... by ...")
+  const reversed = extractSongSearchQuery('find a track called Last Last by Burna Boy on youtube');
+  assert.equal(reversed.query.toLowerCase(), 'burna boy last last');
+
+  // Described YouTube mix preserves mix intent
+  const ytMix = extractSongSearchQuery('find that Kenyan hip hop DJ mix by DJ Joe Mfalme on YouTube');
+  assert.equal(ytMix.wantsMix, true);
+  assert.ok(ytMix.query.toLowerCase().includes('dj joe mfalme'));
+  assert.ok(ytMix.query.toLowerCase().includes('mix'));
+
+  // Queue / Play Next explicit intent
+  const playNextReq = extractSongSearchQuery('play Sauti Sol Midnight Train next');
+  assert.equal(playNextReq.requestedMode, 'play_next');
+
+  // Interactive pending confirmation follow-ups
+  const sampleTracks: Track[] = [
+    {
+      id: 'yt-1',
+      youtubeId: '1',
+      title: '"Blow" Deluxe',
+      artist: 'Wakadinali',
+      album: 'YouTube',
+      duration: 285,
+      source: 'stream',
+      addedAt: 1,
+    },
+    {
+      id: 'yt-2',
+      youtubeId: '2',
+      title: 'Blow (Live)',
+      artist: 'Wakadinali',
+      album: 'YouTube',
+      duration: 300,
+      source: 'stream',
+      addedAt: 2,
+    },
+  ];
+  const pending = { kind: 'tracks' as const, tracks: sampleTracks };
+  assert.deepEqual(matchPendingConfirmation('yes please play it', pending), {
+    decision: 'confirm',
+    selectedIndex: 0,
+    playMode: 'play_now',
+  });
+  assert.deepEqual(matchPendingConfirmation('play the second one next', pending), {
+    decision: 'confirm',
+    selectedIndex: 1,
+    playMode: 'play_next',
+  });
+  assert.deepEqual(matchPendingConfirmation('add to queue', pending), {
+    decision: 'confirm',
+    selectedIndex: 0,
+    playMode: 'add_to_queue',
+  });
+  assert.deepEqual(matchPendingConfirmation('no cancel that', pending), {
+    decision: 'cancel',
+    selectedIndex: 0,
+    playMode: 'play_now',
+  });
+  // Unrelated command must break out of pending confirmation
+  assert.equal(matchPendingConfirmation('open settings', pending), null);
+
+  // Playlist directive
+  assert.deepEqual(extractPlaylistDirective('create a playlist for Wakadinali and play it'), {
+    name: 'Wakadinali Mix',
+    topicQuery: 'Wakadinali',
+    autoPlay: true,
+  });
+
+  // Lyrics search extraction
+  assert.equal(
+    extractLyricsSnippet('Find song by lyrics: I came from nothing to something'),
+    'I came from nothing to something'
+  );
+
+  // Music knowledge / sample question
+  assert.equal(
+    isMusicKnowledgeQuestion('where was the beat in Hotline Bling sampled from?'),
+    true
+  );
+
+  // DSP preset & bass boost
+  assert.deepEqual(extractDspDirective('Switch EQ to Heavy Bass and turn bass boost to 10 dB'), {
+    type: 'update_dsp',
+    eqPreset: 'Heavy Bass',
+    bassBoostEnabled: true,
+    bassBoostDb: 10,
+    crossfadeSeconds: undefined,
+  });
+
+  // Extended app controls
+  assert.deepEqual(extractAppControlAction('open equalizer'), {
+    type: 'control_playback',
+    command: 'open_dsp',
+  });
+  assert.deepEqual(extractAppControlAction('open shared live studio'), {
+    type: 'control_playback',
+    command: 'open_live_studio',
+  });
+  assert.deepEqual(extractAppControlAction('pick a folder'), {
+    type: 'control_playback',
+    command: 'pick_folder',
+  });
+  assert.deepEqual(extractAppControlAction('download this song as mp3 320'), {
+    type: 'download_current_track',
+    destination: 'device',
+    formatId: 'mp3-320',
+  });
+});
+
+test('MainActivity allows Wikipedia, iTunes, MusicBrainz, and LRCLIB URLs for standalone APK AI assistant', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const javaSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'android-native/java/com/kagoplay/workstation/MainActivity.java'),
+    'utf8'
+  );
+  assert.ok(javaSrc.includes('https://en.wikipedia.org/'));
+  assert.ok(javaSrc.includes('https://itunes.apple.com/'));
+  assert.ok(javaSrc.includes('https://musicbrainz.org/'));
+  assert.ok(javaSrc.includes('https://lrclib.net/'));
+});
+
+
 
 
 

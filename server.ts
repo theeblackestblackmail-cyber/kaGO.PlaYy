@@ -889,36 +889,39 @@ function getGeminiClient(): GoogleGenAI | null {
 const AI_ASSISTANT_SYSTEM_INSTRUCTION = `You are the built-in Siri-style AI music assistant inside kaGO.PIaY, a hi-fi offline & streaming audio player.
 
 What you can help users with:
-1. Identify songs from typed or spoken lyrics, song descriptions, vibe hints, or hummed/sung/played audio clips sent via the microphone.
-   - Listen closely to hummed melodies, rhythm, pitch contour, or sung fragments in audio recordings. Listen first, provide your best matching song candidate(s) with artist names via identify_song_candidates (up to 3 plausible matches) and play_song when the match is clear and the user wants to hear it or asked to find/play it.
+1. Search & Confirm Song / Mix Playback:
+   - When the user asks to find or play a song, video, or YouTube DJ mix (e.g., "play a kenyan popular song by wakadinali called blow" or "find that amapiano mix on youtube"), call play_song with mode="ask_confirm" and a clean search query ("Wakadinali Blow", "Kenyan hip hop mix", etc.). The app will search live YouTube/Audius, show the found track card, and let the user confirm playback with "Yes" or tap Play.
+   - Only use mode="play_now" if the user explicitly confirms ("yes play it", "play immediately without asking") or is answering a confirmation question.
+2. Identify songs from typed or spoken lyrics, song descriptions, vibe hints, or hummed/sung/played audio clips sent via the microphone.
+   - Listen closely to hummed melodies, rhythm, pitch contour, or sung fragments in audio recordings. Provide your best matching song candidate(s) with artist names via identify_song_candidates (up to 3 plausible matches) so the user can inspect and confirm playing them.
    - If hummed audio is completely silent, pure noise, or too ambiguous to identify confidently, be honest and suggest humming slightly louder/closer to the mic or adding a lyric clue.
-2. Answer music knowledge questions thoroughly and accurately using Google Search grounding (e.g., where a beat or song was sampled from, producers, release year, chart trivia, meaning of lyrics, or details about the currently playing track shown in context).
-3. Create playlists for any artist, genre, mood, activity, or era using create_playlist with 6 to 12 diverse, real, well-known song search queries in "Artist - Title" format.
-4. Control the kaGO.PIaY app on command: play/pause/skip/previous/rewind/forward/shuffle/autoplay radio/fullscreen/sync lyrics (control_playback), EQ presets & Bass Boost & Crossfade (update_dsp), navigate tabs or open Search (navigate_tab), favorite/unfavorite current track (toggle_favorite_current), download the current track to the app or local device (download_current_track), or play offline library tracks (play_library_match).
+3. Answer music knowledge questions thoroughly and accurately using Google Search grounding (e.g., where a beat or song was sampled from, producers, release year, chart trivia, meaning of lyrics, or details about the currently playing track shown in context).
+4. Create playlists for any artist, genre, mood, activity, or era using create_playlist with 6 to 12 diverse, real, well-known song search queries in "Artist - Title" format.
+5. Control the kaGO.PIaY app on command: play/pause/skip/previous/rewind/forward/shuffle/autoplay radio/fullscreen/sync lyrics/equalizer/live studio/song picker/folder picker (control_playback), EQ presets & Bass Boost & Crossfade (update_dsp), navigate tabs or open Search (navigate_tab), favorite/unfavorite current track (toggle_favorite_current), download the current track to the app or local device (download_current_track), or play offline library tracks (play_library_match).
 
 Rules:
 - Never fabricate sample credits, producers, or song identities—rely on Google Search when verifying facts, samples, or lyric matches.
-- Keep spoken/chat replies concise, warm, direct, and easy to skim on mobile.
-- When you call an app-control tool, state clearly what you did or queued.`;
+- Keep replies concise, warm, conversational like Siri, and easy to skim on mobile.
+- When you call play_song with mode="ask_confirm", tell the user what you searched for and ask them to confirm if they'd like you to play it.`;
 
 const AI_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
   {
     name: 'play_song',
     description:
-      'Search and play, play next, or queue a specific song in kaGO.PIaY streaming player.',
+      'Search YouTube/Audius for a song or mix in kaGO.PIaY and ask to confirm playback, play now, play next, or queue.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         query: {
           type: Type.STRING,
-          description: 'Search query in "Artist - Song Title" format.',
+          description: 'Clean search query (e.g. "Wakadinali Blow" or "Kenyan drill mix").',
         },
         title: { type: Type.STRING, description: 'Track title if known.' },
         artist: { type: Type.STRING, description: 'Artist name if known.' },
         mode: {
           type: Type.STRING,
-          enum: ['play_now', 'play_next', 'add_to_queue'],
-          description: 'Whether to play immediately, insert as Play Next, or append to queue.',
+          enum: ['ask_confirm', 'play_now', 'play_next', 'add_to_queue'],
+          description: 'Use ask_confirm by default for song/mix requests so the user confirms after seeing the found track.',
         },
       },
       required: ['query'],
@@ -979,7 +982,7 @@ const AI_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
   },
   {
     name: 'control_playback',
-    description: 'Control current audio playback state, queue navigation, fullscreen, or lyrics.',
+    description: 'Control current audio playback state, queue navigation, fullscreen, lyrics, EQ modal, live studio, or file pickers.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -996,6 +999,10 @@ const AI_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
             'toggle_autoplay_radio',
             'open_fullscreen',
             'open_lyrics',
+            'open_dsp',
+            'open_live_studio',
+            'pick_song',
+            'pick_folder',
           ],
         },
         valueSeconds: {
