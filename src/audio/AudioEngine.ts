@@ -146,6 +146,7 @@ class DualChannelAudioEngine {
   private backgroundTransitionUntil = 0;
   private userPausedAt = 0;
   private bgKeepaliveTimer: number | null = null;
+  private bgTransitionTimers: number[] = [];
   private bgListenersBound = false;
   private watchdogTrackId: string | null = null;
   private watchdogPos = 0;
@@ -257,14 +258,24 @@ class DualChannelAudioEngine {
     }
   }
 
+  private clearBgTransitionTimers() {
+    for (const timer of this.bgTransitionTimers) {
+      clearTimeout(timer);
+    }
+    this.bgTransitionTimers = [];
+  }
+
   private handleBackgroundTransition() {
     if (!this.isPlaying) return;
     if (this.isRecentlyUserPaused()) return;
 
+    this.clearBgTransitionTimers();
     this.backgroundTransitionUntil = Date.now() + 8000;
     this.ensurePlaybackAliveNow();
     for (const delay of [40, 120, 280, 550, 950]) {
-      window.setTimeout(() => this.ensurePlaybackAliveNow(), delay);
+      this.bgTransitionTimers.push(
+        window.setTimeout(() => this.ensurePlaybackAliveNow(), delay)
+      );
     }
     this.startBgKeepalive();
   }
@@ -503,6 +514,7 @@ class DualChannelAudioEngine {
   }
 
   private stopBgKeepalive() {
+    this.clearBgTransitionTimers();
     if (this.bgKeepaliveTimer !== null) {
       clearInterval(this.bgKeepaliveTimer);
       this.bgKeepaliveTimer = null;
@@ -1026,6 +1038,7 @@ class DualChannelAudioEngine {
         this.activeChannel === id &&
         !this.ytActive &&
         this.isPlaying &&
+        Boolean(audioEl.getAttribute('src')) &&
         !audioEl.ended &&
         !this.audioReloadInFlight &&
         !this.isRecentlyUserPaused()
@@ -1095,8 +1108,8 @@ class DualChannelAudioEngine {
       strip.fadeTimer = null;
     }
     try {
-      strip.audioEl.pause();
       strip.audioEl.removeAttribute('src');
+      strip.audioEl.pause();
       strip.audioEl.load();
     } catch {
       // Ignore

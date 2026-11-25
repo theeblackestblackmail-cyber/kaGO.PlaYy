@@ -46,10 +46,14 @@ import {
   stopNativeSpeechDictation,
   subscribeNativeSpeechEvents,
 } from '../utils/nativeMediaBridge';
+import { canonicalSongKey } from '../utils/streamDiscovery';
 import {
   formatTrackSummaryLine,
+  isPlayablePlaylistCandidate,
   matchPendingConfirmation,
   mergeDictatedPrompt,
+  parsePlaylistDirective,
+  resolvePlaylistTracks,
   runSiriAssistantTurn,
   type PendingSiriAction,
 } from '../utils/siriEngine';
@@ -448,7 +452,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
   }, []);
 
   const executeAssistantActions = useCallback(
-    async (messageId: string, actions: AiAssistantAction[]) => {
+    async (messageId: string, actions: AiAssistantAction[], rawUserPrompt = '') => {
       if (actions.length === 0) return;
 
       const appliedBadges: string[] = [];
@@ -791,33 +795,76 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
         }
       }
 
+      const playlistDirective = rawUserPrompt ? parsePlaylistDirective(rawUserPrompt) : null;
+      const requestedPlCount = playlistDirective?.explicitCount
+        ? playlistDirective.requestedCount
+        : undefined;
+
       for (let pIdx = 0; pIdx < playlistActions.length; pIdx++) {
         const plAction = playlistActions[pIdx];
-        const fetched = await Promise.all(
-          plAction.trackQueries.map((q) => resolveStreamTrack(q))
+        const targetCount = Math.max(
+          plAction.trackQueries.length,
+          requestedPlCount ?? 0,
+          12
         );
+        const wantsMix = playlistDirective?.wantsMixPlaylist ?? false;
+
+        const resolvedSeeds: Track[] = [];
+        const BATCH_SIZE = 5;
+        for (let i = 0; i < plAction.trackQueries.length; i += BATCH_SIZE) {
+          const batch = plAction.trackQueries.slice(i, i + BATCH_SIZE);
+          const batchHits = await Promise.all(batch.map((q) => resolveStreamTracks(q, 3)));
+          for (const candidates of batchHits) {
+            const picked =
+              candidates.find((c) => isPlayablePlaylistCandidate(c, wantsMix)) || candidates[0];
+            if (picked) resolvedSeeds.push(picked);
+          }
+        }
+
         const dedupedTracks: Track[] = [];
         const seenTrackIds = new Set<string>();
-        for (const tr of fetched) {
-          if (!tr || seenTrackIds.has(tr.id)) continue;
+        const seenSongKeys = new Set<string>();
+        for (const tr of resolvedSeeds) {
+          if (!tr || !isPlayablePlaylistCandidate(tr, wantsMix)) continue;
+          if (seenTrackIds.has(tr.id)) continue;
+          const songKey = canonicalSongKey(tr.title, tr.artist);
+          if (songKey && seenSongKeys.has(songKey)) continue;
           seenTrackIds.add(tr.id);
+          if (songKey) seenSongKeys.add(songKey);
           dedupedTracks.push(tr);
         }
 
-        if (dedupedTracks.length > 0) {
+        const topUpTopic = playlistDirective?.topicQuery || plAction.name;
+        let finalTracks = dedupedTracks;
+        if (finalTracks.length < targetCount && topUpTopic) {
+          finalTracks = await resolvePlaylistTracks(
+            {
+              topicQuery: topUpTopic,
+              requestedCount: targetCount,
+              wantsPopular: playlistDirective?.wantsPopular ?? true,
+              wantsMixPlaylist: wantsMix,
+            },
+            {
+              initialTracks: finalTracks,
+              savedTracks,
+            }
+          );
+        }
+
+        if (finalTracks.length > 0) {
           await onCreatePlaylist(
             plAction.name,
-            plAction.description || `AI playlist (${dedupedTracks.length} tracks)`,
-            dedupedTracks
+            plAction.description || `AI playlist (${finalTracks.length} tracks)`,
+            finalTracks
           );
           if (plAction.autoPlay) {
-            onPlayCollection(dedupedTracks, 0);
+            onPlayCollection(finalTracks, 0);
           } else {
             setPendingAction({
               kind: 'playlist',
               name: plAction.name,
               description: plAction.description,
-              tracks: dedupedTracks,
+              tracks: finalTracks,
             });
           }
           triggerHaptic('success');
@@ -828,11 +875,20 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
             if (m.id !== messageId || !m.createdPlaylists) return m;
             return {
               ...m,
+              appliedBadges:
+                finalTracks.length > 0
+                  ? [
+                      ...(m.appliedBadges || []),
+                      plAction.autoPlay
+                        ? `Playing "${plAction.name}" (${finalTracks.length} songs)`
+                        : `Saved "${plAction.name}" (${finalTracks.length} songs)`,
+                    ]
+                  : m.appliedBadges,
               createdPlaylists: m.createdPlaylists.map((card, idx) =>
                 idx === pIdx
                   ? {
                       ...card,
-                      tracks: dedupedTracks,
+                      tracks: finalTracks,
                       resolving: false,
                     }
                   : card
@@ -1089,20 +1145,28 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
             const sources = Array.isArray(data.sources) ? data.sources : [];
 
             if (res.ok && (validReply.length > 0 || actions.length > 0)) {
-              backendSucceeded = true;
-              const fallbackIntro =
-                actions.length > 0 ? 'Searching and executing your request...' : '';
-              setMessages((prev) => [
-                ...prev,
-                {
-                  id: modelMsgId,
-                  role: 'model',
-                  text: validReply || fallbackIntro,
-                  sources,
-                },
-              ]);
-              if (actions.length > 0) {
-                void executeAssistantActions(modelMsgId, actions);
+              const wantsPlaylistTool = Boolean(prompt && parsePlaylistDirective(prompt));
+              const hasPlaylistTool = actions.some((a) => a.type === 'create_playlist');
+
+              if (wantsPlaylistTool && !hasPlaylistTool) {
+                // Model responded conversationally instead of building the playlist — run client playlist builder
+                backendSucceeded = false;
+              } else {
+                backendSucceeded = true;
+                const fallbackIntro =
+                  actions.length > 0 ? 'Searching and executing your request...' : '';
+                setMessages((prev) => [
+                  ...prev,
+                  {
+                    id: modelMsgId,
+                    role: 'model',
+                    text: validReply || fallbackIntro,
+                    sources,
+                  },
+                ]);
+                if (actions.length > 0) {
+                  void executeAssistantActions(modelMsgId, actions, prompt);
+                }
               }
             } else if (data.error) {
               backendErrorMsg = data.error;
@@ -2093,7 +2157,7 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
                             </p>
                             <p className="mt-0.5 text-[11px] text-[#9CA3AF]">
                               {pl.resolving
-                                ? 'Finding playable songs...'
+                                ? 'Searching & adding playable songs...'
                                 : `${pl.tracks.length} playable songs saved to Library`}
                             </p>
                           </div>
@@ -2102,30 +2166,58 @@ export const AiAssistantWidget: React.FC<AiAssistantWidgetProps> = ({
                           )}
                         </div>
                         {!pl.resolving && pl.tracks.length > 0 && (
-                          <div className="flex flex-wrap items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setPendingAction(null);
-                                onPlayCollection(pl.tracks, 0);
-                              }}
-                              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#E11D48] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
-                            >
-                              <Play className="h-3.5 w-3.5 fill-current" />
-                              <span>Play Playlist</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                onOpenFullscreen(false);
-                                onNavigateTab('library', 'playlists');
-                              }}
-                              className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer"
-                            >
-                              <Sliders className="h-3.5 w-3.5 text-[#FF4D6D]" />
-                              <span>Open Playlists</span>
-                            </button>
-                          </div>
+                          <>
+                            <div className="max-h-36 overflow-y-auto rounded-lg border border-white/10 bg-black/35 divide-y divide-white/5">
+                              {pl.tracks.map((tr, trIdx) => (
+                                <button
+                                  key={tr.id}
+                                  type="button"
+                                  onClick={() => {
+                                    setPendingAction(null);
+                                    onPlayCollection(pl.tracks, trIdx);
+                                  }}
+                                  className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-[11px] hover:bg-white/5 cursor-pointer"
+                                >
+                                  <span className="min-w-0 truncate text-[#F4F3F0]">
+                                    <span className="mr-1.5 font-mono-tabular text-[#8E929B]">
+                                      {trIdx + 1}.
+                                    </span>
+                                    <span className="font-medium">{tr.title}</span>
+                                    <span className="text-[#8E929B]"> — {tr.artist}</span>
+                                  </span>
+                                  {tr.duration > 0 && (
+                                    <span className="shrink-0 font-mono-tabular text-[10px] text-[#8E929B]">
+                                      {formatDuration(tr.duration)}
+                                    </span>
+                                  )}
+                                </button>
+                              ))}
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setPendingAction(null);
+                                  onPlayCollection(pl.tracks, 0);
+                                }}
+                                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-[#E11D48] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] cursor-pointer"
+                              >
+                                <Play className="h-3.5 w-3.5 fill-current" />
+                                <span>Play Playlist</span>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  onOpenFullscreen(false);
+                                  onNavigateTab('library', 'playlists');
+                                }}
+                                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-[#282B36] bg-[#14161D] px-3 py-1.5 text-xs font-semibold text-[#F4F3F0] hover:border-[#E11D48] cursor-pointer"
+                              >
+                                <Sliders className="h-3.5 w-3.5 text-[#FF4D6D]" />
+                                <span>Open Playlists</span>
+                              </button>
+                            </div>
+                          </>
                         )}
                       </div>
                     ))}

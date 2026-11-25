@@ -2882,7 +2882,7 @@ test('aiAssistant parses all Siri-style tool calls with strict clamping, filteri
   }
   assert.equal(actions[2].type, 'create_playlist');
   if (actions[2].type === 'create_playlist') {
-    assert.equal(actions[2].trackQueries.length, 15);
+    assert.equal(actions[2].trackQueries.length, 20);
     assert.equal(actions[2].autoPlay, true);
   }
   assert.deepEqual(actions[3], {
@@ -3175,7 +3175,7 @@ test('evaluatePoorConnectionState reaches offline threshold cleanly at 30s and A
   assert.ok(!appSrc.includes('offline stems'));
 });
 
-test('MainActivity and KaGoMediaService configure smooth zero-glitch background focus and WebView keepalive', async () => {
+test('MainActivity and KaGoMediaService keep WebView owning single AudioFocus and deduplicate keepalive timers', async () => {
   const fs = await import('node:fs');
   const path = await import('node:path');
 
@@ -3191,7 +3191,173 @@ test('MainActivity and KaGoMediaService configure smooth zero-glitch background 
   assert.ok(mainJava.includes('setOffscreenPreRaster(true)'));
   assert.ok(mainJava.includes('public void onWindowFocusChanged(boolean hasFocus)'));
   assert.ok(mainJava.includes('postAtFrontOfQueue'));
-  assert.ok(serviceJava.includes('AudioManager.AUDIOFOCUS_GAIN'));
-  assert.ok(serviceJava.includes('requestAudioFocus()'));
-  assert.ok(serviceJava.includes('abandonAudioFocus()'));
+  assert.ok(mainJava.includes('mainHandler.removeCallbacksAndMessages(null)'));
+  // KaGoMediaService must never call AudioManager.requestAudioFocus() because WebView owns Android AudioFocus;
+  // competing focus requests cause AUDIOFOCUS_LOSS ping-pong ~1s after playback starts.
+  assert.ok(!serviceJava.includes('requestAudioFocus'));
+  assert.ok(!serviceJava.includes('abandonAudioFocus'));
+  assert.ok(!serviceJava.includes('AudioManager'));
 });
+
+test('parsePlaylistDirective and resolvePlaylistTracks build 20-song custom playlists from natural prompts', async () => {
+  const {
+    extractPlaylistDirective,
+    extractRequestedTrackCount,
+    matchPendingConfirmation,
+    parsePlaylistDirective,
+    resolvePlaylistTracks,
+  } = await import('./siriEngine');
+
+  // Exact user phrasing: "look for twenty popular drake songs and create a custom playlist"
+  const drake20 = parsePlaylistDirective(
+    'look for twenty popular drake songs and create a custom playlist'
+  );
+  assert.ok(drake20);
+  assert.equal(drake20.topicQuery.toLowerCase(), 'drake');
+  assert.equal(drake20.requestedCount, 20);
+  assert.equal(drake20.explicitCount, true);
+  assert.equal(drake20.wantsPopular, true);
+  assert.equal(drake20.isCustom, true);
+  assert.equal(drake20.autoPlay, false);
+  assert.equal(drake20.name, 'Top 20 Drake Hits');
+
+  // Alternative phrasings
+  const drakeDigits = parsePlaylistDirective(
+    'create a custom playlist of 20 popular drake songs and play it'
+  );
+  assert.ok(drakeDigits);
+  assert.equal(drakeDigits.topicQuery.toLowerCase(), 'drake');
+  assert.equal(drakeDigits.requestedCount, 20);
+  assert.equal(drakeDigits.autoPlay, true);
+
+  const namedCustom = parsePlaylistDirective(
+    'find 15 classic 90s r&b songs and make a custom playlist called Smooth 90s'
+  );
+  assert.ok(namedCustom);
+  assert.equal(namedCustom.name, 'Smooth 90s');
+  assert.equal(namedCustom.requestedCount, 15);
+  assert.ok(namedCustom.topicQuery.toLowerCase().includes('90s'));
+
+  const noConjunction = parsePlaylistDirective('find twenty drake songs create a playlist');
+  assert.ok(noConjunction);
+  assert.equal(noConjunction.topicQuery.toLowerCase(), 'drake');
+  assert.equal(noConjunction.requestedCount, 20);
+
+  const withBy = parsePlaylistDirective('create a custom playlist with 20 songs by Drake');
+  assert.ok(withBy);
+  assert.equal(withBy.topicQuery.toLowerCase(), 'drake');
+  assert.equal(withBy.name, 'Drake (20)');
+
+  const hitsNoDup = parsePlaylistDirective('give me a playlist of 25 kenyan drill hits');
+  assert.ok(hitsNoDup);
+  assert.equal(hitsNoDup.name, 'Top 25 Kenyan Drill Hits');
+
+  // Numeric artist safety ("21 savage" is NOT a count of 21, while "twenty 21 savage songs" IS 20)
+  const savageCount = extractRequestedTrackCount('twenty 21 savage songs');
+  assert.equal(savageCount.count, 20);
+  assert.equal(savageCount.explicit, true);
+  assert.ok(savageCount.cleanedText.toLowerCase().includes('21 savage'));
+
+  const savageNoCount = extractRequestedTrackCount('21 savage songs');
+  assert.equal(savageNoCount.explicit, false);
+  assert.ok(savageNoCount.cleanedText.toLowerCase().includes('21 savage'));
+
+  // Simple tab nav is NOT hijacked as playlist creation
+  assert.equal(parsePlaylistDirective('open my playlists'), null);
+  assert.equal(extractPlaylistDirective('go to playlists'), null);
+
+  // Pending track confirmation must break out immediately on playlist creation prompts
+  const pendingTrack: Track = {
+    id: 'yt-old',
+    youtubeId: 'old1',
+    title: 'Old Song',
+    artist: 'Old Artist',
+    album: 'YouTube',
+    duration: 200,
+    source: 'stream',
+    addedAt: 1,
+  };
+  assert.equal(
+    matchPendingConfirmation(
+      'look for twenty popular drake songs and create a custom playlist',
+      { kind: 'tracks', tracks: [pendingTrack] }
+    ),
+    null
+  );
+
+  // Full 20-track deduplicated resolution & iTunes catalog top-up verification
+  const makeYtTrack = (idx: number, title: string, artist = 'Drake', dur = 210): Track => ({
+    id: `yt-drk-${idx}`,
+    youtubeId: `drkVid${idx}`,
+    title,
+    artist,
+    album: 'YouTube Stream',
+    duration: dur,
+    source: 'stream',
+    viewCount: 50_000_000 - idx * 500_000,
+    addedAt: idx,
+  });
+
+  const broadYoutubeSongs = [
+    makeYtTrack(1, "God's Plan (Official Video)"),
+    makeYtTrack(2, "God's Plan (Audio)"), // duplicate canonical title -> must collapse
+    makeYtTrack(3, 'One Dance'),
+    makeYtTrack(4, 'Hotline Bling'),
+    makeYtTrack(5, 'Drake Full 1 Hour Mix', 'Drake', 3600), // long mix -> must reject
+    makeYtTrack(6, 'Passionfruit'),
+    makeYtTrack(7, 'In My Feelings'),
+    makeYtTrack(8, 'Started From the Bottom'),
+    makeYtTrack(9, 'Nice For What'),
+    makeYtTrack(10, 'Drake Type Beat 2025', 'BeatMaker', 190), // type beat -> must reject
+  ];
+
+  const remainingSeeds = [
+    'Hold On, We’re Going Home',
+    'Laugh Now Cry Later',
+    'Jimmy Cooks',
+    'Rich Flex',
+    'Nonstop',
+    'Headlines',
+    'Take Care',
+    'Best I Ever Had',
+    'Marvin’s Room',
+    'Controlla',
+    'Forever',
+    'Jumpman',
+    'Energy',
+    'Know Yourself',
+    'Toosie Slide',
+    'Search & Rescue',
+  ];
+
+  const resolvedPlaylist = await resolvePlaylistTracks(drake20, {
+    searchStreams: async ({ query }) => {
+      const q = query.toLowerCase();
+      if (q === 'drake' || q.includes('popular') || q.includes('official') || q.includes('greatest')) {
+        return { tracks: broadYoutubeSongs, artists: [], source: 'live', provider: 'youtube' };
+      }
+      const matchIdx = remainingSeeds.findIndex((s) => q.includes(s.toLowerCase()));
+      if (matchIdx >= 0) {
+        return {
+          tracks: [makeYtTrack(100 + matchIdx, remainingSeeds[matchIdx], 'Drake', 215)],
+          artists: [],
+          source: 'live',
+          provider: 'youtube',
+        };
+      }
+      return { tracks: [], artists: [], source: 'fallback', provider: 'none' };
+    },
+    fetchJson: async () => ({
+      results: [
+        { trackName: "God's Plan", artistName: 'Drake' },
+        ...remainingSeeds.map((title) => ({ trackName: title, artistName: 'Drake' })),
+      ],
+    }),
+  });
+
+  assert.equal(resolvedPlaylist.length, 20);
+  const titles = resolvedPlaylist.map((t) => t.title);
+  assert.ok(!titles.some((t) => /1 Hour Mix|Type Beat/i.test(t)));
+  assert.equal(titles.filter((t) => /God's Plan/i.test(t)).length, 1);
+});
+

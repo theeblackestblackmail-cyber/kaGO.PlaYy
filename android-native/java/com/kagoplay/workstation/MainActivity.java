@@ -625,6 +625,7 @@ public class MainActivity extends BridgeActivity {
         if (isFinishing() || isChangingConfigurations() || !KaGoMediaService.isCurrentlyPlaying) {
             return;
         }
+        mainHandler.removeCallbacksAndMessages(null);
         keepWebViewAwakeNow();
         dispatchJsEvent("kago-native-keepalive", "{\"phase\":\"" + phase + "\"}");
 
@@ -648,7 +649,7 @@ public class MainActivity extends BridgeActivity {
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (!hasFocus && KaGoMediaService.isCurrentlyPlaying && !isFinishing() && !isChangingConfigurations()) {
-            scheduleBackgroundKeepalive("focus_lost");
+            keepWebViewAwakeNow();
         }
     }
 

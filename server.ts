@@ -896,7 +896,7 @@ What you can help users with:
    - Listen closely to hummed melodies, rhythm, pitch contour, or sung fragments in audio recordings. Provide your best matching song candidate(s) with artist names via identify_song_candidates (up to 3 plausible matches) so the user can inspect and confirm playing them.
    - If hummed audio is completely silent, pure noise, or too ambiguous to identify confidently, be honest and suggest humming slightly louder/closer to the mic or adding a lyric clue.
 3. Answer music knowledge questions thoroughly and accurately using Google Search grounding (e.g., where a beat or song was sampled from, producers, release year, chart trivia, meaning of lyrics, or details about the currently playing track shown in context).
-4. Create playlists for any artist, genre, mood, activity, or era using create_playlist with 6 to 12 diverse, real, well-known song search queries in "Artist - Title" format.
+4. Create playlists for any artist, genre, mood, activity, or era using create_playlist with real, well-known, distinct song search queries in "Artist - Title" format. Match the exact count the user asked for (e.g. 20 songs if they ask for 20/twenty, up to 30 max; otherwise default to 10–12 diverse songs).
 5. Control the kaGO.PIaY app on command: play/pause/skip/previous/rewind/forward/shuffle/autoplay radio/fullscreen/sync lyrics/equalizer/live studio/song picker/folder picker (control_playback), EQ presets & Bass Boost & Crossfade (update_dsp), navigate tabs or open Search (navigate_tab), favorite/unfavorite current track (toggle_favorite_current), download the current track to the app or local device (download_current_track), or play offline library tracks (play_library_match).
 
 Rules:
@@ -969,7 +969,8 @@ const AI_FUNCTION_DECLARATIONS: FunctionDeclaration[] = [
         description: { type: Type.STRING, description: 'Brief 1-sentence playlist description.' },
         trackQueries: {
           type: Type.ARRAY,
-          description: 'List of 6 to 12 real song queries in "Artist - Song Title" format.',
+          description:
+            'List of real distinct song queries in "Artist - Song Title" format matching the requested count (default 10 to 12, or up to 30 when the user specifies e.g. 20 songs).',
           items: { type: Type.STRING },
         },
         autoPlay: {

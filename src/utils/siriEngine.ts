@@ -12,7 +12,9 @@ import {
 } from './aiAssistant';
 import { formatDuration } from './lrcParser';
 import { hasNativeHttpBridge, nativeFetchText } from './nativeMediaBridge';
+import { canonicalSongKey } from './streamDiscovery';
 import type { DownloadFormatId } from './streamDownloads';
+import { isIndividualSong } from './streamFilter';
 import { searchStreamsUnified } from './streamSearch';
 
 export type PendingSiriAction =
@@ -104,7 +106,10 @@ export function matchPendingConfirmation(
 
   // Reject clearly unrelated new commands so the user is never trapped in confirmation
   if (
-    /^(?:pause|stop\s+music|skip|next\s+track|previous|rewind|forward|open\s+|go\s+to\s+|create\s+a?\s*playlist|where\s+was|who\s+|what\s+song\s+is\s+playing|search\s+for)\b/i.test(
+    /^(?:pause|stop\s+music|skip|next\s+track|previous|rewind|forward|open\s+|go\s+to\s+|create\s+(?:me\s+)?(?:a\s+|an\s+)?(?:custom\s+)?playlist|where\s+was|who\s+|what\s+song\s+is\s+playing|search\s+for|look\s+for)\b/i.test(
+      text
+    ) ||
+    /\b(?:create|make|build|generate)\s+(?:me\s+)?(?:a\s+|an\s+)?(?:[a-z]+\s+){0,3}?playlist\b/i.test(
       text
     )
   ) {
@@ -357,35 +362,260 @@ export function extractDspDirective(rawPrompt: string): Extract<AiAssistantActio
   };
 }
 
+export interface PlaylistDirective {
+  name: string;
+  topicQuery: string;
+  requestedCount: number;
+  explicitCount: boolean;
+  autoPlay: boolean;
+  wantsPopular: boolean;
+  wantsMixPlaylist: boolean;
+  isCustom: boolean;
+}
+
+const NUMBER_WORDS: Record<string, number> = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  eleven: 11,
+  twelve: 12,
+  thirteen: 13,
+  fourteen: 14,
+  fifteen: 15,
+  sixteen: 16,
+  seventeen: 17,
+  eighteen: 18,
+  nineteen: 19,
+  twenty: 20,
+  thirty: 30,
+};
+
+const PLAYLIST_JUNK_RE =
+  /\b(full\s*album|full\s*mix|dj\s*mix|dj\s*set|megamix|nonstop|non-stop|compilation|1\s*hour|2\s*hours|continuous\s*mix|podcast|type\s*beat|karaoke|slowed|reverb|sped\s*up|speed\s*up|nightcore|8d\s*audio|reaction|tutorial|interview)\b/i;
+
+function parseWordOrDigitCount(token: string): number | null {
+  const clean = token.trim().toLowerCase();
+  if (!clean) return null;
+  if (/^\d{1,3}$/.test(clean)) {
+    const n = parseInt(clean, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  const compound = clean.match(/^(twenty)[\s-]+(one|two|three|four|five|six|seven|eight|nine)$/);
+  if (compound) {
+    return 20 + (NUMBER_WORDS[compound[2]] || 0);
+  }
+  return NUMBER_WORDS[clean] ?? null;
+}
+
+export function extractRequestedTrackCount(rawText: string): {
+  count: number;
+  explicit: boolean;
+  cleanedText: string;
+} {
+  const text = rawText.trim();
+  const numWordAlt =
+    '(?:twenty[\\s-]+(?:one|two|three|four|five|six|seven|eight|nine)|thirty|twenty|nineteen|eighteen|seventeen|sixteen|fifteen|fourteen|thirteen|twelve|eleven|ten|nine|eight|seven|six|five|four|three|\\d{1,2})';
+
+  // Pattern A: "top 20" / "best twenty"
+  const topPattern = new RegExp(`\\b(?:top|best)\\s+(${numWordAlt})\\b`, 'i');
+  const topMatch = text.match(topPattern);
+  if (topMatch && typeof topMatch.index === 'number') {
+    const parsed = parseWordOrDigitCount(topMatch[1]);
+    if (parsed !== null && parsed >= 2 && parsed <= 50) {
+      const clamped = Math.max(3, Math.min(30, parsed));
+      const before = text.slice(0, topMatch.index);
+      const after = text.slice(topMatch.index + topMatch[0].length);
+      return {
+        count: clamped,
+        explicit: true,
+        cleanedText: `${before} ${after}`.replace(/\s+/g, ' ').trim(),
+      };
+    }
+  }
+
+  // Pattern B: "<count> [popular/best/drake/...] songs/tracks/hits"
+  // Guard numeric artist names like "21 savage", "50 cent", "3 doors down", "30 seconds to mars"
+  const guardedText = text
+    .replace(/\b21\s+savage\b/gi, '__ARTIST_21_SAVAGE__')
+    .replace(/\b50\s+cent\b/gi, '__ARTIST_50_CENT__')
+    .replace(/\b30\s+seconds\s+to\s+mars\b/gi, '__ARTIST_30_SECONDS__')
+    .replace(/\b3\s+doors\s+down\b/gi, '__ARTIST_3_DOORS__');
+
+  const adjWord =
+    '(?:popular|top|best|good|great|favorite|favourite|famous|trending|hit|classic|essential|random|different|distinct|new|old|recent|most\\s+played|greatest|hot|chill|custom)';
+  const mediaWord = '(?:songs?|tracks?|tunes?|singles?|bangers?|hits?|mixes?|videos?)';
+
+  const countPattern = new RegExp(
+    `\\b(${numWordAlt})\\b(?=\\s+(?:${adjWord}\\s+)*(?:(?:[a-z0-9&'._-]+\\s+){0,2})${mediaWord}\\b|\\s+${adjWord}\\b)`,
+    'i'
+  );
+  const countMatch = guardedText.match(countPattern);
+  if (countMatch && typeof countMatch.index === 'number') {
+    const parsed = parseWordOrDigitCount(countMatch[1]);
+    if (parsed !== null && parsed >= 2 && parsed <= 50) {
+      const clamped = Math.max(3, Math.min(30, parsed));
+      const before = guardedText.slice(0, countMatch.index);
+      const after = guardedText.slice(countMatch.index + countMatch[0].length);
+      const restored = `${before} ${after}`
+        .replace(/__ARTIST_21_SAVAGE__/g, '21 Savage')
+        .replace(/__ARTIST_50_CENT__/g, '50 Cent')
+        .replace(/__ARTIST_30_SECONDS__/g, '30 Seconds to Mars')
+        .replace(/__ARTIST_3_DOORS__/g, '3 Doors Down')
+        .replace(/\s+/g, ' ')
+        .trim();
+      return {
+        count: clamped,
+        explicit: true,
+        cleanedText: restored,
+      };
+    }
+  }
+
+  return {
+    count: 12,
+    explicit: false,
+    cleanedText: text,
+  };
+}
+
+function toTitleCaseLabel(raw: string): string {
+  return raw
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+function cleanPlaylistTopic(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^(?:hey\s+(?:siri|ai|kago)|ok\s+kago|please|can\s+you|could\s+you|would\s+you|help\s+me|i\s+want\s+(?:you\s+)?to)\s+/gi, '')
+    .replace(/^(?:look\s+for|search\s+for|search|find\s+me|find|get\s+me|get|pull\s+up|gather|collect|give\s+me|compile|curate|make|create|build|generate)\s+/gi, '')
+    .replace(/\b(?:and\s+play(?:\s+it)?|play\s+it|start\s+playing|for\s+me|please|in\s+the\s+app)\b/gi, ' ')
+    .replace(/\b(?:custom|personal|personalized|new|playlist)\b/gi, ' ')
+    .replace(/\b(?:popular|famous|trending|most\s+played)\b/gi, ' ')
+    .replace(/\b(?:songs?|tracks?|tunes?|singles?|bangers?|music)\b/gi, ' ')
+    .replace(/\s+\b(?:with|from|featuring|about)\b\s+/gi, ' ')
+    .trim()
+    .replace(/^(?:(?:me|of|for|with|about|featuring|from|by|on|the|a|an)\s+)+/gi, '')
+    .replace(/\s+\b(?:by|of|for)\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export function parsePlaylistDirective(rawPrompt: string): PlaylistDirective | null {
+  const original = rawPrompt.trim();
+  if (!original) return null;
+  if (!/\bplaylists?\b/i.test(original)) return null;
+
+  // Do not hijack simple navigation commands like "open my playlists" or "go to playlists"
+  if (
+    /^(?:open|show|go\s+to|switch\s+to|view)\s+(?:my\s+|the\s+)?playlists?$/i.test(original)
+  ) {
+    return null;
+  }
+
+  let preTopic = '';
+  let postTopic = '';
+  let explicitName = '';
+
+  // Case 1: "<search/find topic> [and] create/make/build [a custom] playlist [called X] [and play it]"
+  const beforeThenCreate = original.match(
+    /^(.+?)\s+(?:(?:\b(?:and|n|&|then|to)\b|,)\s*)?(?:please\s+)?(?:create|make|build|generate|curate|compile|turn\s+(?:them|those|it)\s+into|put\s+(?:them|those|it)\s+in(?:to)?|save\s+(?:them|those|it)\s+(?:as|in(?:to)?))\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?(?:[a-z]+\s+){0,3}?playlists?\b(.*)$/i
+  );
+
+  // Case 2: "create/make/build [me] [a/an] [descriptors] playlist [for/of/called ...]"
+  const createMatch = original.match(
+    /(?:create|make|build|generate|curate|compile|start|give\s+me)\s+(?:me\s+)?(?:a|an|my|the)?\s*(.*?)\bplaylists?\b(.*)$/i
+  );
+
+  // Case 3: "playlist of/for/with ..."
+  const directPlaylistMatch = original.match(
+    /^playlists?\s+(?:for|of|with|about|featuring|called|named)\s+(.+)$/i
+  );
+
+  if (beforeThenCreate) {
+    preTopic = beforeThenCreate[1].trim();
+    postTopic = beforeThenCreate[2].trim();
+  } else if (createMatch) {
+    preTopic = createMatch[1].trim();
+    postTopic = createMatch[2].trim();
+  } else if (directPlaylistMatch) {
+    postTopic = directPlaylistMatch[1].trim();
+  } else {
+    return null;
+  }
+
+  const autoPlay = /\band\s+play\b|\bplay\s+it\b|\bstart\s+playing\b/i.test(original);
+  const wantsPopular = /\b(?:popular|top|best|hits?|greatest|famous|trending)\b/i.test(original);
+  const wantsMixPlaylist = /\b(?:dj\s+mix|mixes|nonstop|non-stop)\b/i.test(original);
+  const isCustom = /\bcustom\b/i.test(original);
+
+  // Extract explicit playlist name ("called X" / "named X" / "titled X") if present
+  const namedMatch = postTopic.match(
+    /\b(?:called|named|titled)\s+["“']?([^"”']+?)["”']?(?=\s+(?:of|for|with|featuring|about|and\s+play)\b|$)/i
+  );
+  if (namedMatch) {
+    explicitName = namedMatch[1].trim();
+    postTopic = postTopic.replace(namedMatch[0], ' ').trim();
+  }
+
+  const combinedRaw = [preTopic, postTopic].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+  const countInfo = extractRequestedTrackCount(combinedRaw);
+  let topic = cleanPlaylistTopic(countInfo.cleanedText);
+
+  if (!topic && explicitName) {
+    topic = cleanPlaylistTopic(explicitName) || explicitName;
+  }
+  if (!topic) return null;
+
+  const titleCase = toTitleCaseLabel(topic);
+  let defaultName: string;
+  if (explicitName) {
+    defaultName = toTitleCaseLabel(explicitName).slice(0, 48).trim();
+  } else if (countInfo.explicit && wantsPopular) {
+    defaultName = (/\bhits$/i.test(titleCase)
+      ? `Top ${countInfo.count} ${titleCase}`
+      : `Top ${countInfo.count} ${titleCase} Hits`
+    )
+      .slice(0, 48)
+      .trim();
+  } else if (countInfo.explicit) {
+    defaultName = `${titleCase} (${countInfo.count})`.slice(0, 48).trim();
+  } else {
+    defaultName = titleCase.length > 48 ? titleCase.slice(0, 48).trim() : `${titleCase} Mix`;
+  }
+
+  return {
+    name: defaultName,
+    topicQuery: topic,
+    requestedCount: countInfo.count,
+    explicitCount: countInfo.explicit,
+    autoPlay,
+    wantsPopular,
+    wantsMixPlaylist,
+    isCustom,
+  };
+}
+
 export function extractPlaylistDirective(rawPrompt: string): {
   name: string;
   topicQuery: string;
   autoPlay: boolean;
 } | null {
-  const original = rawPrompt.trim();
-  const match = original.match(
-    /(?:create|make|build|generate)\s+(?:me\s+)?(?:a|an)?\s*playlist\s*(?:for|of|with|about|featuring|called|named)?\s+(.+)$/i
-  );
-  if (!match) return null;
-
-  let body = match[1].trim();
-  const autoPlay = /\band\s+play\b|\bplay\s+it\b|\bstart\s+playing\b/i.test(original);
-  body = body
-    .replace(/\b(?:and\s+play(?:\s+it)?|for\s+me|please|songs?|tracks?|music)\b/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!body) return null;
-
-  const titleCase = body
-    .split(/\s+/)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(' ');
-
+  const parsed = parsePlaylistDirective(rawPrompt);
+  if (!parsed) return null;
   return {
-    name: titleCase.length > 48 ? titleCase.slice(0, 48).trim() : `${titleCase} Mix`,
-    topicQuery: body,
-    autoPlay,
+    name: parsed.name,
+    topicQuery: parsed.topicQuery,
+    autoPlay: parsed.autoPlay,
   };
 }
 
@@ -772,6 +1002,201 @@ async function searchPlayableStreams(
   return [];
 }
 
+function normalizePlaylistSongKey(track: Pick<Track, 'title' | 'artist'>): string {
+  const canon = canonicalSongKey(track.title, track.artist);
+  if (canon) return canon;
+  return `${track.title} ${track.artist}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+export function isPlayablePlaylistCandidate(
+  track: Track,
+  wantsMixPlaylist = false
+): boolean {
+  if (!track || (!track.youtubeId && !track.streamUrl)) return false;
+  if (track.source === 'synth') return false;
+  if (wantsMixPlaylist) return true;
+  if (PLAYLIST_JUNK_RE.test(track.title)) return false;
+  if (track.duration > 600) return false;
+  const durForCheck = track.duration > 0 ? track.duration : undefined;
+  return isIndividualSong(track.title, track.album, durForCheck);
+}
+
+function topicRelevanceScore(track: Track, topicTokens: string[]): number {
+  if (topicTokens.length === 0) return 1;
+  const hay = `${track.artist} ${track.title} ${track.album || ''}`.toLowerCase();
+  let matched = 0;
+  for (const tok of topicTokens) {
+    if (hay.includes(tok)) matched += 1;
+  }
+  return matched / topicTokens.length;
+}
+
+export interface PlaylistResolverDeps {
+  searchStreams?: typeof searchStreamsUnified;
+  fetchJson?: (url: string, timeoutMs?: number) => Promise<unknown | null>;
+  initialTracks?: Track[];
+  savedTracks?: Track[];
+}
+
+export async function resolvePlaylistTracks(
+  directive: Pick<
+    PlaylistDirective,
+    'topicQuery' | 'requestedCount' | 'wantsPopular' | 'wantsMixPlaylist'
+  >,
+  deps?: PlaylistResolverDeps
+): Promise<Track[]> {
+  const searchFn = deps?.searchStreams ?? searchStreamsUnified;
+  const fetchJsonFn = deps?.fetchJson ?? fetchJsonSafe;
+  const targetCount = Math.max(3, Math.min(30, directive.requestedCount || 12));
+  const topic = directive.topicQuery.trim();
+  if (!topic) return [];
+
+  const topicTokens = topic
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length >= 2);
+
+  const collected: Track[] = [];
+  const seenIds = new Set<string>();
+  const seenYtIds = new Set<string>();
+  const seenSongKeys = new Set<string>();
+
+  const tryAdd = (tr: Track | null | undefined, requireTopicMatch = false): boolean => {
+    if (!tr || !isPlayablePlaylistCandidate(tr, directive.wantsMixPlaylist)) return false;
+    if (seenIds.has(tr.id)) return false;
+    if (tr.youtubeId && seenYtIds.has(tr.youtubeId)) return false;
+    const songKey = normalizePlaylistSongKey(tr);
+    if (songKey && seenSongKeys.has(songKey)) return false;
+    if (requireTopicMatch && topicTokens.length > 0 && topicRelevanceScore(tr, topicTokens) === 0) {
+      return false;
+    }
+
+    seenIds.add(tr.id);
+    if (tr.youtubeId) seenYtIds.add(tr.youtubeId);
+    if (songKey) seenSongKeys.add(songKey);
+    collected.push(tr);
+    return true;
+  };
+
+  if (Array.isArray(deps?.initialTracks)) {
+    for (const tr of deps.initialTracks) {
+      tryAdd(tr, false);
+      if (collected.length >= targetCount) return collected.slice(0, targetCount);
+    }
+  }
+
+  // Stage 1: Fetch verified iTunes song seeds + broad YouTube/stream discovery searches in parallel
+  const discoveryQueries: Array<{ query: string; category: 'songs' | 'all' }> = [
+    { query: topic, category: 'songs' },
+    {
+      query: directive.wantsPopular ? `${topic} popular songs` : `${topic} hits`,
+      category: 'all',
+    },
+  ];
+  if (targetCount > 10) {
+    discoveryQueries.push({ query: `${topic} official audio`, category: 'songs' });
+  }
+  if (targetCount >= 18) {
+    discoveryQueries.push({ query: `${topic} greatest hits`, category: 'all' });
+  }
+
+  const itunesUrl = `https://itunes.apple.com/search?term=${encodeURIComponent(
+    topic
+  )}&entity=song&limit=45`;
+
+  const [itunesRaw, ...searchResults] = await Promise.all([
+    fetchJsonFn(itunesUrl, 6500).catch(() => null),
+    ...discoveryQueries.map((q) => searchFn({ query: q.query, category: q.category }).catch(() => ({ tracks: [] as Track[] }))),
+  ]);
+
+  // Rank discovered tracks so relevant & popular songs enter first
+  const candidatePool: Track[] = [];
+  for (const res of searchResults) {
+    if (Array.isArray(res?.tracks)) {
+      candidatePool.push(...res.tracks);
+    }
+  }
+
+  const scoredPool = candidatePool
+    .filter((tr) => isPlayablePlaylistCandidate(tr, directive.wantsMixPlaylist))
+    .sort((a, b) => {
+      const relDiff =
+        topicRelevanceScore(b, topicTokens) - topicRelevanceScore(a, topicTokens);
+      if (Math.abs(relDiff) > 0.1) return relDiff;
+      return (b.viewCount || 0) - (a.viewCount || 0);
+    });
+
+  // First pass: add strongly matching tracks
+  for (const tr of scoredPool) {
+    tryAdd(tr, topicTokens.length === 1);
+    if (collected.length >= targetCount) return collected.slice(0, targetCount);
+  }
+
+  // Stage 2: Top up any shortfall using verified individual song seeds from iTunes catalog
+  const itunesResults = (
+    itunesRaw as {
+      results?: Array<{
+        trackName?: string;
+        artistName?: string;
+      }>;
+    } | null
+  )?.results;
+
+  const missingSeeds: Array<{ artist: string; title: string }> = [];
+  if (Array.isArray(itunesResults)) {
+    const queuedKeys = new Set<string>(seenSongKeys);
+    for (const row of itunesResults) {
+      const title = (row.trackName || '').trim();
+      const artist = (row.artistName || '').trim();
+      if (!title || !artist) continue;
+      if (PLAYLIST_JUNK_RE.test(title)) continue;
+      const key = canonicalSongKey(title, artist);
+      if (!key || queuedKeys.has(key)) continue;
+      queuedKeys.add(key);
+      missingSeeds.push({ artist, title });
+    }
+  }
+
+  const BATCH_SIZE = 4;
+  for (let i = 0; i < missingSeeds.length && collected.length < targetCount; i += BATCH_SIZE) {
+    const batch = missingSeeds.slice(i, i + BATCH_SIZE);
+    const resolvedBatch = await Promise.all(
+      batch.map((seed) =>
+        searchFn({ query: `${seed.artist} ${seed.title}`, category: 'songs' }).catch(() => ({
+          tracks: [] as Track[],
+        }))
+      )
+    );
+    for (const res of resolvedBatch) {
+      for (const candidate of res.tracks || []) {
+        if (tryAdd(candidate, false)) break;
+      }
+      if (collected.length >= targetCount) break;
+    }
+  }
+
+  // Stage 3: Allow remaining non-strict search candidates before giving up short
+  if (collected.length < targetCount) {
+    for (const tr of scoredPool) {
+      tryAdd(tr, false);
+      if (collected.length >= targetCount) break;
+    }
+  }
+
+  // Stage 4: Blend matching offline saved library songs if stream search still needs more
+  if (collected.length < targetCount && Array.isArray(deps?.savedTracks)) {
+    for (const tr of deps.savedTracks) {
+      tryAdd(tr, true);
+      if (collected.length >= targetCount) break;
+    }
+  }
+
+  return collected.slice(0, targetCount);
+}
+
 export async function runSiriAssistantTurn(params: {
   prompt: string;
   context: AiAssistantContextPayload;
@@ -954,38 +1379,37 @@ export async function runSiriAssistantTurn(params: {
     };
   }
 
-  // 4. Create Playlist for Artist / Genre / Mood
-  const playlistDirective = extractPlaylistDirective(prompt);
+  // 4. Create Playlist for Artist / Genre / Mood / Specific Count (e.g. "look for twenty popular drake songs and create a custom playlist")
+  const playlistDirective = parsePlaylistDirective(prompt);
   if (playlistDirective) {
-    const [songSearch, allSearch] = await Promise.all([
-      searchStreamsUnified({ query: playlistDirective.topicQuery, category: 'songs' }),
-      searchStreamsUnified({ query: `${playlistDirective.topicQuery} hits`, category: 'all' }),
-    ]);
-
-    const combined = [...songSearch.tracks, ...allSearch.tracks];
-    const deduped: Track[] = [];
-    const seen = new Set<string>();
-    for (const tr of combined) {
-      if (!tr || seen.has(tr.id)) continue;
-      seen.add(tr.id);
-      deduped.push(tr);
-      if (deduped.length >= 8) break;
-    }
+    const deduped = await resolvePlaylistTracks(playlistDirective, {
+      savedTracks: params.savedTracks,
+    });
 
     if (deduped.length === 0) {
       return {
-        reply: `I tried searching for playable tracks for "${playlistDirective.topicQuery}", but couldn't find stream matches right now. Check your internet connection or try a more specific artist/genre.`,
+        reply: `I tried searching for playable tracks for "${playlistDirective.topicQuery}", but couldn't find stream matches right now. Check your internet connection or try a more specific artist or genre.`,
         actions: [],
       };
     }
 
     const previewNames = deduped
-      .slice(0, 3)
+      .slice(0, 4)
       .map((t) => `"${t.title}"`)
       .join(', ');
 
+    const countNote =
+      playlistDirective.explicitCount && deduped.length < playlistDirective.requestedCount
+        ? `Found ${deduped.length} of the ${playlistDirective.requestedCount} unique playable songs I searched for`
+        : `Created playlist "${playlistDirective.name}" with ${deduped.length} playable songs`;
+
+    const replyText =
+      playlistDirective.explicitCount && deduped.length < playlistDirective.requestedCount
+        ? `${countNote} and created "${playlistDirective.name}" in your Library (including ${previewNames}).${playlistDirective.autoPlay ? ' Playing now!' : ' Want me to play it now?'}`
+        : `${countNote} (including ${previewNames}) and saved it to your Library.${playlistDirective.autoPlay ? ' Playing now!' : ' Want me to play it now?'}`;
+
     return {
-      reply: `Created playlist "${playlistDirective.name}" with ${deduped.length} playable songs (including ${previewNames}) and saved it to your Library.${playlistDirective.autoPlay ? ' Playing now!' : ' Want me to play it now?'}`,
+      reply: replyText,
       actions: [],
       createdPlaylist: {
         name: playlistDirective.name,

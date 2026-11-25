@@ -317,7 +317,7 @@ export function parseFunctionCallsToActions(
       const trackQueries = rawQueries
         .map((q) => asTrimmedString(q, 160))
         .filter(Boolean)
-        .slice(0, 15);
+        .slice(0, 30);
       if (trackQueries.length === 0) continue;
       actions.push({
         type: 'create_playlist',
